@@ -1,7 +1,3 @@
-The manifesto needs updates. The message-body-as-cognitive-unit principle is absent, and several existing principles should reflect that context flows through message bodies, not through pop-time assembly. The core ideas hold, but the design has moved meaningfully since the manifesto was written.
-
----
-
 # The Apex Manifesto
 
 *Principles for building AI agent harnesses that actually work.*
