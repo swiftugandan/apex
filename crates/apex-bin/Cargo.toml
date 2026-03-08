@@ -15,6 +15,7 @@ apex-queue = { path = "../apex-queue" }
 apex-context = { path = "../apex-context" }
 apex-memory = { path = "../apex-memory" }
 apex-eval = { path = "../apex-eval" }
+apex-config = { path = "../apex-config" }
 rfbmq-core = { path = "../../vendor/rfbmq-core" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 anyhow.workspace = true

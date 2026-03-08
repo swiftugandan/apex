@@ -56,6 +56,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "queue_create_subtask",
     "queue_read_done",
     "queue_depth",
+    "update_config",
 ];
 
 // ── Registry ──────────────────────────────────────────────────────

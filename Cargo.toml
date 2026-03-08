@@ -9,6 +9,7 @@ members = [
     "crates/apex-context",
     "crates/apex-memory",
     "crates/apex-eval",
+    "crates/apex-config",
 ]
 default-members = ["crates/apex-bin"]
 

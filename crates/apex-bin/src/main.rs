@@ -22,7 +22,9 @@ use apex_core::ports::{LlmProvider, MemoryStore, Queue, ToolRegistry, WorkingMem
 use apex_llm::anthropic::AnthropicProvider;
 use apex_memory::{FsScratchpadStore, LongTermMemoryToolRegistry, MemoryToolRegistry, SqliteMemoryStore};
 use apex_queue::RfbmqAdapter;
+use apex_config::{ConfigLoader, Invariants, validate_full};
 use apex_tools::BuiltinToolRegistry;
+use apex_tools::ConfigToolRegistry;
 use apex_tools::CustomToolRegistry;
 use apex_tools::spill::SpillManager;
 
@@ -30,8 +32,6 @@ use crate::queue_tools::QueueToolRegistry;
 
 const MAX_TURNS: usize = 32;
 const MAX_TOKENS: u32 = 8192;
-const MAX_RETRIES: u32 = 3;
-const DEFAULT_MAX_DEPTH: u32 = 3;
 
 // ── CompositeToolRegistry ─────────────────────────────────────────
 
@@ -79,6 +79,7 @@ struct ApexPaths {
     long_term_memory_dir: PathBuf,
     scratch_dir: PathBuf,
     tools_dir: PathBuf,
+    config_dir: PathBuf,
 }
 
 impl ApexPaths {
@@ -94,6 +95,7 @@ impl ApexPaths {
             long_term_memory_dir: root.join("memory").join("long-term"),
             scratch_dir: root.join("scratch"),
             tools_dir: root.join("tools"),
+            config_dir: root.join("config"),
             root,
         })
     }
@@ -172,8 +174,17 @@ async fn main() -> Result<()> {
                 Some(sub) => bail!("unknown tools subcommand: {sub}. Available: list"),
             }
         }
+        Some("config") => {
+            let subcmd = args.get(1).map(|s| s.as_str());
+            match subcmd {
+                Some("show") | None => cmd_config_show().await,
+                Some("invariants") => cmd_config_invariants().await,
+                Some(sub) => bail!("unknown config subcommand: {sub}. Available: show, invariants"),
+            }
+        }
+        Some("validate") => cmd_validate().await,
         Some(cmd) => bail!(
-            "unknown command: {cmd}. Available: init, run, queue, cat, work, status, memory, scratch, tools"
+            "unknown command: {cmd}. Available: init, run, queue, cat, work, status, memory, scratch, tools, config, validate"
         ),
         None => bail!("no command provided. Usage: apex <command>"),
     }
@@ -199,12 +210,19 @@ async fn cmd_init() -> Result<()> {
     std::fs::create_dir_all(paths.tools_dir.join("custom"))
         .context("failed to create tools/custom/ directory")?;
 
+    std::fs::create_dir_all(&paths.config_dir)
+        .context("failed to create config/ directory")?;
+
     // Write empty manifest if absent
     let manifest_path = paths.tools_dir.join("manifest.toml");
     if !manifest_path.exists() {
         std::fs::write(&manifest_path, "")
             .context("failed to write tools/manifest.toml")?;
     }
+
+    // Write default config files if absent
+    ConfigLoader::write_default_invariants(&paths.config_dir)?;
+    ConfigLoader::write_default_agent_config(&paths.config_dir)?;
 
     RfbmqAdapter::init(&paths.queue_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -214,6 +232,7 @@ async fn cmd_init() -> Result<()> {
     eprintln!("  long-term: {}", paths.long_term_memory_dir.display());
     eprintln!("  scratch:  {}", paths.scratch_dir.display());
     eprintln!("  tools:    {}", paths.tools_dir.display());
+    eprintln!("  config:   {}", paths.config_dir.display());
     Ok(())
 }
 
@@ -391,17 +410,21 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
     let evaluator_persona = std::fs::read_to_string(&evaluator_persona_path)
         .context("failed to read prompts/evaluator.md")?;
 
-    let eval_config = apex_eval::EvalConfig::from_env();
+    let invariants = ConfigLoader::load_invariants(&paths.config_dir)?;
+    let agent_config = ConfigLoader::load_agent_config(&paths.config_dir)?;
 
-    let max_concurrent: usize = std::env::var("APEX_CONCURRENT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
+    let max_concurrent = agent_config.agent.max_concurrent;
+    let max_depth = agent_config.agent.max_depth;
+    let max_retries = agent_config.agent.max_retries;
 
-    let max_depth: u32 = std::env::var("APEX_MAX_DEPTH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_MAX_DEPTH);
+    let eval_config = apex_eval::EvalConfig {
+        eval_model: agent_config.eval.eval_model.clone(),
+        eval_on: match agent_config.eval.eval_on.as_str() {
+            "always" => apex_eval::EvalOn::Always,
+            "never" => apex_eval::EvalOn::Never,
+            _ => apex_eval::EvalOn::FuzzyCriteria,
+        },
+    };
 
     let llm = Arc::new(AnthropicProvider::from_env());
 
@@ -429,11 +452,13 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
 
     let scratch_dir = paths.scratch_dir.clone();
     let tools_dir = paths.tools_dir.clone();
+    let config_dir = paths.config_dir.clone();
 
     let persona = Arc::new(persona);
     let evaluator_persona = Arc::new(evaluator_persona);
     let eval_config = Arc::new(eval_config);
     let memory = Arc::clone(&memory);
+    let invariants = Arc::new(invariants);
 
     if max_concurrent <= 1 {
         // Single worker — no spawning needed
@@ -448,9 +473,12 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
             evaluator_persona,
             eval_config,
             max_depth,
+            max_retries,
             0,
             scratch_dir,
             tools_dir,
+            config_dir,
+            invariants,
             estimator,
         )
         .await
@@ -468,6 +496,8 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
             let eval_config = Arc::clone(&eval_config);
             let scratch_dir = scratch_dir.clone();
             let tools_dir = tools_dir.clone();
+            let config_dir = config_dir.clone();
+            let invariants = Arc::clone(&invariants);
             let estimator = Arc::clone(&estimator);
 
             handles.push(tokio::spawn(async move {
@@ -482,9 +512,12 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
                     evaluator_persona,
                     eval_config,
                     max_depth,
+                    max_retries,
                     worker_id,
                     scratch_dir,
                     tools_dir,
+                    config_dir,
+                    invariants,
                     estimator,
                 )
                 .await
@@ -510,9 +543,12 @@ async fn worker_loop(
     evaluator_persona: Arc<String>,
     eval_config: Arc<apex_eval::EvalConfig>,
     max_depth: u32,
+    max_retries: u32,
     worker_id: usize,
     scratch_dir: PathBuf,
     tools_dir: PathBuf,
+    config_dir: PathBuf,
+    invariants: Arc<Invariants>,
     estimator: Arc<Mutex<TokenEstimator>>,
 ) -> Result<()> {
     let mut empty_cycles = 0u32;
@@ -585,12 +621,17 @@ async fn worker_loop(
             custom_spill,
             Some(Arc::clone(&long_term)),
         );
+        let config_tools = ConfigToolRegistry::new(
+            config_dir.clone(),
+            Arc::clone(&invariants),
+        );
         let tools = CompositeToolRegistry::new(vec![
             Box::new(BuiltinToolRegistry::new(scratch_dir.clone())),
             Box::new(memory_tools),
             Box::new(lt_memory_tools),
             Box::new(queue_tools),
             Box::new(custom_tools),
+            Box::new(config_tools),
         ]);
 
         // Build composer with current calibration
@@ -633,7 +674,7 @@ async fn worker_loop(
                     }
                     Err((record, err, scratchpad)) => {
                         handle_failure(
-                            &adapter, &claimed, &record, &err, &scratchpad, worker_id, &composer,
+                            &adapter, &claimed, &record, &err, &scratchpad, worker_id, &composer, max_retries,
                         )
                         .await?;
                     }
@@ -673,7 +714,7 @@ async fn worker_loop(
                     }
                     Err((record, err, scratchpad)) => {
                         handle_failure(
-                            &adapter, &claimed, &record, &err, &scratchpad, worker_id, &composer,
+                            &adapter, &claimed, &record, &err, &scratchpad, worker_id, &composer, max_retries,
                         )
                         .await?;
                     }
@@ -691,6 +732,7 @@ async fn handle_failure(
     scratchpad: &apex_core::domain::Scratchpad,
     worker_id: usize,
     composer: &MessageComposer,
+    max_retries: u32,
 ) -> Result<()> {
     eprintln!("[worker {worker_id}] ✗ {} failed: {err}", claimed.id);
 
@@ -707,13 +749,13 @@ async fn handle_failure(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    if claimed.headers.retry_count + 1 >= MAX_RETRIES {
+    if claimed.headers.retry_count + 1 >= max_retries {
         eprintln!("[worker {worker_id}]   ↳ Max retries reached, message moved to failed/");
     } else {
         eprintln!(
             "[worker {worker_id}]   ↳ Requeued for retry (attempt {} of {})",
             claimed.headers.retry_count + 2,
-            MAX_RETRIES
+            max_retries
         );
     }
     Ok(())
@@ -1606,6 +1648,40 @@ async fn cmd_memory_calibration() -> Result<()> {
     println!("  Mixed ratio:  {:.3} chars/token", cal.chars_per_token_mixed);
     println!("  Sample count: {}", cal.sample_count);
     Ok(())
+}
+
+// ── Config commands ────────────────────────────────────────────────
+
+async fn cmd_config_show() -> Result<()> {
+    let paths = ApexPaths::resolve()?;
+    let config = ConfigLoader::load_agent_config(&paths.config_dir)?;
+    let toml_str = config.to_toml()?;
+    println!("{toml_str}");
+    Ok(())
+}
+
+async fn cmd_config_invariants() -> Result<()> {
+    let paths = ApexPaths::resolve()?;
+    let invariants = ConfigLoader::load_invariants(&paths.config_dir)?;
+    let toml_str = invariants.to_toml()?;
+    println!("{toml_str}");
+    Ok(())
+}
+
+async fn cmd_validate() -> Result<()> {
+    let paths = ApexPaths::resolve()?;
+    let invariants = ConfigLoader::load_invariants(&paths.config_dir)?;
+    let config = ConfigLoader::load_agent_config(&paths.config_dir)?;
+    let report = validate_full(&config, &invariants, &paths.prompts_dir);
+
+    let display = report.display();
+    if report.is_ok() {
+        println!("{display}");
+        Ok(())
+    } else {
+        eprintln!("{display}");
+        std::process::exit(1);
+    }
 }
 
 // ── Utilities ──────────────────────────────────────────────────────

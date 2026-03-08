@@ -43,6 +43,7 @@ name = "apex-bin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "apex-config",
  "apex-context",
  "apex-core",
  "apex-eval",
@@ -56,6 +57,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml",
+]
+
+[[package]]
+name = "apex-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
  "toml",
 ]
 
@@ -128,6 +140,7 @@ dependencies = [
 name = "apex-tools"
 version = "0.1.0"
 dependencies = [
+ "apex-config",
  "apex-core",
  "async-trait",
  "serde",

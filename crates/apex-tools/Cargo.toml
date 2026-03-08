@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 apex-core = { path = "../apex-core" }
+apex-config = { path = "../apex-config" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
