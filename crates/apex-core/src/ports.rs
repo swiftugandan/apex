@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 
 use crate::domain::{
-    ClaimedTask, CompletionRequest, CompletionResponse, QueueDepth, QueueMessage, ReapResult,
-    Scratchpad, ToolCall, ToolCompletionResponse, ToolDef, ToolResult, ToolSchema,
+    ClaimedTask, CompletionRequest, CompletionResponse, Fact, FactId, QueueDepth, QueueMessage,
+    ReapResult, Scratchpad, Skill, SkillId, Strategy, StrategyId, ToolCall,
+    ToolCompletionResponse, ToolDef, ToolResult, ToolSchema,
 };
 use crate::error::{LlmError, MemoryError, QueueError, ToolError};
 
@@ -52,4 +53,21 @@ pub trait WorkingMemory: Send + Sync {
     async fn exists(&self, job_id: &str) -> Result<bool, MemoryError>;
     async fn delete(&self, job_id: &str) -> Result<(), MemoryError>;
     async fn list_active(&self) -> Result<Vec<String>, MemoryError>;
+}
+
+#[async_trait]
+pub trait MemoryStore: Send + Sync {
+    async fn store_fact(&self, fact: Fact) -> Result<FactId, MemoryError>;
+    async fn query_facts(&self, query: &str, limit: usize) -> Result<Vec<Fact>, MemoryError>;
+    async fn verify_fact(&self, id: &FactId) -> Result<(), MemoryError>;
+    async fn store_skill(&self, skill: Skill) -> Result<SkillId, MemoryError>;
+    async fn find_skill(&self, task_pattern: &str) -> Result<Option<Skill>, MemoryError>;
+    async fn update_skill_fitness(&self, id: &SkillId, success: bool) -> Result<(), MemoryError>;
+    async fn store_strategy(&self, strategy: Strategy) -> Result<StrategyId, MemoryError>;
+    async fn find_strategy(&self, goal: &str) -> Result<Option<Strategy>, MemoryError>;
+    async fn update_strategy_fitness(
+        &self,
+        id: &StrategyId,
+        success: bool,
+    ) -> Result<(), MemoryError>;
 }

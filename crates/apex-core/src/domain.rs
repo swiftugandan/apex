@@ -193,6 +193,56 @@ pub struct ReapResult {
     pub lease_reaped: u32,
 }
 
+// ── Long-Term Memory types ────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FactId(pub String);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillId(pub String);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StrategyId(pub String);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fact {
+    pub id: FactId,
+    pub content: String,
+    pub source_job: String,
+    pub confidence: f64,
+    pub created_at: String,
+    pub last_verified: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Skill {
+    pub id: SkillId,
+    pub task_pattern: String,
+    pub approach: String,
+    pub tools_used: Vec<String>,
+    pub criteria_template: Option<String>,
+    pub success_count: u32,
+    pub failure_count: u32,
+    pub fitness: f64,
+    pub min_samples: u32,
+    pub last_used: String,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Strategy {
+    pub id: StrategyId,
+    pub goal_pattern: String,
+    pub decomposition: String,
+    pub avg_subtasks: f64,
+    pub avg_duration_secs: f64,
+    pub success_count: u32,
+    pub failure_count: u32,
+    pub fitness: f64,
+    pub notes: String,
+}
+
 // ── Working Memory types ──────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

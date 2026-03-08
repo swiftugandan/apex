@@ -16,6 +16,7 @@ apex-context = { path = "../apex-context" }
 apex-memory = { path = "../apex-memory" }
 apex-eval = { path = "../apex-eval" }
 rfbmq-core = { path = "../../vendor/rfbmq-core" }
+rusqlite = { version = "0.31", features = ["bundled"] }
 anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true

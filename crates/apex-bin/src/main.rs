@@ -15,9 +15,10 @@ use apex_core::domain::{
     ToolResult, TurnRecord,
 };
 use apex_core::error::ToolError;
-use apex_core::ports::{LlmProvider, Queue, ToolRegistry, WorkingMemory};
+use apex_core::domain::{Fact, FactId, Skill, SkillId, Strategy, StrategyId};
+use apex_core::ports::{LlmProvider, MemoryStore, Queue, ToolRegistry, WorkingMemory};
 use apex_llm::anthropic::AnthropicProvider;
-use apex_memory::{FsScratchpadStore, MemoryToolRegistry};
+use apex_memory::{FsScratchpadStore, LongTermMemoryToolRegistry, MemoryToolRegistry, SqliteMemoryStore};
 use apex_queue::RfbmqAdapter;
 use apex_tools::BuiltinToolRegistry;
 
@@ -71,6 +72,7 @@ struct ApexPaths {
     prompts_dir: PathBuf,
     queue_dir: PathBuf,
     memory_dir: PathBuf,
+    long_term_memory_dir: PathBuf,
 }
 
 impl ApexPaths {
@@ -83,8 +85,13 @@ impl ApexPaths {
             prompts_dir: root.join("prompts"),
             queue_dir: root.join("queues").join("work"),
             memory_dir: root.join("memory").join("working"),
+            long_term_memory_dir: root.join("memory").join("long-term"),
             root,
         })
+    }
+
+    fn long_term_db_path(&self) -> PathBuf {
+        self.long_term_memory_dir.join("memory.db")
     }
 }
 
@@ -128,8 +135,22 @@ async fn main() -> Result<()> {
         }
         Some("work") => cmd_work().await,
         Some("status") => cmd_status().await,
+        Some("memory") => {
+            let subcmd = args.get(1).map(|s| s.as_str());
+            match subcmd {
+                Some("facts") => cmd_memory_facts().await,
+                Some("skills") => cmd_memory_skills().await,
+                Some("strategies") => cmd_memory_strategies().await,
+                None => {
+                    cmd_memory_facts().await?;
+                    cmd_memory_skills().await?;
+                    cmd_memory_strategies().await
+                }
+                Some(sub) => bail!("unknown memory subcommand: {sub}. Available: facts, skills, strategies"),
+            }
+        }
         Some(cmd) => bail!(
-            "unknown command: {cmd}. Available: init, run, queue, cat, work, status"
+            "unknown command: {cmd}. Available: init, run, queue, cat, work, status, memory"
         ),
         None => bail!("no command provided. Usage: apex <command>"),
     }
@@ -146,11 +167,15 @@ async fn cmd_init() -> Result<()> {
     std::fs::create_dir_all(&paths.memory_dir)
         .context("failed to create memory/working/ directory")?;
 
+    std::fs::create_dir_all(&paths.long_term_memory_dir)
+        .context("failed to create memory/long-term/ directory")?;
+
     RfbmqAdapter::init(&paths.queue_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     eprintln!("✓ Initialized apex at {}", paths.root.display());
-    eprintln!("  queue:  {}", paths.queue_dir.display());
-    eprintln!("  memory: {}", paths.memory_dir.display());
+    eprintln!("  queue:    {}", paths.queue_dir.display());
+    eprintln!("  memory:   {}", paths.memory_dir.display());
+    eprintln!("  long-term: {}", paths.long_term_memory_dir.display());
     Ok(())
 }
 
@@ -347,6 +372,11 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
         Arc::new(FsScratchpadStore::new(paths.memory_dir.clone()));
     let queue: Arc<dyn Queue> = adapter.clone();
 
+    let long_term: Arc<dyn MemoryStore> = Arc::new(
+        SqliteMemoryStore::open(&paths.long_term_db_path())
+            .context("failed to open long-term memory database")?,
+    );
+
     let persona = Arc::new(persona);
     let evaluator_persona = Arc::new(evaluator_persona);
     let eval_config = Arc::new(eval_config);
@@ -360,6 +390,7 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
             llm,
             eval_llm,
             memory,
+            long_term,
             persona,
             evaluator_persona,
             eval_config,
@@ -375,6 +406,7 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
             let llm = Arc::clone(&llm);
             let eval_llm = Arc::clone(&eval_llm);
             let memory = Arc::clone(&memory);
+            let long_term = Arc::clone(&long_term);
             let persona = Arc::clone(&persona);
             let evaluator_persona = Arc::clone(&evaluator_persona);
             let eval_config = Arc::clone(&eval_config);
@@ -386,6 +418,7 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
                     llm,
                     eval_llm,
                     memory,
+                    long_term,
                     persona,
                     evaluator_persona,
                     eval_config,
@@ -410,6 +443,7 @@ async fn worker_loop(
     llm: Arc<AnthropicProvider>,
     eval_llm: Arc<dyn LlmProvider>,
     memory: Arc<dyn WorkingMemory>,
+    long_term: Arc<dyn MemoryStore>,
     persona: Arc<String>,
     evaluator_persona: Arc<String>,
     eval_config: Arc<apex_eval::EvalConfig>,
@@ -475,12 +509,15 @@ async fn worker_loop(
             max_depth,
             extract_title(&claimed.body),
             claimed.body.clone(),
+            Some(Arc::clone(&long_term)),
         );
 
         let memory_tools = MemoryToolRegistry::new(Arc::clone(&memory));
+        let lt_memory_tools = LongTermMemoryToolRegistry::new(Arc::clone(&long_term));
         let tools = CompositeToolRegistry::new(vec![
             Box::new(BuiltinToolRegistry::new()),
             Box::new(memory_tools),
+            Box::new(lt_memory_tools),
             Box::new(queue_tools),
         ]);
 
@@ -492,6 +529,7 @@ async fn worker_loop(
                     llm.as_ref(),
                     &tools,
                     memory.as_ref(),
+                    long_term.as_ref(),
                     eval_llm.as_ref(),
                     &eval_config,
                     &evaluator_persona,
@@ -530,6 +568,7 @@ async fn worker_loop(
                     &tools,
                     memory.as_ref(),
                     queue.as_ref(),
+                    long_term.as_ref(),
                     eval_llm.as_ref(),
                     &eval_config,
                     &evaluator_persona,
@@ -619,6 +658,7 @@ async fn execute_task(
     llm: &dyn LlmProvider,
     tools: &dyn ToolRegistry,
     memory: &dyn WorkingMemory,
+    long_term: &dyn MemoryStore,
     eval_llm: &dyn LlmProvider,
     eval_config: &apex_eval::EvalConfig,
     evaluator_persona: &str,
@@ -816,6 +856,15 @@ async fn execute_task(
         eval_summary,
     };
 
+    // Best-effort consolidation of learnings into long-term memory
+    consolidate_learnings(
+        long_term,
+        &claimed.headers.correlation_id,
+        &record,
+        &scratchpad,
+    )
+    .await;
+
     Ok(record)
 }
 
@@ -828,6 +877,7 @@ async fn execute_continuation(
     tools: &dyn ToolRegistry,
     memory: &dyn WorkingMemory,
     queue: &dyn Queue,
+    long_term: &dyn MemoryStore,
     eval_llm: &dyn LlmProvider,
     eval_config: &apex_eval::EvalConfig,
     evaluator_persona: &str,
@@ -1038,7 +1088,316 @@ async fn execute_continuation(
         eval_summary,
     };
 
+    // Best-effort consolidation of learnings into long-term memory
+    consolidate_learnings(
+        long_term,
+        &claimed.headers.correlation_id,
+        &record,
+        &scratchpad,
+    )
+    .await;
+
     Ok(record)
+}
+
+// ── Consolidation ─────────────────────────────────────────────────
+
+/// Best-effort consolidation of learnings from a successful task into long-term memory.
+/// Extracts facts, skills, and strategies from the execution record.
+async fn consolidate_learnings(
+    store: &dyn MemoryStore,
+    correlation_id: &str,
+    record: &AttemptRecord,
+    scratchpad: &apex_core::domain::Scratchpad,
+) {
+    // 1. Extract facts from "## New Facts Discovered" sections in final_text
+    if let Some(ref text) = record.final_text {
+        let mut in_facts_section = false;
+        for line in text.lines() {
+            if line.contains("New Facts Discovered") || line.contains("new facts discovered") {
+                in_facts_section = true;
+                continue;
+            }
+            if in_facts_section && line.starts_with("## ") {
+                break;
+            }
+            if in_facts_section {
+                if let Some(content) = line.strip_prefix("- ") {
+                    let content = content.trim();
+                    if !content.is_empty() {
+                        let fact = Fact {
+                            id: FactId(String::new()),
+                            content: content.to_string(),
+                            source_job: correlation_id.to_string(),
+                            confidence: 0.8,
+                            created_at: String::new(),
+                            last_verified: String::new(),
+                            tags: vec![],
+                        };
+                        if let Err(e) = store.store_fact(fact).await {
+                            eprintln!("  consolidation: failed to store fact: {e}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Skills: update fitness for successful tasks that used tools
+    let title = &scratchpad.goal;
+    if !title.is_empty() {
+        match store.find_skill(title).await {
+            Ok(Some(skill)) => {
+                if let Err(e) = store.update_skill_fitness(&skill.id, record.outcome == AttemptOutcome::Success).await {
+                    eprintln!("  consolidation: failed to update skill fitness: {e}");
+                }
+            }
+            Ok(None) => {
+                // Create a new skill record if tools were used
+                let tools_used: Vec<String> = record
+                    .turns
+                    .iter()
+                    .flat_map(|t| t.tool_calls.iter())
+                    .map(|tc| tc.name.clone())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+
+                if !tools_used.is_empty() && record.outcome == AttemptOutcome::Success {
+                    let skill = Skill {
+                        id: SkillId(String::new()),
+                        task_pattern: title.to_string(),
+                        approach: record
+                            .final_text
+                            .as_deref()
+                            .unwrap_or("")
+                            .lines()
+                            .take(3)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        tools_used,
+                        criteria_template: None,
+                        success_count: 1,
+                        failure_count: 0,
+                        fitness: 0.5,
+                        min_samples: 3,
+                        last_used: String::new(),
+                        notes: String::new(),
+                    };
+                    if let Err(e) = store.store_skill(skill).await {
+                        eprintln!("  consolidation: failed to store skill: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("  consolidation: failed to find skill: {e}");
+            }
+        }
+    }
+
+    // 3. Strategies: for jobs with subtasks, store decomposition pattern
+    if !scratchpad.subtasks.is_empty() && !scratchpad.goal.is_empty() {
+        let decomposition = scratchpad
+            .subtasks
+            .iter()
+            .map(|st| format!("{}. {}", st.index, st.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        match store.find_strategy(&scratchpad.goal).await {
+            Ok(Some(strategy)) => {
+                let success = scratchpad
+                    .subtasks
+                    .iter()
+                    .all(|st| st.status == apex_core::domain::SubtaskStatus::Done);
+                if let Err(e) = store.update_strategy_fitness(&strategy.id, success).await {
+                    eprintln!("  consolidation: failed to update strategy fitness: {e}");
+                }
+            }
+            Ok(None) => {
+                let strategy = Strategy {
+                    id: StrategyId(String::new()),
+                    goal_pattern: scratchpad.goal.clone(),
+                    decomposition,
+                    avg_subtasks: scratchpad.subtasks.len() as f64,
+                    avg_duration_secs: 0.0,
+                    success_count: if record.outcome == AttemptOutcome::Success { 1 } else { 0 },
+                    failure_count: if record.outcome == AttemptOutcome::Failed { 1 } else { 0 },
+                    fitness: 0.5,
+                    notes: String::new(),
+                };
+                if let Err(e) = store.store_strategy(strategy).await {
+                    eprintln!("  consolidation: failed to store strategy: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("  consolidation: failed to find strategy: {e}");
+            }
+        }
+    }
+}
+
+// ── CLI memory commands ───────────────────────────────────────────
+
+async fn cmd_memory_facts() -> Result<()> {
+    let paths = ApexPaths::resolve()?;
+    let db_path = paths.long_term_db_path();
+    if !db_path.exists() {
+        bail!("no long-term memory database found. Run 'apex init' first.");
+    }
+    let store = SqliteMemoryStore::open(&db_path)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let facts = store.query_facts("", 100).await?;
+    if facts.is_empty() {
+        println!("No facts stored.");
+        return Ok(());
+    }
+
+    println!("── Facts ({}) ──", facts.len());
+    println!(
+        "{:<20} {:<50} {:<10} {:<20}",
+        "ID", "Content", "Confidence", "Tags"
+    );
+    for f in &facts {
+        let short_id = if f.id.0.len() > 18 {
+            &f.id.0[..18]
+        } else {
+            &f.id.0
+        };
+        let content = if f.content.len() > 48 {
+            format!("{}…", &f.content[..47])
+        } else {
+            f.content.clone()
+        };
+        let tags = f.tags.join(", ");
+        println!(
+            "{:<20} {:<50} {:<10.2} {:<20}",
+            short_id, content, f.confidence, tags
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_memory_skills() -> Result<()> {
+    let paths = ApexPaths::resolve()?;
+    let db_path = paths.long_term_db_path();
+    if !db_path.exists() {
+        bail!("no long-term memory database found. Run 'apex init' first.");
+    }
+    let store = SqliteMemoryStore::open(&db_path)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Query all skills by using empty pattern
+    let skill = store.find_skill("").await?;
+    // For a full listing we need direct DB access; use query_facts pattern
+    // Actually, let's just open DB directly for the listing
+    let conn = rusqlite::Connection::open(&db_path)
+        .map_err(|e| anyhow::anyhow!("failed to open db: {e}"))?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, task_pattern, fitness, success_count, failure_count, last_used
+             FROM skills ORDER BY fitness DESC",
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let rows: Vec<(String, String, f64, u32, u32, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if rows.is_empty() {
+        println!("No skills stored.");
+        return Ok(());
+    }
+
+    println!("── Skills ({}) ──", rows.len());
+    println!(
+        "{:<20} {:<40} {:<10} {:<8} {:<8}",
+        "ID", "Pattern", "Fitness", "Success", "Failure"
+    );
+    for (id, pattern, fitness, succ, fail, _last_used) in &rows {
+        let short_id = if id.len() > 18 { &id[..18] } else { id };
+        let short_pattern = if pattern.len() > 38 {
+            format!("{}…", &pattern[..37])
+        } else {
+            pattern.clone()
+        };
+        println!(
+            "{:<20} {:<40} {:<10.2} {:<8} {:<8}",
+            short_id, short_pattern, fitness, succ, fail
+        );
+    }
+    let _ = skill; // suppress unused warning
+    Ok(())
+}
+
+async fn cmd_memory_strategies() -> Result<()> {
+    let paths = ApexPaths::resolve()?;
+    let db_path = paths.long_term_db_path();
+    if !db_path.exists() {
+        bail!("no long-term memory database found. Run 'apex init' first.");
+    }
+
+    let conn = rusqlite::Connection::open(&db_path)
+        .map_err(|e| anyhow::anyhow!("failed to open db: {e}"))?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, goal_pattern, fitness, avg_subtasks, success_count, failure_count
+             FROM strategies ORDER BY fitness DESC",
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let rows: Vec<(String, String, f64, f64, u32, u32)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if rows.is_empty() {
+        println!("No strategies stored.");
+        return Ok(());
+    }
+
+    println!("── Strategies ({}) ──", rows.len());
+    println!(
+        "{:<20} {:<40} {:<10} {:<12} {:<8} {:<8}",
+        "ID", "Goal Pattern", "Fitness", "Avg Subtasks", "Success", "Failure"
+    );
+    for (id, pattern, fitness, avg_sub, succ, fail) in &rows {
+        let short_id = if id.len() > 18 { &id[..18] } else { id };
+        let short_pattern = if pattern.len() > 38 {
+            format!("{}…", &pattern[..37])
+        } else {
+            pattern.clone()
+        };
+        println!(
+            "{:<20} {:<40} {:<10.2} {:<12.1} {:<8} {:<8}",
+            short_id, short_pattern, fitness, avg_sub, succ, fail
+        );
+    }
+    Ok(())
 }
 
 // ── Utilities ──────────────────────────────────────────────────────

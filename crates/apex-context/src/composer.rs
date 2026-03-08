@@ -1,5 +1,5 @@
 use crate::estimator::TokenEstimator;
-use apex_core::domain::{AttemptOutcome, AttemptRecord, Scratchpad};
+use apex_core::domain::{AttemptOutcome, AttemptRecord, Fact, Scratchpad, Skill};
 
 pub struct MessageComposer;
 
@@ -122,6 +122,76 @@ impl MessageComposer {
              ## Acceptance Criteria\n\
              {acceptance_criteria}\n"
         )
+    }
+
+    /// Compose a subtask message body with embedded parent context and long-term memory.
+    pub fn compose_subtask_with_memory(
+        title: &str,
+        description: &str,
+        acceptance_criteria: &str,
+        parent_goal: &str,
+        parent_context: &str,
+        relevant_facts: &[Fact],
+        recommended_skill: Option<&Skill>,
+    ) -> String {
+        let budgeted_goal = TokenEstimator::budget(parent_goal, 500);
+        let budgeted_context = TokenEstimator::budget(parent_context, 1000);
+
+        let mut out = format!(
+            "# Subtask: {title}\n\n\
+             ## Parent Goal\n\
+             {budgeted_goal}\n\n\
+             ## Context\n\
+             {budgeted_context}\n\n"
+        );
+
+        if !relevant_facts.is_empty() {
+            out.push_str("## Relevant Facts\n");
+            for fact in relevant_facts {
+                let budgeted = TokenEstimator::budget(&fact.content, 200);
+                out.push_str(&format!(
+                    "- [confidence: {:.2}] {budgeted}\n",
+                    fact.confidence
+                ));
+            }
+            out.push('\n');
+        }
+
+        if let Some(skill) = recommended_skill {
+            out.push_str("## Recommended Approach\n");
+            out.push_str(&format!("**Pattern:** {}\n", skill.task_pattern));
+            let budgeted_approach = TokenEstimator::budget(&skill.approach, 300);
+            out.push_str(&format!("**Approach:** {budgeted_approach}\n"));
+            if !skill.tools_used.is_empty() {
+                out.push_str(&format!("**Tools:** {}\n", skill.tools_used.join(", ")));
+            }
+            out.push_str(&format!("**Fitness:** {:.2}\n\n", skill.fitness));
+        }
+
+        // Determine acceptance criteria: use skill template if available and criteria is default
+        let effective_criteria =
+            if acceptance_criteria == "(to be determined by agent)" {
+                if let Some(skill) = recommended_skill {
+                    if let Some(ref template) = skill.criteria_template {
+                        template.as_str()
+                    } else {
+                        acceptance_criteria
+                    }
+                } else {
+                    acceptance_criteria
+                }
+            } else {
+                acceptance_criteria
+            };
+
+        out.push_str(&format!(
+            "## Task\n\
+             {description}\n\n\
+             ## Acceptance Criteria\n\
+             {effective_criteria}\n"
+        ));
+
+        out
     }
 
     /// Compose a continuation message body that triggers result assembly.

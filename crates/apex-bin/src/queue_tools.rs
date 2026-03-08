@@ -8,7 +8,7 @@ use apex_core::domain::{
     MessageHeaders, MessageType, QueueMessage, ToolCall, ToolDef, ToolResult, ToolSchema,
 };
 use apex_core::error::ToolError;
-use apex_core::ports::{Queue, ToolRegistry};
+use apex_core::ports::{MemoryStore, Queue, ToolRegistry};
 
 pub struct QueueToolRegistry {
     queue: Arc<dyn Queue>,
@@ -17,6 +17,7 @@ pub struct QueueToolRegistry {
     max_depth: u32,
     parent_goal: String,
     parent_body: String,
+    store: Option<Arc<dyn MemoryStore>>,
 }
 
 impl QueueToolRegistry {
@@ -27,6 +28,7 @@ impl QueueToolRegistry {
         max_depth: u32,
         parent_goal: String,
         parent_body: String,
+        store: Option<Arc<dyn MemoryStore>>,
     ) -> Self {
         Self {
             queue,
@@ -35,6 +37,7 @@ impl QueueToolRegistry {
             max_depth,
             parent_goal,
             parent_body,
+            store,
         }
     }
 
@@ -118,13 +121,34 @@ impl QueueToolRegistry {
             let title = info.description.lines().next().unwrap_or(&info.description);
             let title = if title.len() > 80 { &title[..80] } else { title };
 
-            let body = MessageComposer::compose_subtask(
-                title,
-                &info.description,
-                &info.acceptance_criteria,
-                &self.parent_goal,
-                &self.parent_body,
-            );
+            // Query long-term memory for relevant facts and skills
+            let (facts, skill) = if let Some(ref store) = self.store {
+                let facts = store.query_facts(&info.description, 3).await.ok().unwrap_or_default();
+                let skill = store.find_skill(&info.description).await.ok().flatten();
+                (facts, skill)
+            } else {
+                (Vec::new(), None)
+            };
+
+            let body = if !facts.is_empty() || skill.is_some() {
+                MessageComposer::compose_subtask_with_memory(
+                    title,
+                    &info.description,
+                    &info.acceptance_criteria,
+                    &self.parent_goal,
+                    &self.parent_body,
+                    &facts,
+                    skill.as_ref(),
+                )
+            } else {
+                MessageComposer::compose_subtask(
+                    title,
+                    &info.description,
+                    &info.acceptance_criteria,
+                    &self.parent_goal,
+                    &self.parent_body,
+                )
+            };
 
             let depends_on: Vec<String> = info
                 .depends_on_indices

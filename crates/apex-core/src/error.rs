@@ -30,6 +30,8 @@ pub enum MemoryError {
     Parse(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("database error: {0}")]
+    Database(String),
 }
 
 #[derive(Debug, Error)]
