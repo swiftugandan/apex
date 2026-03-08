@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
 use crate::domain::{
-    ClaimedTask, CompletionRequest, CompletionResponse, Fact, FactId, QueueDepth, QueueMessage,
-    ReapResult, Scratchpad, Skill, SkillId, Strategy, StrategyId, ToolCall,
+    CalibrationData, ClaimedTask, CompletionRequest, CompletionResponse, Fact, FactId, QueueDepth,
+    QueueMessage, ReapResult, Scratchpad, Skill, SkillId, Strategy, StrategyId, ToolCall,
     ToolCompletionResponse, ToolDef, ToolResult, ToolSchema,
 };
 use crate::error::{LlmError, MemoryError, QueueError, ToolError};
@@ -70,4 +70,7 @@ pub trait MemoryStore: Send + Sync {
         id: &StrategyId,
         success: bool,
     ) -> Result<(), MemoryError>;
+
+    async fn persist_calibration(&self, data: &CalibrationData) -> Result<(), MemoryError>;
+    async fn load_calibration(&self) -> Result<CalibrationData, MemoryError>;
 }

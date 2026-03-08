@@ -42,6 +42,8 @@ pub async fn execute(call: &ToolCall) -> Result<ToolResult, ToolError> {
                     "truncated": truncated,
                 }),
                 is_error: false,
+                truncated,
+                ..Default::default()
             })
         }
         Err(e) => Ok(ToolResult {
@@ -49,6 +51,7 @@ pub async fn execute(call: &ToolCall) -> Result<ToolResult, ToolError> {
             name: call.name.clone(),
             output: json!({ "error": e.to_string() }),
             is_error: true,
+            ..Default::default()
         }),
     }
 }

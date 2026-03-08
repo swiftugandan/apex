@@ -63,12 +63,14 @@ pub async fn execute(call: &ToolCall) -> Result<ToolResult, ToolError> {
                 "appended": append,
             }),
             is_error: false,
+            ..Default::default()
         }),
         Err(e) => Ok(ToolResult {
             tool_use_id: call.id.clone(),
             name: call.name.clone(),
             output: json!({ "error": e.to_string() }),
             is_error: true,
+            ..Default::default()
         }),
     }
 }

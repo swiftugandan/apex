@@ -4,15 +4,16 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 
-use apex_context::MessageComposer;
+use apex_context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{
-    AttemptOutcome, AttemptRecord, ChatMessage, ClaimedTask, CompletionRequest, ContentBlock,
-    MessageHeaders, MessageRole, MessageType, QueueMessage, ToolCall, ToolCallRecord, ToolDef,
-    ToolResult, TurnRecord,
+    AttemptOutcome, AttemptRecord, ChatMessage, ClaimedTask, CompletionRequest,
+    ContentBlock, MessageHeaders, MessageRole, MessageType, QueueMessage, ToolCall, ToolCallRecord,
+    ToolDef, ToolResult, TurnRecord,
 };
 use apex_core::error::ToolError;
 use apex_core::domain::{Fact, FactId, Skill, SkillId, Strategy, StrategyId};
@@ -21,6 +22,7 @@ use apex_llm::anthropic::AnthropicProvider;
 use apex_memory::{FsScratchpadStore, LongTermMemoryToolRegistry, MemoryToolRegistry, SqliteMemoryStore};
 use apex_queue::RfbmqAdapter;
 use apex_tools::BuiltinToolRegistry;
+use apex_tools::spill::SpillManager;
 
 use crate::queue_tools::QueueToolRegistry;
 
@@ -73,6 +75,7 @@ struct ApexPaths {
     queue_dir: PathBuf,
     memory_dir: PathBuf,
     long_term_memory_dir: PathBuf,
+    scratch_dir: PathBuf,
 }
 
 impl ApexPaths {
@@ -86,6 +89,7 @@ impl ApexPaths {
             queue_dir: root.join("queues").join("work"),
             memory_dir: root.join("memory").join("working"),
             long_term_memory_dir: root.join("memory").join("long-term"),
+            scratch_dir: root.join("scratch"),
             root,
         })
     }
@@ -141,16 +145,24 @@ async fn main() -> Result<()> {
                 Some("facts") => cmd_memory_facts().await,
                 Some("skills") => cmd_memory_skills().await,
                 Some("strategies") => cmd_memory_strategies().await,
+                Some("calibration") => cmd_memory_calibration().await,
                 None => {
                     cmd_memory_facts().await?;
                     cmd_memory_skills().await?;
                     cmd_memory_strategies().await
                 }
-                Some(sub) => bail!("unknown memory subcommand: {sub}. Available: facts, skills, strategies"),
+                Some(sub) => bail!("unknown memory subcommand: {sub}. Available: facts, skills, strategies, calibration"),
+            }
+        }
+        Some("scratch") => {
+            let subcmd = args.get(1).map(|s| s.as_str());
+            match subcmd {
+                Some("ls") | None => cmd_scratch_ls().await,
+                Some(sub) => bail!("unknown scratch subcommand: {sub}. Available: ls"),
             }
         }
         Some(cmd) => bail!(
-            "unknown command: {cmd}. Available: init, run, queue, cat, work, status, memory"
+            "unknown command: {cmd}. Available: init, run, queue, cat, work, status, memory, scratch"
         ),
         None => bail!("no command provided. Usage: apex <command>"),
     }
@@ -170,12 +182,16 @@ async fn cmd_init() -> Result<()> {
     std::fs::create_dir_all(&paths.long_term_memory_dir)
         .context("failed to create memory/long-term/ directory")?;
 
+    std::fs::create_dir_all(&paths.scratch_dir)
+        .context("failed to create scratch/ directory")?;
+
     RfbmqAdapter::init(&paths.queue_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     eprintln!("✓ Initialized apex at {}", paths.root.display());
     eprintln!("  queue:    {}", paths.queue_dir.display());
     eprintln!("  memory:   {}", paths.memory_dir.display());
     eprintln!("  long-term: {}", paths.long_term_memory_dir.display());
+    eprintln!("  scratch:  {}", paths.scratch_dir.display());
     Ok(())
 }
 
@@ -233,6 +249,14 @@ async fn cmd_queue_reap() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     eprintln!("reaped {} lease(s)", result.lease_reaped);
+
+    // Clean scratch files after reap
+    let spill = SpillManager::new(paths.scratch_dir);
+    match spill.clean_all() {
+        Ok(n) if n > 0 => eprintln!("cleaned {n} scratch file(s)"),
+        _ => {}
+    }
+
     Ok(())
 }
 
@@ -377,6 +401,12 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
             .context("failed to open long-term memory database")?,
     );
 
+    // Load calibration data for token estimation
+    let calibration = long_term.load_calibration().await.unwrap_or_default();
+    let estimator = Arc::new(Mutex::new(TokenEstimator::new(calibration)));
+
+    let scratch_dir = paths.scratch_dir.clone();
+
     let persona = Arc::new(persona);
     let evaluator_persona = Arc::new(evaluator_persona);
     let eval_config = Arc::new(eval_config);
@@ -396,6 +426,8 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
             eval_config,
             max_depth,
             0,
+            scratch_dir,
+            estimator,
         )
         .await
     } else {
@@ -410,6 +442,8 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
             let persona = Arc::clone(&persona);
             let evaluator_persona = Arc::clone(&evaluator_persona);
             let eval_config = Arc::clone(&eval_config);
+            let scratch_dir = scratch_dir.clone();
+            let estimator = Arc::clone(&estimator);
 
             handles.push(tokio::spawn(async move {
                 worker_loop(
@@ -424,6 +458,8 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
                     eval_config,
                     max_depth,
                     worker_id,
+                    scratch_dir,
+                    estimator,
                 )
                 .await
             }));
@@ -449,6 +485,8 @@ async fn worker_loop(
     eval_config: Arc<apex_eval::EvalConfig>,
     max_depth: u32,
     worker_id: usize,
+    scratch_dir: PathBuf,
+    estimator: Arc<Mutex<TokenEstimator>>,
 ) -> Result<()> {
     let mut empty_cycles = 0u32;
 
@@ -515,11 +553,17 @@ async fn worker_loop(
         let memory_tools = MemoryToolRegistry::new(Arc::clone(&memory));
         let lt_memory_tools = LongTermMemoryToolRegistry::new(Arc::clone(&long_term));
         let tools = CompositeToolRegistry::new(vec![
-            Box::new(BuiltinToolRegistry::new()),
+            Box::new(BuiltinToolRegistry::new(scratch_dir.clone())),
             Box::new(memory_tools),
             Box::new(lt_memory_tools),
             Box::new(queue_tools),
         ]);
+
+        // Build composer with current calibration
+        let composer = {
+            let est = estimator.lock().await;
+            MessageComposer::new(TokenEstimator::new(est.calibration_data().clone()))
+        };
 
         match claimed.headers.message_type {
             MessageType::Goal | MessageType::Task | MessageType::Subtask => {
@@ -533,6 +577,7 @@ async fn worker_loop(
                     eval_llm.as_ref(),
                     &eval_config,
                     &evaluator_persona,
+                    &estimator,
                 )
                 .await
                 {
@@ -554,7 +599,7 @@ async fn worker_loop(
                     }
                     Err((record, err, scratchpad)) => {
                         handle_failure(
-                            &adapter, &claimed, &record, &err, &scratchpad, worker_id,
+                            &adapter, &claimed, &record, &err, &scratchpad, worker_id, &composer,
                         )
                         .await?;
                     }
@@ -572,6 +617,7 @@ async fn worker_loop(
                     eval_llm.as_ref(),
                     &eval_config,
                     &evaluator_persona,
+                    &estimator,
                 )
                 .await
                 {
@@ -593,7 +639,7 @@ async fn worker_loop(
                     }
                     Err((record, err, scratchpad)) => {
                         handle_failure(
-                            &adapter, &claimed, &record, &err, &scratchpad, worker_id,
+                            &adapter, &claimed, &record, &err, &scratchpad, worker_id, &composer,
                         )
                         .await?;
                     }
@@ -610,11 +656,12 @@ async fn handle_failure(
     err: &str,
     scratchpad: &apex_core::domain::Scratchpad,
     worker_id: usize,
+    composer: &MessageComposer,
 ) -> Result<()> {
     eprintln!("[worker {worker_id}] ✗ {} failed: {err}", claimed.id);
 
     let updated_body =
-        MessageComposer::append_attempt_with_memory(&claimed.body, record, scratchpad);
+        composer.append_attempt_with_memory(&claimed.body, record, scratchpad);
 
     adapter
         .update_body(claimed, &updated_body)
@@ -662,6 +709,7 @@ async fn execute_task(
     eval_llm: &dyn LlmProvider,
     eval_config: &apex_eval::EvalConfig,
     evaluator_persona: &str,
+    estimator: &Arc<Mutex<TokenEstimator>>,
 ) -> std::result::Result<AttemptRecord, (AttemptRecord, String, apex_core::domain::Scratchpad)> {
     let started_at = now_iso();
     let schemas = tools.schemas();
@@ -727,6 +775,23 @@ async fn execute_task(
             resp.usage.output_tokens,
         );
 
+        // Calibrate token estimator from actual usage
+        {
+            let prompt_text: String = messages
+                .iter()
+                .map(|m| m.text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut est = estimator.lock().await;
+            est.calibrate(&prompt_text, resp.usage.input_tokens);
+            // Persist every 5 samples
+            if est.calibration_data().sample_count % 5 == 0 {
+                let cal = est.calibration_data().clone();
+                drop(est);
+                let _ = long_term.persist_calibration(&cal).await;
+            }
+        }
+
         messages.push(resp.message.clone());
 
         // If no tool calls, this is the final response
@@ -757,6 +822,7 @@ async fn execute_task(
                     name: call.name.clone(),
                     output: serde_json::json!({ "error": err.to_string() }),
                     is_error: true,
+                    ..Default::default()
                 },
             };
 
@@ -881,6 +947,7 @@ async fn execute_continuation(
     eval_llm: &dyn LlmProvider,
     eval_config: &apex_eval::EvalConfig,
     evaluator_persona: &str,
+    estimator: &Arc<Mutex<TokenEstimator>>,
 ) -> std::result::Result<AttemptRecord, (AttemptRecord, String, apex_core::domain::Scratchpad)> {
     let started_at = now_iso();
     let job_id = &claimed.headers.correlation_id;
@@ -967,6 +1034,22 @@ async fn execute_continuation(
             resp.usage.output_tokens,
         );
 
+        // Calibrate token estimator from actual usage
+        {
+            let prompt_text: String = messages
+                .iter()
+                .map(|m| m.text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut est = estimator.lock().await;
+            est.calibrate(&prompt_text, resp.usage.input_tokens);
+            if est.calibration_data().sample_count % 5 == 0 {
+                let cal = est.calibration_data().clone();
+                drop(est);
+                let _ = long_term.persist_calibration(&cal).await;
+            }
+        }
+
         messages.push(resp.message.clone());
 
         if resp.tool_calls.is_empty() {
@@ -995,6 +1078,7 @@ async fn execute_continuation(
                     name: call.name.clone(),
                     output: serde_json::json!({ "error": err.to_string() }),
                     is_error: true,
+                    ..Default::default()
                 },
             };
 
@@ -1397,6 +1481,48 @@ async fn cmd_memory_strategies() -> Result<()> {
             short_id, short_pattern, fitness, avg_sub, succ, fail
         );
     }
+    Ok(())
+}
+
+// ── Scratch and calibration CLI commands ───────────────────────────
+
+async fn cmd_scratch_ls() -> Result<()> {
+    let paths = ApexPaths::resolve()?;
+    let spill = SpillManager::new(paths.scratch_dir);
+    let entries = spill.list().map_err(|e| anyhow::anyhow!("failed to list scratch: {e}"))?;
+
+    if entries.is_empty() {
+        println!("No scratch files.");
+        return Ok(());
+    }
+
+    println!("── Scratch files ({}) ──", entries.len());
+    for entry in &entries {
+        let name = std::path::Path::new(&entry.path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let size_kb = entry.size as f64 / 1024.0;
+        println!("  {name:<40} {size_kb:.1} KB");
+    }
+    Ok(())
+}
+
+async fn cmd_memory_calibration() -> Result<()> {
+    let paths = ApexPaths::resolve()?;
+    let db_path = paths.long_term_db_path();
+    if !db_path.exists() {
+        bail!("no long-term memory database found. Run 'apex init' first.");
+    }
+    let store = SqliteMemoryStore::open(&db_path)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let cal = store.load_calibration().await?;
+    println!("── Token Calibration ──");
+    println!("  Prose ratio:  {:.3} chars/token", cal.chars_per_token_prose);
+    println!("  Code ratio:   {:.3} chars/token", cal.chars_per_token_code);
+    println!("  Mixed ratio:  {:.3} chars/token", cal.chars_per_token_mixed);
+    println!("  Sample count: {}", cal.sample_count);
     Ok(())
 }
 

@@ -24,12 +24,21 @@ pub struct ToolCall {
 }
 
 /// Result of executing a tool call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolResult {
     pub tool_use_id: String,
     pub name: String,
+    #[serde(default)]
     pub output: Value,
     pub is_error: bool,
+    #[serde(default)]
+    pub spill_path: Option<String>,
+    #[serde(default)]
+    pub stats: Option<OutputStats>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub duration_ms: u64,
 }
 
 /// Token usage from an LLM response.
@@ -37,6 +46,51 @@ pub struct ToolResult {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+}
+
+/// Content type for token estimation calibration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentType {
+    Prose,
+    Code,
+    Mixed,
+}
+
+/// Calibration data for token estimation, updated from actual LLM responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationData {
+    pub chars_per_token_prose: f32,
+    pub chars_per_token_code: f32,
+    pub chars_per_token_mixed: f32,
+    pub sample_count: u32,
+}
+
+impl Default for CalibrationData {
+    fn default() -> Self {
+        Self {
+            chars_per_token_prose: 4.0,
+            chars_per_token_code: 3.0,
+            chars_per_token_mixed: 3.5,
+            sample_count: 0,
+        }
+    }
+}
+
+/// Statistics about tool output (used with spill).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OutputStats {
+    pub total_lines: u64,
+    pub total_bytes: u64,
+    pub patterns: Vec<(String, u32)>,
+}
+
+/// Strategy for truncating large output before spilling to disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpillStrategy {
+    HeadTail,
+    TailOnly,
 }
 
 /// Request to the LLM.

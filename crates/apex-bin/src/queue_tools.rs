@@ -18,6 +18,7 @@ pub struct QueueToolRegistry {
     parent_goal: String,
     parent_body: String,
     store: Option<Arc<dyn MemoryStore>>,
+    composer: MessageComposer,
 }
 
 impl QueueToolRegistry {
@@ -38,7 +39,14 @@ impl QueueToolRegistry {
             parent_goal,
             parent_body,
             store,
+            composer: MessageComposer::default(),
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_composer(mut self, composer: MessageComposer) -> Self {
+        self.composer = composer;
+        self
     }
 
     async fn handle_decompose_goal(&self, input: &Value) -> Result<Value, ToolError> {
@@ -131,7 +139,7 @@ impl QueueToolRegistry {
             };
 
             let body = if !facts.is_empty() || skill.is_some() {
-                MessageComposer::compose_subtask_with_memory(
+                self.composer.compose_subtask_with_memory(
                     title,
                     &info.description,
                     &info.acceptance_criteria,
@@ -141,7 +149,7 @@ impl QueueToolRegistry {
                     skill.as_ref(),
                 )
             } else {
-                MessageComposer::compose_subtask(
+                self.composer.compose_subtask(
                     title,
                     &info.description,
                     &info.acceptance_criteria,
@@ -311,6 +319,7 @@ impl ToolRegistry for QueueToolRegistry {
             name: call.name.clone(),
             output: result,
             is_error: false,
+            ..Default::default()
         })
     }
 }

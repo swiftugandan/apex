@@ -116,6 +116,7 @@ impl MemoryToolRegistry {
             name: call.name.clone(),
             output: json!({ "content": pad.to_markdown() }),
             is_error: false,
+            ..Default::default()
         })
     }
 
@@ -198,6 +199,7 @@ impl MemoryToolRegistry {
             name: call.name.clone(),
             output: json!({ "content": pad.to_markdown() }),
             is_error: false,
+            ..Default::default()
         })
     }
 }
@@ -447,6 +449,7 @@ impl ToolRegistry for LongTermMemoryToolRegistry {
             name: call.name.clone(),
             output: result,
             is_error: false,
+            ..Default::default()
         })
     }
 }

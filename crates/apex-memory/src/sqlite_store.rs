@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rusqlite::Connection;
 use tokio::sync::Mutex;
 
-use apex_core::domain::{Fact, FactId, Skill, SkillId, Strategy, StrategyId};
+use apex_core::domain::{CalibrationData, Fact, FactId, Skill, SkillId, Strategy, StrategyId};
 use apex_core::error::MemoryError;
 use apex_core::ports::MemoryStore;
 
@@ -57,6 +57,14 @@ impl SqliteMemoryStore {
                 failure_count INTEGER NOT NULL DEFAULT 0,
                 fitness REAL NOT NULL DEFAULT 0.0,
                 notes TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS calibration (
+                id TEXT PRIMARY KEY DEFAULT 'default',
+                chars_per_token_prose REAL NOT NULL,
+                chars_per_token_code REAL NOT NULL,
+                chars_per_token_mixed REAL NOT NULL,
+                sample_count INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
             );",
         )
         .map_err(|e| MemoryError::Database(format!("failed to create tables: {e}")))?;
@@ -460,6 +468,46 @@ impl MemoryStore for SqliteMemoryStore {
         .map_err(|e| MemoryError::Database(e.to_string()))?;
 
         Ok(())
+    }
+
+    async fn persist_calibration(&self, data: &CalibrationData) -> Result<(), MemoryError> {
+        let conn = self.conn.lock().await;
+        let now = Self::now_iso();
+        conn.execute(
+            "INSERT OR REPLACE INTO calibration (id, chars_per_token_prose, chars_per_token_code, chars_per_token_mixed, sample_count, updated_at)
+             VALUES ('default', ?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                data.chars_per_token_prose as f64,
+                data.chars_per_token_code as f64,
+                data.chars_per_token_mixed as f64,
+                data.sample_count,
+                now
+            ],
+        )
+        .map_err(|e| MemoryError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn load_calibration(&self) -> Result<CalibrationData, MemoryError> {
+        let conn = self.conn.lock().await;
+        let result = conn.query_row(
+            "SELECT chars_per_token_prose, chars_per_token_code, chars_per_token_mixed, sample_count
+             FROM calibration WHERE id = 'default'",
+            [],
+            |row| {
+                Ok(CalibrationData {
+                    chars_per_token_prose: row.get::<_, f64>(0)? as f32,
+                    chars_per_token_code: row.get::<_, f64>(1)? as f32,
+                    chars_per_token_mixed: row.get::<_, f64>(2)? as f32,
+                    sample_count: row.get(3)?,
+                })
+            },
+        );
+        match result {
+            Ok(data) => Ok(data),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(CalibrationData::default()),
+            Err(e) => Err(MemoryError::Database(e.to_string())),
+        }
     }
 }
 
