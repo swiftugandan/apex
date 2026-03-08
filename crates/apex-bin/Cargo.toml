@@ -1,0 +1,16 @@
+[package]
+name = "apex-bin"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "apex"
+path = "src/main.rs"
+
+[dependencies]
+apex-core = { path = "../apex-core" }
+apex-llm = { path = "../apex-llm" }
+apex-tools = { path = "../apex-tools" }
+anyhow.workspace = true
+tokio.workspace = true
+serde_json.workspace = true

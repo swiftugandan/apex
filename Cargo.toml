@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/apex-core",
+    "crates/apex-llm",
+    "crates/apex-tools",
+    "crates/apex-bin",
+]
+default-members = ["crates/apex-bin"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "io-std", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
