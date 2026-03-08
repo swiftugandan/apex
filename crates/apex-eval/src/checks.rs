@@ -34,13 +34,14 @@ pub async fn run_check(criterion: &Criterion) -> CriterionResult {
                     actual: truncate(&stdout, 200),
                 },
                 CheckType::OutputMatches(pattern) => {
+                    let trimmed = stdout.trim();
                     let passed = regex::Regex::new(pattern)
-                        .map(|re| re.is_match(&stdout))
+                        .map(|re| re.is_match(trimmed))
                         .unwrap_or(false);
                     CriterionResult {
                         criterion_display: display,
                         passed,
-                        actual: truncate(&stdout, 200),
+                        actual: truncate(trimmed, 200),
                     }
                 }
                 CheckType::NotContains(unexpected) => CriterionResult {

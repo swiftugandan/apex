@@ -42,6 +42,7 @@ pub struct WorkerContext {
     pub eval_config: Arc<apex_eval::EvalConfig>,
     pub max_depth: u32,
     pub max_retries: u32,
+    pub max_tool_result_bytes: usize,
     pub estimator: Arc<Mutex<TokenEstimator>>,
 }
 
@@ -253,6 +254,7 @@ async fn run_agentic_loop(
     tools: &dyn ToolRegistry,
     long_term: &dyn MemoryStore,
     estimator: &Arc<Mutex<TokenEstimator>>,
+    max_tool_result_bytes: usize,
 ) -> (Vec<TurnRecord>, Option<String>, Vec<ChatMessage>) {
     let mut messages = initial_messages;
     let mut turns: Vec<TurnRecord> = Vec::new();
@@ -343,10 +345,18 @@ async fn run_agentic_loop(
                 duration_ms,
             });
 
+            let raw_content = serde_json::to_string(&result.output)
+                .unwrap_or_else(|_| "{}".to_string());
+            let content = if raw_content.len() > max_tool_result_bytes {
+                let truncated = apex_core::truncate_str(&raw_content, max_tool_result_bytes);
+                format!("{truncated}\n\n[truncated: {orig} bytes → {kept} bytes]",
+                    orig = raw_content.len(), kept = truncated.len())
+            } else {
+                raw_content
+            };
             result_blocks.push(ContentBlock::ToolResult {
                 tool_use_id: result.tool_use_id,
-                content: serde_json::to_string(&result.output)
-                    .unwrap_or_else(|_| "{}".to_string()),
+                content,
                 is_error: result.is_error,
             });
         }
@@ -491,6 +501,7 @@ async fn execute_claim(
         tools,
         ctx.long_term.as_ref(),
         &ctx.estimator,
+        ctx.max_tool_result_bytes,
     )
     .await;
 
@@ -584,6 +595,12 @@ fn is_non_retryable(err: &str) -> bool {
         .any(|pattern| lower.contains(pattern))
 }
 
+/// Returns true if the error is a rate limit (429) that should be retried with backoff.
+fn is_rate_limited(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("rate_limit") || lower.contains("429") || lower.contains("too many requests")
+}
+
 async fn handle_failure(
     adapter: &RfbmqAdapter,
     claimed: &ClaimedTask,
@@ -611,6 +628,16 @@ async fn handle_failure(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         eprintln!("[worker {worker_id}]   ↳ Non-retryable error, moved to failed/");
         return Ok(());
+    }
+
+    // Rate limit errors: wait before requeueing so the next attempt doesn't
+    // immediately hit the same limit.
+    if is_rate_limited(err) {
+        let backoff_secs = 30 * (claimed.headers.retry_count + 1) as u64;
+        eprintln!(
+            "[worker {worker_id}]   ↳ Rate limited, waiting {backoff_secs}s before retry"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
     }
 
     adapter

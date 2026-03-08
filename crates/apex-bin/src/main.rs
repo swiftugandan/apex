@@ -522,6 +522,7 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
         eval_config: Arc::new(eval_config),
         max_depth,
         max_retries,
+        max_tool_result_bytes: agent_config.context_budget.max_tool_result_tokens * 4,
         estimator,
     };
 
