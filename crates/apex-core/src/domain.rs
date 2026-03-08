@@ -189,6 +189,197 @@ pub struct ReapResult {
     pub lease_reaped: u32,
 }
 
+// ── Working Memory types ──────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubtaskStatus {
+    Done,
+    Active,
+    Pending,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubtaskEntry {
+    pub index: u32,
+    pub description: String,
+    pub status: SubtaskStatus,
+    pub task_id: Option<String>,
+    pub depends_on: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Scratchpad {
+    pub job_id: String,
+    pub goal: String,
+    pub subtasks: Vec<SubtaskEntry>,
+    pub status_summary: String,
+    pub notes: Vec<String>,
+}
+
+impl Scratchpad {
+    pub fn new(job_id: impl Into<String>, goal: impl Into<String>) -> Self {
+        Self {
+            job_id: job_id.into(),
+            goal: goal.into(),
+            subtasks: Vec::new(),
+            status_summary: String::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    pub fn to_markdown(&self) -> String {
+        let mut out = format!("# Working Memory: {}\n\n## Goal\n{}\n\n## Decomposition\n", self.job_id, self.goal);
+
+        if self.subtasks.is_empty() {
+            out.push_str("(none)\n");
+        } else {
+            for st in &self.subtasks {
+                let status = match st.status {
+                    SubtaskStatus::Done => "done",
+                    SubtaskStatus::Active => "active",
+                    SubtaskStatus::Pending => "pending",
+                };
+                out.push_str(&format!("{}. [{}] {}", st.index, status, st.description));
+                if let Some(ref tid) = st.task_id {
+                    out.push_str(&format!(" → {tid}"));
+                }
+                if let Some(ref dep) = st.depends_on {
+                    out.push_str(&format!(" (depends on {dep})"));
+                }
+                out.push('\n');
+            }
+        }
+
+        out.push_str(&format!("\n## Status\n{}\n", self.status_summary));
+
+        out.push_str("\n## Job-Level Notes\n");
+        if self.notes.is_empty() {
+            out.push_str("(none)\n");
+        } else {
+            for note in &self.notes {
+                out.push_str(&format!("- {note}\n"));
+            }
+        }
+
+        out
+    }
+
+    pub fn from_markdown(md: &str) -> Result<Self, String> {
+        let mut job_id = String::new();
+        let mut goal = String::new();
+        let mut subtasks = Vec::new();
+        let mut status_summary = String::new();
+        let mut notes = Vec::new();
+
+        #[derive(PartialEq)]
+        enum Section { None, Goal, Decomposition, Status, Notes }
+        let mut section = Section::None;
+
+        for line in md.lines() {
+            if line.starts_with("# Working Memory: ") {
+                job_id = line.trim_start_matches("# Working Memory: ").to_string();
+                continue;
+            }
+            if line == "## Goal" {
+                section = Section::Goal;
+                continue;
+            }
+            if line == "## Decomposition" {
+                section = Section::Decomposition;
+                continue;
+            }
+            if line == "## Status" {
+                section = Section::Status;
+                continue;
+            }
+            if line == "## Job-Level Notes" {
+                section = Section::Notes;
+                continue;
+            }
+
+            match section {
+                Section::Goal => {
+                    if !line.is_empty() {
+                        if !goal.is_empty() {
+                            goal.push('\n');
+                        }
+                        goal.push_str(line);
+                    }
+                }
+                Section::Decomposition => {
+                    if line == "(none)" || line.is_empty() {
+                        continue;
+                    }
+                    // Parse: "1. [done] description → task-id (depends on 003)"
+                    if let Some(entry) = parse_subtask_line(line) {
+                        subtasks.push(entry);
+                    }
+                }
+                Section::Status => {
+                    if !line.is_empty() {
+                        if !status_summary.is_empty() {
+                            status_summary.push('\n');
+                        }
+                        status_summary.push_str(line);
+                    }
+                }
+                Section::Notes => {
+                    if line == "(none)" || line.is_empty() {
+                        continue;
+                    }
+                    if let Some(note) = line.strip_prefix("- ") {
+                        notes.push(note.to_string());
+                    }
+                }
+                Section::None => {}
+            }
+        }
+
+        if job_id.is_empty() {
+            return Err("missing job_id header".to_string());
+        }
+
+        Ok(Scratchpad { job_id, goal, subtasks, status_summary, notes })
+    }
+}
+
+fn parse_subtask_line(line: &str) -> Option<SubtaskEntry> {
+    // "1. [done] description → task-id (depends on 003)"
+    let dot_pos = line.find(". [")?;
+    let index: u32 = line[..dot_pos].trim().parse().ok()?;
+
+    let after_dot = &line[dot_pos + 3..]; // after ". ["
+    let bracket_end = after_dot.find("] ")?;
+    let status_str = &after_dot[..bracket_end];
+    let status = match status_str {
+        "done" => SubtaskStatus::Done,
+        "active" => SubtaskStatus::Active,
+        "pending" => SubtaskStatus::Pending,
+        _ => return None,
+    };
+
+    let rest = &after_dot[bracket_end + 2..]; // after "] "
+
+    // Extract depends_on from end
+    let (rest, depends_on) = if let Some(dep_start) = rest.rfind(" (depends on ") {
+        let dep_end = rest.len();
+        let dep = rest[dep_start + 13..dep_end].trim_end_matches(')').to_string();
+        (&rest[..dep_start], Some(dep))
+    } else {
+        (rest, None)
+    };
+
+    // Extract task_id from " → task-id"
+    let (description, task_id) = if let Some(arrow_pos) = rest.find(" → ") {
+        (rest[..arrow_pos].to_string(), Some(rest[arrow_pos + 5..].to_string()))
+    } else {
+        (rest.to_string(), None)
+    };
+
+    Some(SubtaskEntry { index, description, status, task_id, depends_on })
+}
+
 /// An attempt record capturing a full execution attempt for a task.
 #[derive(Debug, Clone)]
 pub struct AttemptRecord {
@@ -543,5 +734,102 @@ mod tests {
             stop_reason: StopReason::ToolUse,
         };
         assert_eq!(resp.text(), "thinking");
+    }
+
+    // ── SubtaskStatus serde ─────────────────────────────────────────
+
+    #[test]
+    fn subtask_status_serializes_lowercase() {
+        assert_eq!(to_value(SubtaskStatus::Done).unwrap(), json!("done"));
+        assert_eq!(to_value(SubtaskStatus::Active).unwrap(), json!("active"));
+        assert_eq!(to_value(SubtaskStatus::Pending).unwrap(), json!("pending"));
+    }
+
+    #[test]
+    fn subtask_status_roundtrips() {
+        for (s, expected) in [
+            ("done", SubtaskStatus::Done),
+            ("active", SubtaskStatus::Active),
+            ("pending", SubtaskStatus::Pending),
+        ] {
+            let got: SubtaskStatus = from_value(json!(s)).unwrap();
+            assert_eq!(got, expected);
+        }
+    }
+
+    // ── Scratchpad to_markdown / from_markdown roundtrip ────────────
+
+    #[test]
+    fn scratchpad_roundtrip_full() {
+        let pad = Scratchpad {
+            job_id: "job-42".into(),
+            goal: "Deploy the widget".into(),
+            subtasks: vec![
+                SubtaskEntry {
+                    index: 1,
+                    description: "Build artifact".into(),
+                    status: SubtaskStatus::Done,
+                    task_id: Some("task-001".into()),
+                    depends_on: None,
+                },
+                SubtaskEntry {
+                    index: 2,
+                    description: "Run tests".into(),
+                    status: SubtaskStatus::Active,
+                    task_id: Some("task-002".into()),
+                    depends_on: Some("001".into()),
+                },
+                SubtaskEntry {
+                    index: 3,
+                    description: "Deploy".into(),
+                    status: SubtaskStatus::Pending,
+                    task_id: None,
+                    depends_on: Some("002".into()),
+                },
+            ],
+            status_summary: "Step 1 done, step 2 running".into(),
+            notes: vec!["Found a config issue".into(), "Retrying with fix".into()],
+        };
+
+        let md = pad.to_markdown();
+        let parsed = Scratchpad::from_markdown(&md).unwrap();
+
+        assert_eq!(parsed.job_id, "job-42");
+        assert_eq!(parsed.goal, "Deploy the widget");
+        assert_eq!(parsed.subtasks.len(), 3);
+        assert_eq!(parsed.subtasks[0].status, SubtaskStatus::Done);
+        assert_eq!(parsed.subtasks[0].task_id.as_deref(), Some("task-001"));
+        assert_eq!(parsed.subtasks[1].depends_on.as_deref(), Some("001"));
+        assert_eq!(parsed.subtasks[2].task_id, None);
+        assert_eq!(parsed.status_summary, "Step 1 done, step 2 running");
+        assert_eq!(parsed.notes, vec!["Found a config issue", "Retrying with fix"]);
+    }
+
+    #[test]
+    fn scratchpad_roundtrip_empty() {
+        let pad = Scratchpad::new("job-00", "");
+        let md = pad.to_markdown();
+        let parsed = Scratchpad::from_markdown(&md).unwrap();
+
+        assert_eq!(parsed.job_id, "job-00");
+        assert!(parsed.goal.is_empty());
+        assert!(parsed.subtasks.is_empty());
+        assert!(parsed.notes.is_empty());
+    }
+
+    #[test]
+    fn scratchpad_from_markdown_missing_header() {
+        let result = Scratchpad::from_markdown("## Goal\nSomething\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scratchpad_new_creates_empty() {
+        let pad = Scratchpad::new("job-99", "Fix the bug");
+        assert_eq!(pad.job_id, "job-99");
+        assert_eq!(pad.goal, "Fix the bug");
+        assert!(pad.subtasks.is_empty());
+        assert!(pad.status_summary.is_empty());
+        assert!(pad.notes.is_empty());
     }
 }

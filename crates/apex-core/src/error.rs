@@ -23,6 +23,16 @@ pub enum ToolError {
 }
 
 #[derive(Debug, Error)]
+pub enum MemoryError {
+    #[error("memory I/O error: {0}")]
+    Io(String),
+    #[error("parse error: {0}")]
+    Parse(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+}
+
+#[derive(Debug, Error)]
 pub enum QueueError {
     #[error("queue not found: {0}")]
     NotFound(String),

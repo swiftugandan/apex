@@ -1,16 +1,21 @@
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 
 use apex_context::MessageComposer;
 use apex_core::domain::{
     AttemptOutcome, AttemptRecord, ChatMessage, ClaimedTask, CompletionRequest, ContentBlock,
-    MessageHeaders, MessageRole, MessageType, QueueMessage, ToolCallRecord, ToolResult, TurnRecord,
+    MessageHeaders, MessageRole, MessageType, QueueMessage, ToolCall, ToolCallRecord, ToolDef,
+    ToolResult, TurnRecord,
 };
-use apex_core::ports::{LlmProvider, Queue, ToolRegistry};
+use apex_core::error::ToolError;
+use apex_core::ports::{LlmProvider, Queue, ToolRegistry, WorkingMemory};
 use apex_llm::anthropic::AnthropicProvider;
+use apex_memory::{FsScratchpadStore, MemoryToolRegistry};
 use apex_queue::RfbmqAdapter;
 use apex_tools::BuiltinToolRegistry;
 
@@ -18,12 +23,49 @@ const MAX_TURNS: usize = 32;
 const MAX_TOKENS: u32 = 8192;
 const MAX_RETRIES: u32 = 3;
 
+// ── CompositeToolRegistry ─────────────────────────────────────────
+
+struct CompositeToolRegistry {
+    registries: Vec<Box<dyn ToolRegistry>>,
+}
+
+impl CompositeToolRegistry {
+    fn new(registries: Vec<Box<dyn ToolRegistry>>) -> Self {
+        Self { registries }
+    }
+}
+
+#[async_trait]
+impl ToolRegistry for CompositeToolRegistry {
+    fn definitions(&self) -> Vec<ToolDef> {
+        self.registries
+            .iter()
+            .flat_map(|r| r.definitions())
+            .collect()
+    }
+
+    async fn execute(&self, call: &ToolCall) -> std::result::Result<ToolResult, ToolError> {
+        for registry in &self.registries {
+            let names: Vec<String> = registry
+                .definitions()
+                .iter()
+                .map(|d| d.schema.name.clone())
+                .collect();
+            if names.iter().any(|n| n == &call.name) {
+                return registry.execute(call).await;
+            }
+        }
+        Err(ToolError::UnknownTool(call.name.clone()))
+    }
+}
+
 // ── Path resolution ────────────────────────────────────────────────
 
 struct ApexPaths {
     root: PathBuf,
     prompts_dir: PathBuf,
     queue_dir: PathBuf,
+    memory_dir: PathBuf,
 }
 
 impl ApexPaths {
@@ -35,6 +77,7 @@ impl ApexPaths {
         Ok(Self {
             prompts_dir: root.join("prompts"),
             queue_dir: root.join("queues").join("work"),
+            memory_dir: root.join("memory").join("working"),
             root,
         })
     }
@@ -92,10 +135,14 @@ async fn cmd_init() -> Result<()> {
     std::fs::create_dir_all(&paths.queue_dir.parent().unwrap())
         .context("failed to create queues/ directory")?;
 
+    std::fs::create_dir_all(&paths.memory_dir)
+        .context("failed to create memory/working/ directory")?;
+
     RfbmqAdapter::init(&paths.queue_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     eprintln!("✓ Initialized apex at {}", paths.root.display());
-    eprintln!("  queue: {}", paths.queue_dir.display());
+    eprintln!("  queue:  {}", paths.queue_dir.display());
+    eprintln!("  memory: {}", paths.memory_dir.display());
     Ok(())
 }
 
@@ -187,7 +234,13 @@ async fn process_queue(paths: &ApexPaths, adapter: &RfbmqAdapter) -> Result<()> 
         std::fs::read_to_string(&persona_path).context("failed to read prompts/agent.md")?;
 
     let llm = AnthropicProvider::from_env();
-    let tools = BuiltinToolRegistry::new();
+    let memory: Arc<dyn WorkingMemory> =
+        Arc::new(FsScratchpadStore::new(paths.memory_dir.clone()));
+    let memory_tools = MemoryToolRegistry::new(Arc::clone(&memory));
+    let tools = CompositeToolRegistry::new(vec![
+        Box::new(BuiltinToolRegistry::new()),
+        Box::new(memory_tools),
+    ]);
 
     loop {
         let claimed = adapter
@@ -208,7 +261,7 @@ async fn process_queue(paths: &ApexPaths, adapter: &RfbmqAdapter) -> Result<()> 
             claimed.id, claimed.headers.retry_count
         );
 
-        match execute_task(&claimed, &persona, &llm, &tools).await {
+        match execute_task(&claimed, &persona, &llm, &tools, memory.as_ref()).await {
             Ok(record) => {
                 let title = extract_title(&claimed.body);
                 let result_body = MessageComposer::compose_result(&title, &record);
@@ -222,11 +275,11 @@ async fn process_queue(paths: &ApexPaths, adapter: &RfbmqAdapter) -> Result<()> 
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 eprintln!("✓ Task {} completed successfully", claimed.id);
             }
-            Err((record, err)) => {
+            Err((record, err, scratchpad)) => {
                 eprintln!("✗ Task {} failed: {err}", claimed.id);
 
                 let updated_body =
-                    MessageComposer::append_attempt(&claimed.body, &record);
+                    MessageComposer::append_attempt_with_memory(&claimed.body, &record, &scratchpad);
 
                 adapter
                     .update_body(&claimed, &updated_body)
@@ -266,13 +319,38 @@ async fn process_queue(paths: &ApexPaths, adapter: &RfbmqAdapter) -> Result<()> 
 async fn execute_task(
     claimed: &ClaimedTask,
     persona: &str,
-    llm: &AnthropicProvider,
-    tools: &BuiltinToolRegistry,
-) -> std::result::Result<AttemptRecord, (AttemptRecord, String)> {
+    llm: &dyn LlmProvider,
+    tools: &dyn ToolRegistry,
+    memory: &dyn WorkingMemory,
+) -> std::result::Result<AttemptRecord, (AttemptRecord, String, apex_core::domain::Scratchpad)> {
     let started_at = now_iso();
     let schemas = tools.schemas();
 
-    let mut messages = vec![ChatMessage::user_text(&claimed.body)];
+    // Load or create scratchpad for this job
+    let job_id = &claimed.headers.correlation_id;
+    let mut scratchpad = memory
+        .load_or_create(job_id)
+        .await
+        .unwrap_or_else(|_| apex_core::domain::Scratchpad::new(job_id, ""));
+
+    // Set goal from task title if empty
+    if scratchpad.goal.is_empty() {
+        scratchpad.goal = extract_title(&claimed.body);
+        let _ = memory.save(&scratchpad).await;
+    }
+
+    // Build initial message, injecting working memory if it has content
+    let initial_body = if !scratchpad.subtasks.is_empty() || !scratchpad.notes.is_empty() {
+        format!(
+            "{}\n\n---\n## Working Memory (from previous iterations)\n{}",
+            claimed.body,
+            scratchpad.to_markdown()
+        )
+    } else {
+        claimed.body.clone()
+    };
+
+    let mut messages = vec![ChatMessage::user_text(&initial_body)];
     let mut turns: Vec<TurnRecord> = Vec::new();
     let mut final_text: Option<String> = None;
 
@@ -296,7 +374,7 @@ async fn execute_task(
                     outcome: AttemptOutcome::Failed,
                     failure_reason: Some(format!("LLM error: {err}")),
                 };
-                return Err((record, format!("LLM error: {err}")));
+                return Err((record, format!("LLM error: {err}"), scratchpad));
             }
         };
 
@@ -370,6 +448,13 @@ async fn execute_task(
             content: result_blocks,
         });
     }
+
+    // Save scratchpad after successful execution (it may have been updated by tool calls)
+    // Reload from disk in case memory tools updated it during execution
+    if let Ok(updated_pad) = memory.load_or_create(job_id).await {
+        scratchpad = updated_pad;
+    }
+    let _ = memory.save(&scratchpad).await;
 
     let record = AttemptRecord {
         attempt_number: claimed.headers.retry_count + 1,

@@ -1,4 +1,4 @@
-use apex_core::domain::{AttemptOutcome, AttemptRecord};
+use apex_core::domain::{AttemptOutcome, AttemptRecord, Scratchpad};
 
 pub struct MessageComposer;
 
@@ -63,6 +63,19 @@ impl MessageComposer {
         }
     }
 
+    /// Append an attempt record and working memory snapshot to a message body for retry.
+    pub fn append_attempt_with_memory(
+        existing_body: &str,
+        record: &AttemptRecord,
+        scratchpad: &Scratchpad,
+    ) -> String {
+        let with_attempt = Self::append_attempt(existing_body, record);
+        format!(
+            "{with_attempt}\n## Working Memory Snapshot\n{}\n",
+            scratchpad.to_markdown()
+        )
+    }
+
     /// Compose a terminal failure narrative (all retries exhausted).
     pub fn compose_failure(title: &str, attempts: &[AttemptRecord]) -> String {
         let mut out = format!(
@@ -121,7 +134,9 @@ impl MessageComposer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apex_core::domain::{AttemptOutcome, AttemptRecord, TokenUsage, ToolCallRecord, TurnRecord};
+    use apex_core::domain::{
+        AttemptOutcome, AttemptRecord, Scratchpad, TokenUsage, ToolCallRecord, TurnRecord,
+    };
 
     fn make_tool_call(name: &str, is_error: bool) -> ToolCallRecord {
         ToolCallRecord {
@@ -298,6 +313,23 @@ mod tests {
         assert!(result.contains("- Called `bash` — bash input (100ms, ERROR)"));
         assert!(result.contains("  Error: something went wrong"));
         assert!(result.contains("- Diagnosis: command failed"));
+    }
+
+    // ── append_attempt_with_memory ─────────────────────────────────
+
+    #[test]
+    fn append_attempt_with_memory_includes_both() {
+        let body = "# Task: Do something\n";
+        let record = make_record(AttemptOutcome::Failed, 1);
+        let pad = Scratchpad::new("job-42", "Do something");
+
+        let result = MessageComposer::append_attempt_with_memory(body, &record, &pad);
+
+        assert!(result.contains("## Previous Attempts"));
+        assert!(result.contains("### Attempt 1 — FAILED"));
+        assert!(result.contains("## Working Memory Snapshot"));
+        assert!(result.contains("# Working Memory: job-42"));
+        assert!(result.contains("## Goal\nDo something"));
     }
 
     #[test]

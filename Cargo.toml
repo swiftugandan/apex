@@ -7,6 +7,7 @@ members = [
     "crates/apex-tools",
     "crates/apex-bin",
     "crates/apex-context",
+    "crates/apex-memory",
 ]
 default-members = ["crates/apex-bin"]
 

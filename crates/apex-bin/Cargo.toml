@@ -13,6 +13,8 @@ apex-llm = { path = "../apex-llm" }
 apex-tools = { path = "../apex-tools" }
 apex-queue = { path = "../apex-queue" }
 apex-context = { path = "../apex-context" }
+apex-memory = { path = "../apex-memory" }
 anyhow.workspace = true
+async-trait.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
