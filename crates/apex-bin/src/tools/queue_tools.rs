@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
 
-use apex_core::context::MessageComposer;
+use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{
     MessageHeaders, MessageType, QueueMessage, ToolCall, ToolDef, ToolResult, ToolSchema,
 };
@@ -19,6 +20,8 @@ pub struct QueueToolRegistry {
     parent_body: String,
     store: Option<Arc<dyn MemoryStore>>,
     composer: MessageComposer,
+    /// When set, used to build a calibrated composer for push-time subtask composition.
+    estimator: Option<Arc<Mutex<TokenEstimator>>>,
 }
 
 impl QueueToolRegistry {
@@ -30,6 +33,7 @@ impl QueueToolRegistry {
         parent_goal: String,
         parent_body: String,
         store: Option<Arc<dyn MemoryStore>>,
+        estimator: Option<Arc<Mutex<TokenEstimator>>>,
     ) -> Self {
         Self {
             queue,
@@ -40,6 +44,7 @@ impl QueueToolRegistry {
             parent_body,
             store,
             composer: MessageComposer::default(),
+            estimator,
         }
     }
 
@@ -47,6 +52,17 @@ impl QueueToolRegistry {
     pub fn with_composer(mut self, composer: MessageComposer) -> Self {
         self.composer = composer;
         self
+    }
+
+    /// Build the composer to use for this call: calibrated from shared estimator if available.
+    async fn composer(&self) -> MessageComposer {
+        match &self.estimator {
+            Some(est) => {
+                let cal = est.lock().await;
+                MessageComposer::new(TokenEstimator::new(cal.calibration_data().clone()))
+            }
+            None => self.composer.clone(),
+        }
     }
 
     async fn handle_decompose_goal(&self, input: &Value) -> Result<Value, ToolError> {
@@ -67,6 +83,8 @@ impl QueueToolRegistry {
                 "subtasks array must not be empty".to_string(),
             ));
         }
+
+        let composer = self.composer().await;
 
         struct SubtaskInfo {
             description: String,
@@ -135,7 +153,7 @@ impl QueueToolRegistry {
             };
 
             let body = if !facts.is_empty() || skill.is_some() {
-                self.composer.compose_subtask_with_memory(
+                composer.compose_subtask_with_memory(
                     title,
                     &info.description,
                     &info.acceptance_criteria,
@@ -145,7 +163,7 @@ impl QueueToolRegistry {
                     skill.as_ref(),
                 )
             } else {
-                self.composer.compose_subtask(
+                composer.compose_subtask(
                     title,
                     &info.description,
                     &info.acceptance_criteria,

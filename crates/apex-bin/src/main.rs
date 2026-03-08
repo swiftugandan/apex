@@ -260,72 +260,31 @@ async fn cmd_cat(path: &str) -> Result<()> {
 
 async fn cmd_status() -> Result<()> {
     let paths = ApexPaths::resolve()?;
-    let queue_root = &paths.queue_dir;
-
-    if !queue_root.exists() {
-        bail!("queue not found. Run 'apex init' first.");
-    }
+    let adapter = open_queue(&paths)?;
 
     let dirs = ["pending", "processing", "done", "failed"];
     for dir_name in &dirs {
-        let dir = queue_root.join(dir_name);
-        if !dir.exists() {
+        let list = adapter
+            .list_with_state(dir_name)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        if list.is_empty() {
             continue;
         }
 
-        let entries: Vec<_> = std::fs::read_dir(&dir)
-            .with_context(|| format!("failed to read {dir_name}/ directory"))?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    == Some("md")
-            })
-            .collect();
-
-        if entries.is_empty() {
-            continue;
-        }
-
-        println!("── {dir_name}/ ({} messages) ──", entries.len());
-        for entry in &entries {
-            let path = entry.path();
-            match rfbmq_core::Message::from_file(&path) {
-                Ok(msg) => {
-                    let id = msg
-                        .header
-                        .id
-                        .as_ref()
-                        .map(|i| i.to_string())
-                        .unwrap_or_else(|| "???".to_string());
-                    let corr = msg
-                        .header
-                        .correlation_id
-                        .as_deref()
-                        .unwrap_or("-");
-                    let msg_type = msg
-                        .header
-                        .custom
-                        .iter()
-                        .find(|l| l.starts_with("Type:"))
-                        .map(|l| l.trim_start_matches("Type:").trim())
-                        .unwrap_or("unknown");
-                    let deps = if msg.header.depends_on.is_empty() {
-                        String::new()
-                    } else {
-                        let dep_strs: Vec<&str> =
-                            msg.header.depends_on.iter().map(|d| d.as_str()).collect();
-                        format!(" depends_on=[{}]", dep_strs.join(", "))
-                    };
-                    let short_id = &id[..id.len().min(12)];
-                    println!("  {short_id}  {msg_type:<13} corr={corr}{deps}");
-                }
-                Err(e) => {
-                    let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    println!("  {name}  (parse error: {e})");
-                }
-            }
+        println!("── {dir_name}/ ({} messages) ──", list.len());
+        for meta in &list {
+            let deps = if meta.depends_on.is_empty() {
+                String::new()
+            } else {
+                format!(" depends_on=[{}]", meta.depends_on.join(", "))
+            };
+            let short_id = &meta.id[..meta.id.len().min(12)];
+            println!(
+                "  {short_id}  {:<13} corr={}{deps}",
+                meta.type_label, meta.correlation_id
+            );
         }
     }
 
@@ -413,40 +372,17 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
         eval_config: Arc::new(eval_config),
         max_depth,
         max_retries,
-        scratch_dir: paths.scratch_dir.clone(),
-        tools_dir: paths.tools_dir.clone(),
-        config_dir: paths.config_dir.clone(),
-        invariants,
         estimator,
     };
 
     if max_concurrent <= 1 {
         agent::worker_loop(ctx, 0).await
     } else {
-        // For multiple workers, we need to clone the context fields
         let mut handles = Vec::new();
         for worker_id in 0..max_concurrent {
-            let ctx = WorkerContext {
-                adapter: Arc::clone(&ctx.adapter),
-                static_tools: Arc::clone(&ctx.static_tools),
-                llm: Arc::clone(&ctx.llm),
-                eval_llm: Arc::clone(&ctx.eval_llm),
-                memory: Arc::clone(&ctx.memory),
-                long_term: Arc::clone(&ctx.long_term),
-                persona: Arc::clone(&ctx.persona),
-                evaluator_persona: Arc::clone(&ctx.evaluator_persona),
-                eval_config: Arc::clone(&ctx.eval_config),
-                max_depth: ctx.max_depth,
-                max_retries: ctx.max_retries,
-                scratch_dir: ctx.scratch_dir.clone(),
-                tools_dir: ctx.tools_dir.clone(),
-                config_dir: ctx.config_dir.clone(),
-                invariants: Arc::clone(&ctx.invariants),
-                estimator: Arc::clone(&ctx.estimator),
-            };
-
+            let worker_ctx = ctx.clone();
             handles.push(tokio::spawn(async move {
-                agent::worker_loop(ctx, worker_id as usize).await
+                agent::worker_loop(worker_ctx, worker_id as usize).await
             }));
         }
 

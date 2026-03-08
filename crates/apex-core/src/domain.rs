@@ -247,6 +247,15 @@ pub struct ReapResult {
     pub lease_reaped: u32,
 }
 
+/// Metadata for a message in a queue directory (for listing/inspection).
+#[derive(Debug, Clone)]
+pub struct QueueMessageMeta {
+    pub id: String,
+    pub type_label: String,
+    pub correlation_id: String,
+    pub depends_on: Vec<String>,
+}
+
 // ── Long-Term Memory types ────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

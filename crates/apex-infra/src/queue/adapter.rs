@@ -3,7 +3,8 @@ use std::path::Path;
 use async_trait::async_trait;
 
 use apex_core::domain::{
-    ClaimedTask, MessageHeaders, MessageType, QueueDepth, QueueMessage, ReapResult,
+    ClaimedTask, MessageHeaders, MessageType, QueueDepth, QueueMessage, QueueMessageMeta,
+    ReapResult,
 };
 use apex_core::error::QueueError;
 use apex_core::ports::Queue;
@@ -213,6 +214,65 @@ impl Queue for RfbmqAdapter {
             .map_err(|e| QueueError::NotFound(e.to_string()))?;
         Ok(msg.body)
     }
+
+    async fn list_with_state(&self, state: &str) -> Result<Vec<QueueMessageMeta>, QueueError> {
+        let dir = self.queue.root().join(state);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let entries = std::fs::read_dir(&dir).map_err(|e| QueueError::Io(e.to_string()))?;
+        let mut result = Vec::new();
+
+        for entry in entries {
+            let entry = entry.map_err(|e| QueueError::Io(e.to_string()))?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+
+            if let Some(meta) = message_meta_from_path(&path) {
+                result.push(meta);
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+fn message_meta_from_path(path: &Path) -> Option<QueueMessageMeta> {
+    let msg = Message::from_file(path).ok()?;
+    let id = msg
+        .header
+        .id
+        .as_ref()
+        .map(|i| i.to_string())
+        .unwrap_or_else(|| "???".to_string());
+    let correlation_id = msg
+        .header
+        .correlation_id
+        .clone()
+        .unwrap_or_else(|| "-".to_string());
+    let type_label = msg
+        .header
+        .custom
+        .iter()
+        .find(|l| l.starts_with("Type:"))
+        .map(|l| l.trim_start_matches("Type:").trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let depends_on: Vec<String> = msg
+        .header
+        .depends_on
+        .iter()
+        .map(|d| d.to_string())
+        .collect();
+
+    Some(QueueMessageMeta {
+        id,
+        type_label,
+        correlation_id,
+        depends_on,
+    })
 }
 
 fn headers_to_custom(headers: &MessageHeaders) -> Vec<String> {

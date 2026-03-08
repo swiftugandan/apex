@@ -2,8 +2,8 @@ use async_trait::async_trait;
 
 use crate::domain::{
     CalibrationData, ClaimedTask, CompletionRequest, CompletionResponse, Fact, FactId, QueueDepth,
-    QueueMessage, ReapResult, Scratchpad, Skill, SkillId, Strategy, StrategyId, ToolCall,
-    ToolCompletionResponse, ToolDef, ToolResult, ToolSchema,
+    QueueMessage, QueueMessageMeta, ReapResult, Scratchpad, Skill, SkillId, Strategy, StrategyId,
+    ToolCall, ToolCompletionResponse, ToolDef, ToolResult, ToolSchema,
 };
 use crate::error::{LlmError, MemoryError, QueueError, ToolError};
 
@@ -44,6 +44,8 @@ pub trait Queue: Send + Sync {
     async fn reap(&self) -> Result<ReapResult, QueueError>;
     async fn list_done(&self, correlation_id: &str) -> Result<Vec<String>, QueueError>;
     async fn read_done_body(&self, id: &str) -> Result<String, QueueError>;
+    /// List message metadata in a queue state directory (pending, processing, done, failed).
+    async fn list_with_state(&self, state: &str) -> Result<Vec<QueueMessageMeta>, QueueError>;
 }
 
 #[async_trait]

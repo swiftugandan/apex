@@ -7,6 +7,7 @@ const MAX_SKILL_TOKENS: u32 = 500;
 const MAX_CRITERIA_TOKENS: u32 = 500;
 const MAX_ATTEMPTS_TOKENS: u32 = 2000;
 
+#[derive(Clone)]
 pub struct MessageComposer {
     estimator: TokenEstimator,
 }

@@ -1,6 +1,7 @@
 use crate::domain::{CalibrationData, ContentType};
 
 /// Stateful token estimator with content-type awareness and self-calibration.
+#[derive(Clone)]
 pub struct TokenEstimator {
     calibration: CalibrationData,
 }

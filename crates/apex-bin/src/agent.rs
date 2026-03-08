@@ -28,6 +28,7 @@ const MAX_TOKENS: u32 = 8192;
 
 // ── WorkerContext ───────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct WorkerContext {
     pub adapter: Arc<RfbmqAdapter>,
     pub static_tools: Arc<CompositeToolRegistry>,
@@ -40,10 +41,6 @@ pub struct WorkerContext {
     pub eval_config: Arc<apex_eval::EvalConfig>,
     pub max_depth: u32,
     pub max_retries: u32,
-    pub scratch_dir: PathBuf,
-    pub tools_dir: PathBuf,
-    pub config_dir: PathBuf,
-    pub invariants: Arc<Invariants>,
     pub estimator: Arc<Mutex<TokenEstimator>>,
 }
 
@@ -83,17 +80,31 @@ impl ToolRegistry for CompositeToolRegistry {
     }
 }
 
-/// Delegates to a shared CompositeToolRegistry (used for static tools).
-struct DelegatingToolRegistry(Arc<CompositeToolRegistry>);
+/// Single registry that dispatches to static tools first, then per-claim queue tools.
+pub(crate) struct ApexToolRegistry {
+    static_tools: Arc<CompositeToolRegistry>,
+    queue_tools: QueueToolRegistry,
+}
 
 #[async_trait]
-impl ToolRegistry for DelegatingToolRegistry {
+impl ToolRegistry for ApexToolRegistry {
     fn definitions(&self) -> Vec<ToolDef> {
-        self.0.definitions()
+        let mut defs = self.static_tools.definitions();
+        defs.extend(self.queue_tools.definitions());
+        defs
     }
 
     async fn execute(&self, call: &ToolCall) -> std::result::Result<ToolResult, ToolError> {
-        self.0.execute(call).await
+        let static_names: Vec<String> = self
+            .static_tools
+            .definitions()
+            .iter()
+            .map(|d| d.schema.name.clone())
+            .collect();
+        if static_names.iter().any(|n| n == &call.name) {
+            return self.static_tools.execute(call).await;
+        }
+        self.queue_tools.execute(call).await
     }
 }
 
@@ -180,15 +191,11 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
             extract_title(&claimed.body),
             claimed.body.clone(),
             Some(Arc::clone(&ctx.long_term)),
+            Some(Arc::clone(&ctx.estimator)),
         );
-        let tools = CompositeToolRegistry::new(vec![
-            Box::new(DelegatingToolRegistry(Arc::clone(&ctx.static_tools))),
-            Box::new(queue_tools),
-        ]);
-
-        let composer = {
-            let est = ctx.estimator.lock().await;
-            MessageComposer::new(TokenEstimator::new(est.calibration_data().clone()))
+        let tools = ApexToolRegistry {
+            static_tools: Arc::clone(&ctx.static_tools),
+            queue_tools,
         };
 
         let result = execute_claim(&ctx, &claimed, &tools).await;
@@ -211,6 +218,10 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
                 );
             }
             Err((record, err, scratchpad)) => {
+                let composer = {
+                    let est = ctx.estimator.lock().await;
+                    MessageComposer::new(TokenEstimator::new(est.calibration_data().clone()))
+                };
                 handle_failure(
                     &ctx.adapter, &claimed, &record, &err, &scratchpad,
                     worker_id, &composer, ctx.max_retries,
@@ -444,58 +455,19 @@ async fn execute_claim(
         .await
         .unwrap_or_else(|_| apex_core::domain::Scratchpad::new(job_id, ""));
 
-    let initial_body = match claimed.headers.message_type {
-        MessageType::Goal | MessageType::Task | MessageType::Subtask => {
-            if scratchpad.goal.is_empty() {
-                scratchpad.goal = extract_title(&claimed.body);
-                let _ = ctx.memory.save(&scratchpad).await;
-            }
-            if !scratchpad.subtasks.is_empty() || !scratchpad.notes.is_empty() {
-                format!(
-                    "{}\n\n---\n## Working Memory (from previous iterations)\n{}",
-                    claimed.body,
-                    scratchpad.to_markdown()
-                )
-            } else {
-                claimed.body.clone()
-            }
+    let initial_body = {
+        if claimed.headers.message_type != MessageType::Continuation && scratchpad.goal.is_empty() {
+            scratchpad.goal = extract_title(&claimed.body);
+            let _ = ctx.memory.save(&scratchpad).await;
         }
-        MessageType::Continuation => {
-            let done_ids = ctx
-                .adapter
-                .list_done(job_id)
-                .await
-                .map_err(|e| {
-                    let record = AttemptRecord {
-                        attempt_number: claimed.headers.retry_count + 1,
-                        started_at: started_at.clone(),
-                        finished_at: now_iso(),
-                        turns: vec![],
-                        final_text: None,
-                        outcome: AttemptOutcome::Failed,
-                        failure_reason: Some(format!("Failed to list done messages: {e}")),
-                        eval_summary: None,
-                    };
-                    (record, e.to_string(), scratchpad.clone())
-                })?;
-
-            let mut subtask_results = Vec::new();
-            for id in &done_ids {
-                if let Ok(body) = ctx.adapter.read_done_body(id).await {
-                    subtask_results.push((id.clone(), body));
-                }
-            }
-
+        if !scratchpad.subtasks.is_empty() || !scratchpad.notes.is_empty() {
             format!(
-                "{}\n\n---\n## Pre-loaded Results ({} subtasks completed)\n{}",
+                "{}\n\n---\n## Working Memory (from previous iterations)\n{}",
                 claimed.body,
-                subtask_results.len(),
-                subtask_results
-                    .iter()
-                    .map(|(id, body)| format!("### {id}\n{body}\n"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                scratchpad.to_markdown()
             )
+        } else {
+            claimed.body.clone()
         }
     };
 
