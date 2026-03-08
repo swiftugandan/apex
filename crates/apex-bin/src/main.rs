@@ -316,6 +316,12 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
     let persona =
         std::fs::read_to_string(&persona_path).context("failed to read prompts/agent.md")?;
 
+    let evaluator_persona_path = paths.prompts_dir.join("evaluator.md");
+    let evaluator_persona = std::fs::read_to_string(&evaluator_persona_path)
+        .context("failed to read prompts/evaluator.md")?;
+
+    let eval_config = apex_eval::EvalConfig::from_env();
+
     let max_concurrent: usize = std::env::var("APEX_CONCURRENT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -327,11 +333,23 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
         .unwrap_or(DEFAULT_MAX_DEPTH);
 
     let llm = Arc::new(AnthropicProvider::from_env());
+
+    // Create a separate LLM provider for eval if a different model is configured
+    let eval_llm: Arc<dyn LlmProvider> = if let Some(ref eval_model) = eval_config.eval_model {
+        let api_key =
+            std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY must be set");
+        Arc::new(AnthropicProvider::new(api_key, eval_model.clone(), 200_000))
+    } else {
+        Arc::clone(&llm) as Arc<dyn LlmProvider>
+    };
+
     let memory: Arc<dyn WorkingMemory> =
         Arc::new(FsScratchpadStore::new(paths.memory_dir.clone()));
     let queue: Arc<dyn Queue> = adapter.clone();
 
     let persona = Arc::new(persona);
+    let evaluator_persona = Arc::new(evaluator_persona);
+    let eval_config = Arc::new(eval_config);
     let memory = Arc::clone(&memory);
 
     if max_concurrent <= 1 {
@@ -340,8 +358,11 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
             adapter,
             queue,
             llm,
+            eval_llm,
             memory,
             persona,
+            evaluator_persona,
+            eval_config,
             max_depth,
             0,
         )
@@ -352,11 +373,26 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
             let adapter = Arc::clone(&adapter);
             let queue = queue.clone();
             let llm = Arc::clone(&llm);
+            let eval_llm = Arc::clone(&eval_llm);
             let memory = Arc::clone(&memory);
             let persona = Arc::clone(&persona);
+            let evaluator_persona = Arc::clone(&evaluator_persona);
+            let eval_config = Arc::clone(&eval_config);
 
             handles.push(tokio::spawn(async move {
-                worker_loop(adapter, queue, llm, memory, persona, max_depth, worker_id).await
+                worker_loop(
+                    adapter,
+                    queue,
+                    llm,
+                    eval_llm,
+                    memory,
+                    persona,
+                    evaluator_persona,
+                    eval_config,
+                    max_depth,
+                    worker_id,
+                )
+                .await
             }));
         }
 
@@ -372,8 +408,11 @@ async fn worker_loop(
     adapter: Arc<RfbmqAdapter>,
     queue: Arc<dyn Queue>,
     llm: Arc<AnthropicProvider>,
+    eval_llm: Arc<dyn LlmProvider>,
     memory: Arc<dyn WorkingMemory>,
     persona: Arc<String>,
+    evaluator_persona: Arc<String>,
+    eval_config: Arc<apex_eval::EvalConfig>,
     max_depth: u32,
     worker_id: usize,
 ) -> Result<()> {
@@ -447,7 +486,17 @@ async fn worker_loop(
 
         match claimed.headers.message_type {
             MessageType::Goal | MessageType::Task | MessageType::Subtask => {
-                match execute_task(&claimed, &persona, llm.as_ref(), &tools, memory.as_ref()).await
+                match execute_task(
+                    &claimed,
+                    &persona,
+                    llm.as_ref(),
+                    &tools,
+                    memory.as_ref(),
+                    eval_llm.as_ref(),
+                    &eval_config,
+                    &evaluator_persona,
+                )
+                .await
                 {
                     Ok(record) => {
                         let title = extract_title(&claimed.body);
@@ -481,6 +530,9 @@ async fn worker_loop(
                     &tools,
                     memory.as_ref(),
                     queue.as_ref(),
+                    eval_llm.as_ref(),
+                    &eval_config,
+                    &evaluator_persona,
                 )
                 .await
                 {
@@ -567,6 +619,9 @@ async fn execute_task(
     llm: &dyn LlmProvider,
     tools: &dyn ToolRegistry,
     memory: &dyn WorkingMemory,
+    eval_llm: &dyn LlmProvider,
+    eval_config: &apex_eval::EvalConfig,
+    evaluator_persona: &str,
 ) -> std::result::Result<AttemptRecord, (AttemptRecord, String, apex_core::domain::Scratchpad)> {
     let started_at = now_iso();
     let schemas = tools.schemas();
@@ -700,29 +755,55 @@ async fn execute_task(
     }
     let _ = memory.save(&scratchpad).await;
 
-    // Step 7: Deterministic evaluation
-    let eval_summary = match apex_eval::Evaluator::run_deterministic(&claimed.body).await {
-        Some(eval_result) if !eval_result.all_passed() => {
-            let summary = eval_result.failure_summary();
-            eprintln!("  eval: {}/{} checks failed", eval_result.failed, eval_result.total);
-            let record = AttemptRecord {
-                attempt_number: claimed.headers.retry_count + 1,
-                started_at,
-                finished_at: now_iso(),
-                turns,
-                final_text,
-                outcome: AttemptOutcome::Failed,
-                failure_reason: Some("deterministic evaluation failed".into()),
-                eval_summary: Some(summary),
-            };
-            return Err((record, "deterministic evaluation failed".into(), scratchpad));
-        }
-        Some(eval_result) => {
-            eprintln!("  eval: {}/{} checks passed", eval_result.passed, eval_result.total);
-            Some(eval_result.full_summary())
-        }
-        None => None,
-    };
+    // Step 7: Evaluation (deterministic + adversarial)
+    let result_text = final_text.as_deref().unwrap_or("");
+    let evaluation = apex_eval::Evaluator::evaluate(
+        &claimed.body,
+        result_text,
+        evaluator_persona,
+        eval_llm,
+        eval_config,
+    )
+    .await;
+
+    if !evaluation.passed {
+        let summary = evaluation.failure_summary();
+        let reason = if evaluation
+            .deterministic
+            .as_ref()
+            .map_or(false, |d| !d.all_passed())
+        {
+            "deterministic evaluation failed"
+        } else {
+            "adversarial evaluation failed"
+        };
+        eprintln!("  eval: {reason}");
+        let record = AttemptRecord {
+            attempt_number: claimed.headers.retry_count + 1,
+            started_at,
+            finished_at: now_iso(),
+            turns,
+            final_text,
+            outcome: AttemptOutcome::Failed,
+            failure_reason: Some(reason.into()),
+            eval_summary: Some(summary),
+        };
+        return Err((record, reason.into(), scratchpad));
+    }
+
+    let eval_summary =
+        if evaluation.deterministic.is_some() || evaluation.adversarial.is_some() {
+            Some(evaluation.full_summary())
+        } else {
+            None
+        };
+
+    if let Some(ref det) = evaluation.deterministic {
+        eprintln!("  eval: {}/{} checks passed", det.passed, det.total);
+    }
+    if evaluation.adversarial.is_some() {
+        eprintln!("  eval: adversarial passed");
+    }
 
     let record = AttemptRecord {
         attempt_number: claimed.headers.retry_count + 1,
@@ -747,6 +828,9 @@ async fn execute_continuation(
     tools: &dyn ToolRegistry,
     memory: &dyn WorkingMemory,
     queue: &dyn Queue,
+    eval_llm: &dyn LlmProvider,
+    eval_config: &apex_eval::EvalConfig,
+    evaluator_persona: &str,
 ) -> std::result::Result<AttemptRecord, (AttemptRecord, String, apex_core::domain::Scratchpad)> {
     let started_at = now_iso();
     let job_id = &claimed.headers.correlation_id;
@@ -893,29 +977,55 @@ async fn execute_continuation(
         });
     }
 
-    // Deterministic evaluation for continuation
-    let eval_summary = match apex_eval::Evaluator::run_deterministic(&claimed.body).await {
-        Some(eval_result) if !eval_result.all_passed() => {
-            let summary = eval_result.failure_summary();
-            eprintln!("  eval: {}/{} checks failed", eval_result.failed, eval_result.total);
-            let record = AttemptRecord {
-                attempt_number: claimed.headers.retry_count + 1,
-                started_at,
-                finished_at: now_iso(),
-                turns,
-                final_text,
-                outcome: AttemptOutcome::Failed,
-                failure_reason: Some("deterministic evaluation failed".into()),
-                eval_summary: Some(summary),
-            };
-            return Err((record, "deterministic evaluation failed".into(), scratchpad));
-        }
-        Some(eval_result) => {
-            eprintln!("  eval: {}/{} checks passed", eval_result.passed, eval_result.total);
-            Some(eval_result.full_summary())
-        }
-        None => None,
-    };
+    // Evaluation (deterministic + adversarial) for continuation
+    let result_text = final_text.as_deref().unwrap_or("");
+    let evaluation = apex_eval::Evaluator::evaluate(
+        &claimed.body,
+        result_text,
+        evaluator_persona,
+        eval_llm,
+        eval_config,
+    )
+    .await;
+
+    if !evaluation.passed {
+        let summary = evaluation.failure_summary();
+        let reason = if evaluation
+            .deterministic
+            .as_ref()
+            .map_or(false, |d| !d.all_passed())
+        {
+            "deterministic evaluation failed"
+        } else {
+            "adversarial evaluation failed"
+        };
+        eprintln!("  eval: {reason}");
+        let record = AttemptRecord {
+            attempt_number: claimed.headers.retry_count + 1,
+            started_at,
+            finished_at: now_iso(),
+            turns,
+            final_text,
+            outcome: AttemptOutcome::Failed,
+            failure_reason: Some(reason.into()),
+            eval_summary: Some(summary),
+        };
+        return Err((record, reason.into(), scratchpad));
+    }
+
+    let eval_summary =
+        if evaluation.deterministic.is_some() || evaluation.adversarial.is_some() {
+            Some(evaluation.full_summary())
+        } else {
+            None
+        };
+
+    if let Some(ref det) = evaluation.deterministic {
+        eprintln!("  eval: {}/{} checks passed", det.passed, det.total);
+    }
+    if evaluation.adversarial.is_some() {
+        eprintln!("  eval: adversarial passed");
+    }
 
     let record = AttemptRecord {
         attempt_number: claimed.headers.retry_count + 1,

@@ -65,6 +65,8 @@ dependencies = [
 name = "apex-eval"
 version = "0.1.0"
 dependencies = [
+ "apex-core",
+ "async-trait",
  "regex",
  "serde",
  "serde_json",

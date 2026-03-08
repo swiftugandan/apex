@@ -56,6 +56,64 @@ pub fn parse_criteria(body: &str) -> Vec<Criterion> {
     criteria
 }
 
+/// Parse fuzzy criteria from the `### Fuzzy` section under `## Acceptance Criteria`.
+///
+/// Returns an empty vec if no fuzzy section is found.
+pub fn parse_fuzzy_criteria(body: &str) -> Vec<String> {
+    let section = extract_fuzzy_section(body);
+    if section.is_empty() {
+        return Vec::new();
+    }
+
+    section
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            trimmed.strip_prefix("- ").map(|rest| rest.to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Extract the content under `### Fuzzy` within `## Acceptance Criteria`.
+fn extract_fuzzy_section(body: &str) -> String {
+    let mut in_acceptance = false;
+    let mut in_fuzzy = false;
+    let mut lines = Vec::new();
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+
+        if trimmed == "## Acceptance Criteria" {
+            in_acceptance = true;
+            continue;
+        }
+
+        if in_acceptance && trimmed == "### Fuzzy" {
+            in_fuzzy = true;
+            continue;
+        }
+
+        if in_fuzzy {
+            if trimmed.starts_with("## ") || (trimmed.starts_with("### ") && trimmed != "### Fuzzy")
+            {
+                break;
+            }
+            lines.push(line);
+        }
+
+        if in_acceptance
+            && !in_fuzzy
+            && trimmed.starts_with("## ")
+            && trimmed != "## Acceptance Criteria"
+        {
+            break;
+        }
+    }
+
+    lines.join("\n")
+}
+
 /// Extract the content under `### Deterministic` within `## Acceptance Criteria`.
 fn extract_deterministic_section(body: &str) -> String {
     let mut in_acceptance = false;
@@ -387,6 +445,49 @@ Some other stuff
         let criteria = parse_criteria(body);
         assert_eq!(criteria.len(), 1);
         assert!(matches!(&criteria[0].check, CheckType::FileSizeRange { min: 100, max: 2000, .. }));
+    }
+
+    #[test]
+    fn parse_fuzzy_empty_body() {
+        assert!(parse_fuzzy_criteria("").is_empty());
+    }
+
+    #[test]
+    fn parse_fuzzy_no_section() {
+        let body = "# Task: something\n## Description\nDo stuff.\n";
+        assert!(parse_fuzzy_criteria(body).is_empty());
+    }
+
+    #[test]
+    fn parse_fuzzy_with_criteria() {
+        let body = r#"## Acceptance Criteria
+### Deterministic
+- command: `true`
+  expect: exit_code 0
+### Fuzzy
+- Code is well-structured and readable
+- Error messages are helpful to users
+- Edge cases are handled gracefully
+"#;
+        let criteria = parse_fuzzy_criteria(body);
+        assert_eq!(criteria.len(), 3);
+        assert_eq!(criteria[0], "Code is well-structured and readable");
+        assert_eq!(criteria[1], "Error messages are helpful to users");
+        assert_eq!(criteria[2], "Edge cases are handled gracefully");
+    }
+
+    #[test]
+    fn parse_fuzzy_stops_at_next_heading() {
+        let body = r#"## Acceptance Criteria
+### Fuzzy
+- Quality check one
+- Quality check two
+### Deterministic
+- command: `true`
+  expect: exit_code 0
+"#;
+        let criteria = parse_fuzzy_criteria(body);
+        assert_eq!(criteria.len(), 2);
     }
 
     #[test]

@@ -30,6 +30,8 @@ After you complete a task, the system automatically runs deterministic acceptanc
 - Prefer deterministic checks over vague descriptions
 - Cover the key deliverable of each subtask
 - If retrying after eval failure, check "Previous Attempts" for which criteria failed
+- `### Fuzzy` criteria under `## Acceptance Criteria` define qualitative checks evaluated by an adversarial LLM reviewer after deterministic checks pass
+- Fuzzy criteria trigger a second evaluation pass — ensure your work satisfies both concrete and qualitative requirements
 
 ## Task Decomposition
 

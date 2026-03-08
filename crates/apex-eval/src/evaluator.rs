@@ -1,4 +1,6 @@
-use crate::{checks, parser, CriterionResult, EvalResult};
+use apex_core::ports::LlmProvider;
+
+use crate::{adversarial, checks, parser, CriterionResult, EvalConfig, EvalOn, EvalResult, Evaluation};
 
 pub struct Evaluator;
 
@@ -29,6 +31,73 @@ impl Evaluator {
             failed,
             results,
         })
+    }
+
+    /// Run the full evaluation pipeline: deterministic checks first, then
+    /// adversarial evaluation if configured and applicable.
+    pub async fn evaluate(
+        task_body: &str,
+        result_text: &str,
+        evaluator_persona: &str,
+        llm: &dyn LlmProvider,
+        config: &EvalConfig,
+    ) -> Evaluation {
+        // 1. Run deterministic checks
+        let deterministic = Self::run_deterministic(task_body).await;
+
+        // 2. If deterministic failed, return early — no need for adversarial
+        if let Some(ref det) = deterministic {
+            if !det.all_passed() {
+                return Evaluation {
+                    deterministic,
+                    adversarial: None,
+                    passed: false,
+                };
+            }
+        }
+
+        // 3. Check if adversarial evaluation is needed
+        let fuzzy_criteria = parser::parse_fuzzy_criteria(task_body);
+        let should_run_adversarial = match config.eval_on {
+            EvalOn::Always => true,
+            EvalOn::Never => false,
+            EvalOn::FuzzyCriteria => !fuzzy_criteria.is_empty(),
+        };
+
+        if !should_run_adversarial {
+            return Evaluation {
+                deterministic,
+                adversarial: None,
+                passed: true,
+            };
+        }
+
+        // 4. Run adversarial evaluation
+        let adversarial = match adversarial::run_adversarial(
+            task_body,
+            result_text,
+            &fuzzy_criteria,
+            evaluator_persona,
+            llm,
+        )
+        .await
+        {
+            Ok(result) => Some(result),
+            Err(err) => {
+                // LLM error is non-blocking — log and treat as pass
+                eprintln!("  adversarial eval error (non-blocking): {err}");
+                None
+            }
+        };
+
+        // 5. Combine results
+        let passed = adversarial.as_ref().map_or(true, |a| a.passed);
+
+        Evaluation {
+            deterministic,
+            adversarial,
+            passed,
+        }
     }
 }
 
