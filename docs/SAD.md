@@ -1,7 +1,9 @@
 # SAD: **Apex** — Autonomous AI Agent Harness
 
-**Version:** 5.0 | **Date:** March 2026 | **Status:** Draft
+**Version:** 6.0 (implementation-aligned) | **Date:** March 2026 | **Status:** Current
 **Language:** Rust | **Target:** Embedded Linux (ARMv7+, AArch64, x86-64, RISC-V)
+
+This revision reflects the actual codebase (apex-core, apex-infra, apex-eval, apex-bin) and replaces the prior design document.
 
 ---
 
@@ -25,7 +27,7 @@ rfbmq-core is compiled directly into the binary. Every message is a rich, self-c
                 ┌──────▼──────┐
                 │    Apex     │  single static Rust binary
                 │             │  rfbmq-core + rusqlite compiled in
-                │             │  < 6 MB, zero daemons
+                │             │  zero daemons
                 └──────┬──────┘
                        │
                 ┌──────▼──────┐
@@ -36,10 +38,10 @@ rfbmq-core is compiled directly into the binary. Every message is a rich, self-c
        ┌───────────────┼───────────────┐
        │               │               │
        ▼               ▼               ▼
-    rfbmq-core      memory          sandbox
-    (linked,        (working +      (Linux namespaces)
-     dirs on disk)  long-term +
-                    token estimator)
+    apex-infra     apex-infra      (tools run in process;
+    (rfbmq queue)  (working +       no separate sandbox crate)
+                   long-term +
+                   token estimator)
 ```
 
 rfbmq's Markdown-with-RFC-822-headers format is the native language of LLM agents. Each message is up to 64 MiB of Markdown — enough to carry full task context, execution narratives, evaluation results, and discovered facts in a single human-readable file.
@@ -58,9 +60,9 @@ rfbmq's Markdown-with-RFC-822-headers format is the native language of LLM agent
 
 **P5 — Two-layer evaluation.** Every task is evaluated through deterministic criteria first (exit codes, file existence, output matching), then adversarial LLM review for anything deterministic checks can't cover. The execution persona optimizes for success; the evaluation persona hunts for failure.
 
-**P6 — Every function is a tool.** Decomposition, execution, evaluation, memory access, tool creation, configuration changes — all registered with JSON schemas. Uniformly self-extensible.
+**P6 — Every function is a tool.** Decomposition, execution, evaluation, memory access, tool creation, configuration changes — all exposed with JSON schemas. Uniformly self-extensible.
 
-**P7 — rfbmq is the coordination primitive.** One work queue backed by rfbmq-core. Fan-out uses subtasks with `Depends-On` headers. `Queue::ready()` resolves dependency ordering. All coordination is atomic `rename(2)`.
+**P7 — rfbmq is the coordination primitive.** One work queue backed by rfbmq-core (via apex-infra). Fan-out uses subtasks with `depends_on` headers. All coordination is atomic `rename(2)`.
 
 **P8 — Self-extending.** The agent creates new tools, records successful approaches as skills, records effective decomposition patterns as strategies.
 
@@ -75,80 +77,87 @@ rfbmq's Markdown-with-RFC-822-headers format is the native language of LLM agent
 | ID | Constraint | Rationale |
 |---|---|---|
 | C1 | Single static binary, zero runtime deps | One-file deployment |
-| C2 | < 6 MB on-device footprint | Embedded targets |
-| C3 | Linux-only (kernel 4.18+) | Namespace/seccomp/cgroup sandboxing |
+| C2 | Small on-device footprint | Embedded targets (actual size depends on build) |
+| C3 | Linux-oriented | Primary target; cross-compilation supported |
 | C4 | rfbmq-core as Rust crate dependency | Direct function calls, no process spawn |
 | C5 | SQLite via rusqlite (bundled) | Single-file persistence |
 | C6 | Model-agnostic | LLM provider is a trait |
 | C7 | Zero-daemon constraint | Only Apex runs |
 | C8 | One queue | All message types flow through `work/` |
-| C9 | Max fan-out depth: 2 (configurable) | Prevents runaway decomposition |
+| C9 | Max fan-out depth configurable | Prevents runaway decomposition |
 | C10 | Context budgeted in tokens at push-time | Message bodies are pre-budgeted prompts |
 
 ---
 
 ## 5. Crate Structure
 
+The workspace has four crates. Queue, memory, and LLM live in **apex-infra**; context (composer, estimator) lives in **apex-core**; tools are implemented in **apex-bin**. There are no separate apex-queue, apex-memory, apex-llm, apex-sandbox, apex-tools, or apex-context crates. Shell and file tools run in-process; there is no dedicated sandbox crate.
+
 ```
 apex/
 ├── Cargo.toml                      # workspace root
 ├── crates/
-│   ├── apex-core/                  # PORTABLE — zero infra deps
-│   │   ├── domain/                 # Job, Task, QueueMessage, Memory, Tool, Skill
-│   │   ├── ports/                  # trait contracts (§9)
-│   │   └── use_cases/
-│   │       └── agent_loop.rs       # the agent loop
+│   ├── apex-core/                  # Portable — zero infra deps
+│   │   ├── domain.rs               # QueueMessage, ClaimedTask, MessageHeaders, Fact, Skill, Strategy, etc.
+│   │   ├── ports.rs                # Queue, LlmProvider, ToolRegistry, WorkingMemory, MemoryStore
+│   │   ├── config/                  # Invariants, AgentConfig, loader, validate
+│   │   ├── context/                # MessageComposer, TokenEstimator (composer.rs, estimator.rs)
+│   │   └── error.rs
 │   │
-│   ├── apex-queue/                 # Queue port adapter — wraps rfbmq-core
-│   │   └── Cargo.toml              # depends on rfbmq-core
+│   ├── apex-infra/                 # Queue + memory + LLM adapters
+│   │   ├── queue/                  # RfbmqAdapter (wraps rfbmq-core)
+│   │   ├── memory/                 # FsScratchpadStore (working), SqliteMemoryStore (long-term)
+│   │   └── llm/                    # AnthropicProvider
 │   │
-│   ├── apex-memory/                # SQLite: working memory + long-term + calibration
-│   ├── apex-llm/                   # LLM provider adapters
-│   ├── apex-sandbox/               # Linux namespace sandbox
-│   ├── apex-tools/                 # Built-in tool implementations
-│   ├── apex-context/               # Token estimator + message body composer
 │   ├── apex-eval/                  # Evaluation engine (deterministic + adversarial)
-│   └── apex-bin/                   # Binary entry point, DI wiring, CLI, config
+│   │   ├── evaluator.rs
+│   │   ├── adversarial.rs
+│   │   ├── checks.rs
+│   │   └── parser.rs
+│   │
+│   └── apex-bin/                   # Binary entry point, CLI, agent loop, tools
+│       ├── main.rs                 # CLI, path resolution, process_queue
+│       ├── agent.rs                # worker_loop, execute_claim, run_agentic_loop
+│       └── tools/                  # Builtin, MemoryToolRegistry, QueueToolRegistry, ConfigToolRegistry, CustomToolRegistry, spill
 │
 ├── vendor/
-│   └── rfbmq-core/                 # rfbmq-core source
+│   └── rfbmq-core/                 # rfbmq-core source (path dependency)
 │
 └── Cargo.lock
 ```
 
 ### 5.1 Runtime Directory Structure
 
+Root is `APEX_ROOT` (env var) or current directory. **Init** creates: `queues/` (and the work queue via rfbmq), `memory/working/`, `memory/long-term/`, `scratch/`, `tools/custom/`, `config/`, `tools/manifest.toml` (if missing), and writes default `invariants.toml` and `agent.toml`. Init does **not** create `prompts/` or `tools/schemas/`; those are provided by the operator or created manually.
+
 ```
-/opt/apex/
+{APEX_ROOT}/
 ├── config/
 │   ├── agent.toml
-│   ├── invariants.toml
-│   └── models.toml
+│   └── invariants.toml
 │
 ├── prompts/
-│   ├── agent.md                  # execution persona
+│   ├── agent.md                  # execution persona (read at runtime)
 │   └── evaluator.md              # adversarial evaluation persona
 │
 ├── tools/
 │   ├── manifest.toml
-│   ├── schemas/
+│   ├── schemas/                  # (optional; not created by init)
 │   └── custom/
 │
 ├── memory/
-│   ├── working/                  # lightweight per-job scratchpads
+│   ├── working/                  # per-job scratchpads ({job_id}.md)
 │   └── long-term/
-│       └── apex.db               # SQLite: facts + skills + strategies + calibration
+│       └── memory.db             # SQLite: facts, skills, strategies, calibration
 │
 ├── queues/
 │   └── work/                     # rfbmq queue
-│       ├── pending/              # ← self-contained task documents
-│       ├── processing/           # ← task being worked
-│       ├── done/                 # ← complete execution narratives
-│       └── failed/               # ← failure narratives with full history
+│       ├── pending/
+│       ├── processing/
+│       ├── done/
+│       └── failed/
 │
-├── scratch/                      # spilled tool output (ephemeral)
-│
-└── sandbox/                      # tool execution workspace
+└── scratch/                      # spilled tool output (ephemeral)
 ```
 
 ---
@@ -157,7 +166,7 @@ apex/
 
 ### 6.1 The Principle
 
-Each rfbmq message is a self-contained Markdown document. The headers carry routing metadata (`Type`, `Correlation-Id`, `Depends-On`, `Depth`, `Priority`). The body carries cognitive state — everything the agent needs to understand and execute the task.
+Each rfbmq message is a self-contained Markdown document. The headers carry routing metadata (`message_type`, `correlation_id`, `depends_on`, `depth`, `retry_count`). The body carries cognitive state — everything the agent needs to understand and execute the task.
 
 Context assembly happens at **push-time**, not pop-time. The agent that creates a subtask embeds the relevant facts, recommended skill, acceptance criteria, and previous attempt history into the message body. The agent that pops the subtask receives a ready-to-use prompt. This means every message file in every queue directory is a complete, inspectable document.
 
@@ -204,177 +213,19 @@ check sources list and network connectivity before retrying.
 
 ### 6.3 Result Message Format (pushed to done/ on ack)
 
-When a task completes, the agent rewrites the message body with the full execution narrative before acking:
-
-```markdown
-# Result: Install aws-cli
-
-## Outcome
-SUCCESS
-
-## Execution
-1. Ran `apt-get update` — exit 0, 12s
-2. Ran `apt-get install -y awscli` — exit 0, 34s
-3. Verified `which aws` → `/usr/bin/aws`
-4. Verified `aws --version` → `aws-cli/1.22.34`
-
-## Evaluation
-### Deterministic: PASS (3/3)
-- `which aws` → exit 0 ✓
-- `aws --version` → contains "aws-cli" ✓
-- `dpkg -l awscli` → exit 0 ✓
-
-### Adversarial: PASS
-No blocking issues. Warning: awscli from apt may be outdated
-compared to pip install. Acceptable for backup use case.
-
-## New Facts Discovered
-- awscli version 1.22.34 installed via apt
-- apt-get update takes ~12s on this network
-
-## Duration
-48s total
-```
-
-`cat queues/work/done/task-001.md` is a complete audit record. No cross-referencing needed.
+When a task completes, the agent rewrites the message body with the full execution narrative before acking (via `MessageComposer::compose_result`). The result includes Outcome, Execution, Final Response, Duration, Evaluation, and New Tools Created as applicable.
 
 ### 6.4 Failure Message Format (in failed/ after retry exhaustion)
 
-```markdown
-# Failed: Configure SSL certificate
-
-## Outcome
-FAILED (3/3 retries exhausted)
-
-## Attempt History
-### Attempt 1
-- Ran `certbot --nginx -d example.com`
-- Exit code 1: "Could not bind to port 80"
-- Diagnosis: nginx already listening on port 80
-- Deterministic eval: FAIL — exit_code != 0
-
-### Attempt 2
-- Stopped nginx, ran certbot, restarted nginx
-- Exit code 1: "DNS problem: NXDOMAIN"
-- Diagnosis: domain not pointed to this device's IP
-- Deterministic eval: FAIL — exit_code != 0
-
-### Attempt 3
-- Attempted DNS verification method
-- Exit code 1: "No DNS plugin installed"
-- Deterministic eval: FAIL — exit_code != 0
-
-## Root Cause Assessment
-Domain example.com does not resolve to this device.
-SSL provisioning requires DNS configuration outside
-this device's control.
-
-## Suggested Resolution
-Configure DNS A record for example.com to point to
-this device's public IP before retrying.
-```
-
-`ls queues/work/failed/` and `cat` on any file gives the operator a complete failure narrative with all attempts, diagnoses, and resolution suggestions. No log diving required.
+`MessageComposer::compose_failure(title, attempts)` produces a failure narrative with outcome, attempt history, and (when appended by the agent) root cause and suggested resolution.
 
 ### 6.5 Continuation Message Format
 
-The continuation message fires when all subtasks complete. The creating agent doesn't know the results yet — it only knows the structure. The agent processing the continuation reads subtask results from `done/` and assembles them into the final output:
-
-```markdown
-# Continuation: job-42
-
-## Goal
-Set up nightly S3 backup of /var/data
-
-## Subtask IDs
-- task-001: Install aws-cli
-- task-002: Write backup script
-- task-003: Test backup script
-- task-004: Create cron entry
-
-## Instructions
-All subtasks above have completed. Read their results from done/,
-assemble a summary, extract facts and skills for consolidation,
-and produce the final job result.
-```
-
-After processing, the continuation's result body in `done/` becomes the complete job narrative:
-
-```markdown
-# Job Complete: job-42
-
-## Goal
-Set up nightly S3 backup of /var/data
-
-## Result
-Nightly backup configured and verified.
-
-## Subtask Summary
-### 1. Install aws-cli — SUCCESS (48s)
-awscli 1.22.34 installed via apt.
-
-### 2. Write backup script — SUCCESS (22s)
-/opt/backup.sh created. Uses aws s3 sync with flock
-and error handling. Shellcheck passed.
-
-### 3. Test backup script — SUCCESS (67s)
-Dry-run: 47 files, 198MB total. No errors.
-
-### 4. Create cron entry — SUCCESS (8s)
-/etc/cron.d/backup-var-data, runs 02:00 daily.
-
-## Facts Discovered
-- awscli 1.22.34 installed via apt
-- /opt/backup.sh exists, uses aws s3 sync
-- /var/data is 198MB, 47 files
-- Backup cron at 02:00 daily via /etc/cron.d/
-
-## Skills Updated
-- package-install-apt: success (fitness → 0.93)
-- s3-backup-awscli: success (fitness → 0.88)
-- cron-setup-etc-cron-d: success (fitness → 1.0)
-
-## Total Duration
-145s
-```
+The continuation message is composed when all subtasks are pushed. The agent processing the continuation reads subtask results from `done/` via `queue_read_done`, assembles the job-complete narrative with `compose_job_complete`, and consolidates learnings into long-term memory.
 
 ### 6.6 Retry: Message Body Evolution
 
-When a task fails evaluation and is NACKed for retry, rfbmq puts it back in `pending/` with an incremented retry count. The agent rewrites the body before NACKing to include the attempt history:
-
-```markdown
-# Task: Install aws-cli
-
-## Parent Goal
-Set up nightly S3 backup of /var/data
-
-## Relevant Facts
-- Device runs Debian 11, no Python installed
-- 512MB RAM, ARM architecture
-
-## Recommended Approach
-Skill: package-install-apt (fitness: 0.92)
-
-## Acceptance Criteria
-### Deterministic
-- command: `which aws`
-  expect: exit_code 0
-
-### Fuzzy
-- Should not conflict with existing packages
-
-## Previous Attempts
-### Attempt 1 — FAILED
-- Ran `apt-get install -y awscli`
-- Exit code 100: "Unable to locate package awscli"
-- Root cause: apt sources not updated
-- Deterministic eval: FAIL — `which aws` exit 1
-- Adversarial eval: skipped (deterministic failed)
-
-**→ Next attempt should run `apt-get update` first.**
-```
-
-The retry agent sees exactly what was tried and what went wrong. The "Next attempt should" line is written by the agent based on its diagnosis — it's giving its future self specific instructions.
+When a task fails evaluation and is NACKed for retry, the agent rewrites the body with `MessageComposer::append_attempt` or `append_attempt_with_memory` before NACKing. The body gains a "Previous Attempts" section; the composer can compress older attempts to stay within token budget.
 
 ---
 
@@ -382,300 +233,64 @@ The retry agent sees exactly what was tried and what went wrong. The "Next attem
 
 ### 7.1 Message Headers
 
-```
-Id: a3f2e1b4c5d6a7b8
-Type: goal | task | subtask | continuation
-Correlation-Id: job-42
-Depends-On: task-001, task-002
-Depth: 0
-Priority: normal
-TTL: 3600
-Retry-Count: 0
-```
+Headers are represented as `MessageHeaders` in apex-core (mapped to/from rfbmq custom headers):
 
-| Header | Purpose |
-|---|---|
-| `Id` | Unique message identifier |
-| `Type` | Determines agent behavior mode |
-| `Correlation-Id` | Links all messages in a job |
-| `Depends-On` | Task DAG edges (comma-separated IDs) |
-| `Depth` | Decomposition depth in spawn chain |
-| `Priority` | critical / high / normal / low |
-| `TTL` | Time-to-live in seconds |
-| `Retry-Count` | Number of previous attempts |
+| Field | Type | Purpose |
+|-------|------|---------|
+| `message_type` | Goal \| Task \| Subtask \| Continuation | Determines agent behavior mode |
+| `correlation_id` | String | Links all messages in a job |
+| `depth` | u32 | Decomposition depth in spawn chain |
+| `retry_count` | u32 | Number of previous attempts |
+| `depends_on` | Vec\<String\> | Task DAG edges (message IDs) |
 
 Headers carry routing. The body carries cognition.
 
 ### 7.2 Working Memory
 
-Working memory is lighter in this design. The rich execution context lives in message bodies. The scratchpad at `memory/working/{job-id}.md` tracks only the job-level overview:
-
-```markdown
-# Working Memory: job-42
-
-## Goal
-Set up nightly S3 backup of /var/data
-
-## Decomposition
-1. [done] Install aws-cli → task-001
-2. [done] Write backup script → task-002
-3. [active] Test backup script → task-003
-4. [pending] Create cron entry → task-004 (depends on 003)
-
-## Status
-3 of 4 subtasks complete. Waiting on task-003.
-
-## Job-Level Notes
-- Switched from boto3 to aws-cli approach early (no Python on device)
-- apt sources needed update before install
-```
-
-Detailed execution narratives, evaluation results, and discovered facts live in the message bodies in `done/`. The scratchpad is an index, not a comprehensive log. This keeps working memory small and well within the token budget.
+Working memory is implemented by **FsScratchpadStore** (apex-infra): one Markdown file per job at `memory/working/{job_id}.md`. The scratchpad tracks job-level overview, decomposition status, and job-level notes. Detailed execution narratives live in message bodies in `done/`. The trait `WorkingMemory` in apex-core defines `load_or_create`, `save`, `exists`, `delete`, `list_active`.
 
 ### 7.3 Long-Term Memory
 
-Persists across jobs in SQLite (`memory/long-term/apex.db`).
-
-**Facts** — environment knowledge.
-
-```sql
-CREATE TABLE facts (
-    id TEXT PRIMARY KEY,
-    content TEXT NOT NULL,
-    source_job TEXT,
-    confidence REAL DEFAULT 1.0,
-    created_at TEXT,
-    last_verified TEXT,
-    tags TEXT
-);
-```
-
-**Skills** — effective approaches for task types.
-
-```sql
-CREATE TABLE skills (
-    id TEXT PRIMARY KEY,
-    task_pattern TEXT NOT NULL,
-    approach TEXT NOT NULL,
-    tools_used TEXT,
-    criteria_template TEXT,
-    success_count INTEGER DEFAULT 0,
-    failure_count INTEGER DEFAULT 0,
-    fitness REAL DEFAULT 0.0,
-    min_samples INTEGER DEFAULT 5,
-    last_used TEXT,
-    parent_id TEXT,
-    notes TEXT
-);
-```
-
-**Strategies** — decomposition patterns for goal types.
-
-```sql
-CREATE TABLE strategies (
-    id TEXT PRIMARY KEY,
-    goal_pattern TEXT NOT NULL,
-    decomposition TEXT NOT NULL,
-    avg_subtasks REAL,
-    avg_duration_secs REAL,
-    success_count INTEGER DEFAULT 0,
-    failure_count INTEGER DEFAULT 0,
-    fitness REAL DEFAULT 0.0,
-    notes TEXT
-);
-```
-
-**Calibration** — token estimator state.
-
-```sql
-CREATE TABLE calibration (
-    id TEXT PRIMARY KEY DEFAULT 'default',
-    chars_per_token_prose REAL DEFAULT 4.0,
-    chars_per_token_code REAL DEFAULT 3.0,
-    chars_per_token_mixed REAL DEFAULT 3.5,
-    sample_count INTEGER DEFAULT 0,
-    updated_at TEXT
-);
-```
+Persists across jobs in SQLite at `memory/long-term/memory.db`. Implemented by **SqliteMemoryStore** (apex-infra). Tables: **facts**, **skills**, **strategies**, and calibration data. The `MemoryStore` port provides store/query/update for facts, skills, strategies, and calibration (`persist_calibration`, `load_calibration` using `CalibrationData`).
 
 ---
 
 ## 8. The Agent Loop
 
-```rust
-pub async fn agent_loop(
-    config: &AgentConfig,
-    queue: &dyn Queue,
-    llm: &dyn LlmProvider,
-    memory: &dyn MemoryStore,
-    working_mem: &dyn WorkingMemory,
-    tools: &dyn ToolRegistry,
-    sandbox: &dyn Sandbox,
-    composer: &MessageComposer,
-    evaluator: &Evaluator,
-    estimator: &mut TokenEstimator,
-) -> Result<(), AgentError> {
-    let persona = load_persona(&config.persona)?;
+The agent loop lives in **apex-bin**: `main.rs` drives it via `process_queue`, which spawns one or more workers; each runs `worker_loop(ctx, worker_id)` in [crates/apex-bin/src/agent.rs](crates/apex-bin/src/agent.rs). There is no `agent_loop.rs` in apex-core.
 
-    loop {
-        // 1. Pop next ready message
-        let claimed = match queue.pop("work", config.lease_secs).await? {
-            Some(msg) => msg,
-            None => { sleep(config.poll_interval).await; continue; }
-        };
+### 8.1 Flow
 
-        let msg_type = claimed.headers.msg_type;
-        let job_id = &claimed.headers.correlation_id;
-        let depth = claimed.headers.depth.unwrap_or(0);
+1. **Pop:** `ctx.adapter.pop()` (single logical queue; no queue name parameter).
+2. **Empty:** If `None`, check queue depth; if both pending and processing are 0, the worker may exit. Otherwise sleep (e.g. 1s), increment empty cycles; after a configured number of empty cycles the worker returns.
+3. **Per-claim setup:** Build a `MessageComposer` from the shared `TokenEstimator`. Build `QueueToolRegistry` with queue, correlation_id, depth, max_depth, title, body, long_term, composer. Combine with static tools in `ApexToolRegistry`.
+4. **Execute claim:** `execute_claim(ctx, claimed, tools)`:
+   - Load or create scratchpad from working memory; optionally prepend "Working Memory" to the message body.
+   - Build initial user message from body.
+   - **run_agentic_loop:** Up to MAX_TURNS (e.g. 32). Each turn: call `llm.complete_with_tools`, calibrate token estimator (and periodically persist calibration to long-term memory), append assistant message and tool results to the conversation; stop when the model returns no tool calls (final text is captured).
+   - **Evaluate:** `apex_eval::Evaluator::evaluate(task_body, result_text, evaluator_persona, llm, config)` — deterministic checks first, then adversarial LLM evaluation if configured.
+   - On pass: build `AttemptRecord`, optionally run consolidation (extract facts, update skills/strategies), compose result body.
+   - On fail or LLM error: build attempt record and failure/retry body.
+5. **Success path:** `adapter.update_body(claimed, result_body)`, `adapter.ack(claimed)`.
+6. **Failure path:** `handle_failure`: append attempt or compose full failure body, `update_body`, then `nack` (retry) or `ack` (terminal failure to failed/) as appropriate.
 
-        // 2. Load or create lightweight working memory
-        let mut scratch = working_mem.load_or_create(job_id).await?;
+### 8.2 Context Flow
 
-        // 3. The message body IS the context.
-        //    Persona is the only thing added at pop-time.
-        let prompt = format!("{}\n\n{}", persona, claimed.body);
+**Push-time (creating agent):** Query long-term memory for relevant facts; find best-fit skill and strategy (for goals). Compose message body with embedded context via `MessageComposer` (subtask, continuation). Budget to token limit via `TokenEstimator`. Push to work/.
 
-        // 4. Call LLM
-        let tool_schemas = tools.resolve_schemas(&config.tools).await?;
-        let response = llm.complete_with_tools(
-            CompletionRequest {
-                system: prompt,
-                messages: vec![],
-                model: config.model.clone(),
-            },
-            &tool_schemas,
-        ).await?;
+**Pop-time (receiving agent):** Pop message; optionally prepend working memory to body; that (with persona) is the prompt. No additional lookups required to start.
 
-        // 5. Calibrate token estimator
-        estimator.calibrate_from_response(&response.usage);
-        memory.persist_calibration(estimator).await?;
+### 8.3 Mode Emergence
 
-        // 6. Execute tool calls
-        let mut results = Vec::new();
-        for tool_call in &response.tool_calls {
-            let result = tools.invoke(
-                &tool_call.name, tool_call.input.clone(),
-                sandbox, depth, config.max_depth,
-            ).await?;
-            results.push(result);
-        }
+**Goal →** Agent reads goal body, may query long-term memory, decomposes via `decompose_goal` tool. MessageComposer embeds context into each subtask body. Pushes subtasks and a continuation.
 
-        // 7. Two-layer evaluation
-        let evaluation = evaluator.evaluate(
-            &claimed.body,
-            &format_result(&response, &results),
-            sandbox, llm, &config.eval, estimator,
-        ).await?;
+**Subtask →** Body is the prompt. Agent runs multi-turn LLM with tools, evaluates (deterministic then adversarial if configured). On success: compose result, ack. On failure: append attempt or compose failure, update_body, nack or ack.
 
-        // 8. Handle failure — rewrite body with attempt history, nack
-        if !evaluation.passed {
-            let retry_count = claimed.headers.retry_count.unwrap_or(0);
-            if retry_count < config.max_retries {
-                let updated_body = composer.append_attempt(
-                    &claimed.body, retry_count + 1,
-                    &response, &results, &evaluation,
-                );
-                queue.update_body("work", &claimed.id, &updated_body).await?;
-                scratch.record_failure_summary(&evaluation);
-                working_mem.save(&scratch).await?;
-                queue.nack("work", &claimed.id, true).await?;
-                continue;
-            }
-            // Terminal failure — rewrite body with full failure narrative
-            let failure_body = composer.compose_failure(
-                &claimed.body, &response, &results, &evaluation,
-            );
-            queue.update_body("work", &claimed.id, &failure_body).await?;
-        }
+**Continuation →** When dependencies are in done/, agent reads subtask results via `queue_read_done`, composes job-complete narrative, consolidates into long-term memory.
 
-        // 9. Success — rewrite body with execution narrative
-        if evaluation.passed {
-            let result_body = composer.compose_result(
-                &claimed.body, &response, &results, &evaluation,
-            );
-            queue.update_body("work", &claimed.id, &result_body).await?;
-        }
+### 8.4 Self-Healing
 
-        // 10. Update working memory (lightweight)
-        scratch.update_subtask_status(&claimed, &evaluation);
-        working_mem.save(&scratch).await?;
-
-        // 11. Handle subtask/continuation creation for goals
-        match msg_type {
-            MessageType::Goal => {
-                // Agent decomposed via tool calls.
-                // Each subtask pushed by decompose_goal tool
-                // with full context embedded by the MessageComposer.
-                if has_pending_subtasks(&scratch) {
-                    let continuation_body = composer.compose_continuation(
-                        job_id, &scratch,
-                    );
-                    queue.push("work", QueueMessage {
-                        msg_type: MessageType::Continuation,
-                        correlation_id: job_id.clone(),
-                        depends_on: collect_subtask_ids(&scratch),
-                        depth,
-                        body: continuation_body,
-                        ..Default::default()
-                    }).await?;
-                }
-            }
-            MessageType::Continuation => {
-                // Read subtask results from done/, consolidate
-                let subtask_results = read_subtask_results(
-                    queue, job_id
-                ).await?;
-                let job_body = composer.compose_job_complete(
-                    &claimed.body, &subtask_results,
-                );
-                queue.update_body("work", &claimed.id, &job_body).await?;
-                consolidate(job_id, &subtask_results, memory).await?;
-                cleanup_scratch(job_id).await?;
-            }
-            _ => {}
-        }
-
-        // 12. Ack
-        queue.ack("work", &claimed.id).await?;
-    }
-}
-```
-
-### 8.1 Context Flow
-
-```
-Push-time (creating agent):
-  Query long-term memory for relevant facts
-  Find best-fit skill and criteria template
-  Find best-fit strategy (for goals)
-  Compose message body with embedded context
-  Budget to token limit via TokenEstimator
-  Push to work/
-
-Pop-time (receiving agent):
-  Pop message
-  Prepend persona to message body
-  That's the prompt. No additional lookups needed.
-```
-
-The creating agent does the heavy lifting — it has just been reasoning about the goal and knows exactly which context is relevant for each subtask. The receiving agent gets a pre-assembled, pre-budgeted prompt. This eliminates redundant memory queries and ensures each subtask gets precisely the context it needs, not a generic dump of recent facts.
-
-### 8.2 Mode Emergence
-
-**Goal arrives →** Agent reads the goal body (which may include user-provided context). Queries long-term memory for matching strategy and relevant facts. Decomposes into subtasks via `decompose_goal` tool. For each subtask, `MessageComposer` embeds relevant facts, best-fit skill, criteria template, and parent context into the body. Pushes subtasks to `work/` with `Depends-On` edges. Pushes a `continuation`.
-
-**Subtask arrives →** Body is a complete prompt. Agent prepends persona, calls LLM, executes tools, runs two-layer evaluation. On success, rewrites body as execution narrative, acks. On failure, appends attempt history to body, nacks for retry.
-
-**Continuation arrives →** `Queue::ready()` surfaces this when all dependencies are in `done/`. Agent reads subtask results from `done/`, assembles job-complete narrative, consolidates learnings into long-term memory.
-
-### 8.3 Self-Healing
-
-1. Deterministic criterion fails → agent composes diagnosis, appends to body as "Previous Attempts" section, includes "Next attempt should..." guidance.
-2. Adversarial eval finds blocking issue → specific finding appended to body.
-3. `nack` returns message to `pending/` with incremented retry count and enriched body.
-4. Next pop: the body contains the full failure history. The agent reads it as part of the prompt and addresses the specific issues.
-5. Missing tool → agent calls `create_tool`, retries.
-6. Retries exhausted → body rewritten as failure narrative with all attempts and root cause assessment. Message moves to `failed/`.
+Deterministic failure → append attempt to body with diagnosis and "Next attempt should..." guidance; nack. Adversarial finding → appended to body. Retries exhausted → compose failure narrative, ack (message moves to failed/). Missing tool → agent can call `create_tool` and retry.
 
 ---
 
@@ -683,24 +298,25 @@ The creating agent does the heavy lifting — it has just been reasoning about t
 
 ### 9.1 Queue
 
+Single logical queue; no queue name or lease_secs in the trait. Implemented by **RfbmqAdapter** in apex-infra (wraps rfbmq-core).
+
 ```rust
 #[async_trait]
 pub trait Queue: Send + Sync {
-    async fn init(&self, queue: &str, max_pending: Option<u32>) -> Result<(), QueueError>;
-    async fn push(&self, queue: &str, msg: QueueMessage) -> Result<String, QueueError>;
-    async fn pop(&self, queue: &str, lease_secs: u32) -> Result<Option<ClaimedMessage>, QueueError>;
-    async fn ack(&self, queue: &str, msg_id: &str) -> Result<(), QueueError>;
-    async fn nack(&self, queue: &str, msg_id: &str, retry: bool) -> Result<(), QueueError>;
-    async fn update_body(&self, queue: &str, msg_id: &str, body: &str) -> Result<(), QueueError>;
-    async fn depth(&self, queue: &str) -> Result<QueueDepth, QueueError>;
-    async fn ready(&self, queue: &str) -> Result<Vec<String>, QueueError>;
-    async fn inspect(&self, msg_path: &str) -> Result<MessageMetadata, QueueError>;
-    async fn cat(&self, msg_path: &str) -> Result<String, QueueError>;
-    async fn reap(&self, queue: &str) -> Result<ReapResult, QueueError>;
+    async fn push(&self, msg: QueueMessage) -> Result<String, QueueError>;
+    async fn pop(&self) -> Result<Option<ClaimedTask>, QueueError>;
+    async fn update_body(&self, claimed: &ClaimedTask, new_body: &str) -> Result<(), QueueError>;
+    async fn ack(&self, claimed: &ClaimedTask) -> Result<(), QueueError>;
+    async fn nack(&self, claimed: &ClaimedTask) -> Result<(), QueueError>;
+    async fn depth(&self) -> Result<QueueDepth, QueueError>;
+    async fn reap(&self) -> Result<ReapResult, QueueError>;
+    async fn list_done(&self, correlation_id: &str) -> Result<Vec<String>, QueueError>;
+    async fn read_done_body(&self, id: &str) -> Result<String, QueueError>;
+    async fn list_with_state(&self, state: &str) -> Result<Vec<QueueMessageMeta>, QueueError>;
 }
 ```
 
-`update_body` is the new operation — it rewrites the message body while preserving headers. Used before both ack (to write the result narrative) and nack (to append attempt history). The rfbmq-core adapter implements this as an atomic write-to-temp-then-rename, preserving rfbmq's durability guarantees.
+Types: `QueueMessage` (headers + body), `ClaimedTask` (id, claim_path, headers, body), `QueueDepth` (pending, processing), `ReapResult` (lease_reaped), `QueueMessageMeta` (id, type_label, correlation_id, depends_on).
 
 ### 9.2 LLM Provider
 
@@ -715,6 +331,8 @@ pub trait LlmProvider: Send + Sync {
 }
 ```
 
+Implemented by **AnthropicProvider** in apex-infra.
+
 ### 9.3 Working Memory
 
 ```rust
@@ -728,9 +346,9 @@ pub trait WorkingMemory: Send + Sync {
 }
 ```
 
-Working memory is lighter now — the `Scratchpad` tracks decomposition status and job-level notes. Detailed execution narratives live in message bodies. No `load_compressed` or `load_section` needed; the scratchpad fits in the token budget naturally because it's an index, not a comprehensive log.
+Implemented by **FsScratchpadStore** (files under memory/working/).
 
-### 9.4 Long-Term Memory
+### 9.4 Long-Term Memory (MemoryStore)
 
 ```rust
 #[async_trait]
@@ -741,233 +359,109 @@ pub trait MemoryStore: Send + Sync {
 
     async fn store_skill(&self, skill: Skill) -> Result<SkillId, MemoryError>;
     async fn find_skill(&self, task_pattern: &str) -> Result<Option<Skill>, MemoryError>;
-    async fn update_skill_fitness(&self, id: &SkillId, outcome: &Outcome)
-        -> Result<(), MemoryError>;
+    async fn list_skills(&self, limit: usize) -> Result<Vec<Skill>, MemoryError>;
+    async fn update_skill_fitness(&self, id: &SkillId, success: bool) -> Result<(), MemoryError>;
 
     async fn store_strategy(&self, strategy: Strategy) -> Result<StrategyId, MemoryError>;
     async fn find_strategy(&self, goal: &str) -> Result<Option<Strategy>, MemoryError>;
-    async fn update_strategy_fitness(&self, id: &StrategyId, outcome: &Outcome)
-        -> Result<(), MemoryError>;
+    async fn list_strategies(&self, limit: usize) -> Result<Vec<Strategy>, MemoryError>;
+    async fn update_strategy_fitness(&self, id: &StrategyId, success: bool) -> Result<(), MemoryError>;
 
-    async fn persist_calibration(&self, estimator: &TokenEstimator) -> Result<(), MemoryError>;
-    async fn load_calibration(&self) -> Result<Option<TokenEstimator>, MemoryError>;
+    async fn persist_calibration(&self, data: &CalibrationData) -> Result<(), MemoryError>;
+    async fn load_calibration(&self) -> Result<CalibrationData, MemoryError>;
 }
 ```
 
+Implemented by **SqliteMemoryStore** in apex-infra. Calibration is stored as `CalibrationData`, not a full TokenEstimator.
+
 ### 9.5 Message Composer
+
+Lives in apex-core `context/composer.rs`. Holds a `TokenEstimator`; uses internal constants (MAX_TASK_TOKENS, MAX_FACTS_TOKENS, MAX_SKILL_TOKENS, MAX_CRITERIA_TOKENS, MAX_ATTEMPTS_TOKENS) for budgeting. No separate `ContextBudget` config struct.
 
 ```rust
 pub struct MessageComposer {
     estimator: TokenEstimator,
-    budget: ContextBudget,
 }
 
 impl MessageComposer {
-    /// Compose a subtask message body with embedded context
-    pub fn compose_subtask(
-        &self,
-        task_description: &str,
-        parent_goal: &str,
-        facts: &[Fact],
-        skill: Option<&Skill>,
-        depth_context: &str,
-    ) -> String;
-
-    /// Compose result narrative after successful execution
-    pub fn compose_result(
-        &self,
-        original_body: &str,
-        response: &ToolCompletionResponse,
-        results: &[ToolResult],
-        evaluation: &Evaluation,
-    ) -> String;
-
-    /// Append attempt history to body for retry
-    pub fn append_attempt(
-        &self,
-        original_body: &str,
-        attempt_num: u32,
-        response: &ToolCompletionResponse,
-        results: &[ToolResult],
-        evaluation: &Evaluation,
-    ) -> String;
-
-    /// Compose failure narrative after retry exhaustion
-    pub fn compose_failure(
-        &self,
-        original_body: &str,
-        response: &ToolCompletionResponse,
-        results: &[ToolResult],
-        evaluation: &Evaluation,
-    ) -> String;
-
-    /// Compose continuation message
-    pub fn compose_continuation(
-        &self,
-        job_id: &str,
-        scratch: &Scratchpad,
-    ) -> String;
-
-    /// Compose job-complete narrative from subtask results
-    pub fn compose_job_complete(
-        &self,
-        continuation_body: &str,
-        subtask_results: &[SubtaskResult],
-    ) -> String;
+    pub fn new(estimator: TokenEstimator) -> Self;
+    pub fn compose_task_body(task: &str) -> String;
+    pub fn compose_result(title: &str, record: &AttemptRecord) -> String;
+    pub fn append_attempt(&self, existing_body: &str, record: &AttemptRecord) -> String;
+    pub fn append_attempt_with_memory(&self, existing_body: &str, record: &AttemptRecord, scratchpad: &Scratchpad) -> String;
+    pub fn compose_failure(title: &str, attempts: &[AttemptRecord]) -> String;
+    pub fn compose_subtask(&self, title: &str, description: &str, acceptance_criteria: &str, parent_goal: &str, parent_context: &str) -> String;
+    pub fn compose_subtask_with_memory(&self, title: &str, description: &str, acceptance_criteria: &str, parent_goal: &str, parent_context: &str, relevant_facts: &[Fact], recommended_skill: Option<&Skill>) -> String;
+    pub fn compose_continuation(correlation_id: &str, goal: &str, subtask_ids: &[String]) -> String;  // static
+    pub fn compose_job_complete(&self, continuation_body: &str, subtask_results: &[SubtaskResult]) -> String;
 }
 ```
-
-The `MessageComposer` is the component that enforces token budgets at push-time. When composing a subtask body, it allocates tokens across sections (context, facts, skill, criteria) and truncates to fit. The resulting message body is pre-budgeted — the receiving agent's pop-time context assembly is just "prepend persona."
 
 ### 9.6 Evaluator
 
+Lives in apex-eval. Static-style API; no Sandbox or TokenEstimator parameters. Persona and config are passed per call.
+
 ```rust
-pub struct Evaluator {
-    eval_persona: String,
-}
+pub struct Evaluator;
 
 impl Evaluator {
+    pub async fn run_deterministic(body: &str) -> Option<EvalResult>;
     pub async fn evaluate(
-        &self,
         task_body: &str,
-        result: &str,
-        sandbox: &dyn Sandbox,
+        result_text: &str,
+        evaluator_persona: &str,
         llm: &dyn LlmProvider,
         config: &EvalConfig,
-        estimator: &TokenEstimator,
-    ) -> Result<Evaluation, EvalError> {
-        // Layer 1: deterministic
-        let deterministic = self.run_deterministic(task_body, sandbox).await?;
-        if !deterministic.passed {
-            return Ok(Evaluation {
-                deterministic,
-                adversarial: None,
-                passed: false,
-                blocking_issues: deterministic.failures.clone(),
-                warnings: vec![],
-            });
-        }
-
-        // Layer 2: adversarial
-        let fuzzy_criteria = extract_fuzzy_criteria(task_body);
-        let needs_adversarial = match config.eval_on {
-            EvalOn::Always => true,
-            EvalOn::FuzzyCriteria => !fuzzy_criteria.is_empty(),
-            EvalOn::Never => false,
-        };
-
-        let adversarial = if needs_adversarial {
-            Some(self.run_adversarial(
-                task_body, result, &fuzzy_criteria,
-                llm, config, estimator
-            ).await?)
-        } else {
-            None
-        };
-
-        let passed = adversarial.as_ref().map(|a| a.passed).unwrap_or(true);
-
-        Ok(Evaluation {
-            deterministic,
-            adversarial,
-            passed,
-            blocking_issues: adversarial.as_ref()
-                .map(|a| a.blocking_issues.clone()).unwrap_or_default(),
-            warnings: adversarial.as_ref()
-                .map(|a| a.warnings.clone()).unwrap_or_default(),
-        })
-    }
+    ) -> Evaluation;
 }
 ```
+
+Deterministic: parse criteria from body, run checks (exit_code, output_contains, file_exists, etc.). Adversarial: run only when configured (eval_on: Always | Never | FuzzyCriteria) and when deterministic passed.
 
 ### 9.7 Sandbox
 
-```rust
-#[async_trait]
-pub trait Sandbox: Send + Sync {
-    async fn execute(&self, cmd: SandboxCommand) -> Result<SandboxResult, SandboxError>;
-    async fn execute_with_timeout(&self, cmd: SandboxCommand, timeout: Duration)
-        -> Result<SandboxResult, SandboxError>;
-    fn capabilities(&self) -> SandboxCapabilities;
-}
-```
+There is no Sandbox trait in apex-core ports. Built-in tools (e.g. shell_exec) run in-process. Future work may introduce a sandbox abstraction; the current implementation does not use one.
 
 ### 9.8 Tool Registry
 
 ```rust
 #[async_trait]
 pub trait ToolRegistry: Send + Sync {
-    async fn register(&self, tool: ToolDef) -> Result<(), ToolError>;
-    async fn unregister(&self, name: &str) -> Result<(), ToolError>;
-    async fn get(&self, name: &str) -> Result<Option<ToolDef>, ToolError>;
-    async fn list(&self) -> Result<Vec<ToolDef>, ToolError>;
-    async fn list_by_tag(&self, tag: &str) -> Result<Vec<ToolDef>, ToolError>;
-    async fn resolve_schemas(&self, names: &[String]) -> Result<Vec<ToolSchema>, ToolError>;
-    async fn invoke(&self, name: &str, input: serde_json::Value,
-                    sandbox: &dyn Sandbox, depth: u8, max_depth: u8)
-        -> Result<ToolResult, ToolError>;
+    fn definitions(&self) -> Vec<ToolDef>;
+    fn schemas(&self) -> Vec<ToolSchema> { ... }  // default: from definitions
+    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError>;
 }
 ```
+
+No `register`, `unregister`, or `invoke(name, input, sandbox, depth, max_depth)`. Tools are registered at build/wiring time; execution is via `execute(call)`. Implementations in apex-bin: `StaticToolRegistry` (aggregates builtin, memory, custom, config), `QueueToolRegistry` (per-claim: decompose_goal, queue_read_done), `ApexToolRegistry` (static + queue).
 
 ---
 
 ## 10. Tool System
 
-### 10.1 Built-in Tools
+### 10.1 Built-in Tools (as implemented)
 
-| Tool | Description | Default Output Budget |
-|---|---|---|
-| `shell_exec` | Execute a shell command via sandbox | 8KB |
-| `file_read` | Read a file (supports line ranges) | 8KB |
-| `file_write` | Write content to a file | — |
-| `file_list` | List directory contents | 4KB |
-| `http_request` | Make an HTTP request | 8KB |
-| `memory_store_fact` | Store a fact in long-term memory | — |
-| `memory_query_facts` | Query facts by relevance | 4KB |
-| `memory_store_skill` | Store or update a skill | — |
-| `memory_query_skill` | Find best skill for a task type | 2KB |
-| `memory_store_strategy` | Store or update a strategy | — |
-| `working_memory_read` | Read scratchpad | 4KB |
-| `working_memory_update` | Update scratchpad | — |
-| `queue_push` | Push a message to the work queue | — |
-| `queue_depth` | Check queue depth | 256B |
-| `queue_inspect` | Inspect a message's headers | 2KB |
-| `queue_read_done` | Read a completed message from done/ | 8KB |
-| `create_tool` | Synthesize, test, and register a new tool | 4KB |
-| `decompose_goal` | Break a goal into subtasks with embedded context | 4KB |
-| `sandbox_exec` | Execute in isolated namespace | 8KB |
-| `update_config` | Modify agent.toml (validated against invariants) | — |
+| Registry | Tools |
+|----------|--------|
+| **Builtin** | `shell_exec`, `file_read`, `file_write` |
+| **Memory** | `working_memory_read`, `working_memory_update`, `memory_store_fact`, `memory_query_facts`, `memory_store_skill`, `memory_query_skill`, `memory_store_strategy` |
+| **Queue** (per-claim) | `decompose_goal`, `queue_read_done` |
+| **Config** | `update_config` |
+| **Custom** | `create_tool` plus dynamic tools loaded from `tools/manifest.toml` / `tools/custom/` |
 
-`decompose_goal` now calls `MessageComposer` internally to embed context into each subtask's body before pushing to the queue. `queue_read_done` allows the continuation agent to read subtask results from `done/`.
+Not present in the current implementation: `file_list`, `http_request`, `queue_push`, `queue_depth`, `queue_inspect`, `sandbox_exec`. Tool output limits and spill-to-disk are implemented in apex-bin (e.g. [crates/apex-bin/src/tools/spill.rs](crates/apex-bin/src/tools/spill.rs)); when output exceeds budget, the agent receives a summary and can drill down via `file_read` or follow-up tool calls.
 
 ### 10.2 Tool Manifest
 
-```toml
-[[tool]]
-name = "shell_exec"
-description = "Execute a shell command in the sandbox"
-mode = "builtin"
-schema = "schemas/shell_exec.json"
-sandbox = true
-network = false
-max_output = "8KB"
-spill_strategy = "head_tail"
-head_lines = 20
-tail_lines = 20
-```
+Path: `tools/manifest.toml`. Defines custom tools and metadata; format is tool-specific. Built-in tools are wired in code (BuiltinToolRegistry, MemoryToolRegistry, etc.).
 
 ### 10.3 Dynamic Tool Creation
 
-1. LLM generates implementation.
-2. Written to `tools/custom/{name}/`.
-3. Tested in sandbox.
-4. Entry added to `tools/manifest.toml`.
-5. Skill record created.
-6. Tool immediately available.
+The agent can call `create_tool` to synthesize, test, and register a new tool. Implementations are written under `tools/custom/` and registered via the manifest. Skills can be updated when a new approach succeeds.
 
 ### 10.4 Skill Evolution
 
-Each use updates fitness. `criteria_template` accumulates proven acceptance criteria. Skills below `auto_retire_below` are excluded. `parent_id` tracks lineage.
+`MemoryStore::update_skill_fitness(id, success)` updates success/failure counts and fitness. Criteria templates and strategy fitness are updated during consolidation. Skills and strategies are queried when composing subtasks.
 
 ---
 
@@ -975,88 +469,23 @@ Each use updates fitness. `criteria_template` accumulates proven acceptance crit
 
 ### 11.1 Push-Time Budgeting
 
-Context is budgeted when composing message bodies, not when popping them. The `MessageComposer` allocates tokens across sections:
-
-```toml
-[context_budget]
-max_body_tokens = 6000          # total budget for message body
-max_task_tokens = 1000          # task description + parent context
-max_facts_tokens = 1000         # relevant facts section
-max_skill_tokens = 500          # recommended approach
-max_criteria_tokens = 500       # acceptance criteria
-max_attempts_tokens = 2000      # previous attempt history (grows with retries)
-```
-
-The persona (prepended at pop-time) has its own budget:
-
-```toml
-max_persona_tokens = 500
-```
-
-Total tokens entering the LLM: `max_persona_tokens + max_body_tokens + tool_schemas_overhead`. This is validated against the model's context window via `LlmProvider::context_window()`.
+The `MessageComposer` uses a `TokenEstimator` and internal constants (MAX_TASK_TOKENS, MAX_FACTS_TOKENS, MAX_SKILL_TOKENS, MAX_CRITERIA_TOKENS, MAX_ATTEMPTS_TOKENS) to truncate sections. There is no separate `[context_budget]` section in agent.toml for per-section limits; agent.toml has `context_budget.max_body_tokens` and `max_tool_result_tokens` for high-level caps. Total context is validated against the model's context window where applicable.
 
 ### 11.2 Token Estimator
 
-Self-calibrating, persists in SQLite:
-
-```rust
-pub struct TokenEstimator {
-    chars_per_token_prose: f32,   // initial: 4.0
-    chars_per_token_code: f32,    // initial: 3.0
-    chars_per_token_mixed: f32,   // initial: 3.5
-    sample_count: u32,
-}
-```
-
-Converges to ~5% accuracy after 20-30 LLM calls. Calibrated from `response.usage.prompt_tokens` after every call.
+Lives in apex-core `context/estimator.rs`. Holds `CalibrationData` (chars-per-token for prose, code, mixed). Methods: `classify(text)` → ContentType, `ratio(ct)`, `estimate(text)`, `estimate_typed(text, ct)`, `budget(text, max_tokens)`, `calibrate(&mut self, prompt_text, actual_tokens)`. Calibration is persisted via `MemoryStore::persist_calibration` / `load_calibration`. Self-calibrates from LLM usage over time.
 
 ### 11.3 Tool Output Spill
 
-When output exceeds a tool's `max_output`, the full output writes to `scratch/`. The agent receives a summary envelope:
-
-```markdown
-## Tool Result: shell_exec
-Status: exit_code 0
-Output: SPILLED (247KB, 3,841 lines → /scratch/result-a7b3.txt)
-
-### Head (first 20 lines)
-[first 20 lines]
-
-### Tail (last 20 lines)
-[last 20 lines]
-
-### Stats
-- Total lines: 3,841
-- Total bytes: 247,129
-- Patterns: error (12), warning (47), info (3,782)
-```
-
-The agent drills with follow-up tool calls. Tools support pre-filtering (`grep`, `tail`, `max_lines`). The agent learns to use filtered invocations via skills.
+When a tool's output exceeds its byte budget, the full output is written to `scratch/` and the agent receives a summary (head/tail or similar). Implemented in apex-bin (SpillManager / spill module). The agent can use `file_read` or `shell_exec` to drill into spilled files.
 
 ### 11.4 Attempt History Budget
 
-As retries accumulate, the "Previous Attempts" section grows. The `MessageComposer` manages this within the `max_attempts_tokens` budget. If three attempts exceed the budget, the oldest attempt is compressed to a one-line summary:
-
-```markdown
-## Previous Attempts
-### Attempt 1 [COMPRESSED]
-✗ apt-get install failed — package not found (sources not updated)
-
-### Attempt 2 [FULL]
-- Ran `apt-get update` — exit 0
-- Ran `apt-get install -y awscli` — exit 100: "held broken packages"
-- Diagnosis: conflicting dependency with existing aws-sdk package
-- Deterministic eval: FAIL
-
-**→ Next attempt should resolve the dependency conflict first.**
-```
+As retries accumulate, `MessageComposer::append_attempt` and `compress_attempts` keep the "Previous Attempts" section within budget by compressing older attempts to one-line summaries.
 
 ### 11.5 Scratch File Lifecycle
 
-- Created when tool output exceeds byte budget.
-- Available for drill-down via `file_read` and `shell_exec`.
-- Deleted when parent message is ACKed.
-- Cleaned up by `apex reap` if orphaned.
+Created when tool output exceeds budget; available for drill-down; cleaned up when the parent message is acked or via manual/periodic cleanup.
 
 ---
 
@@ -1064,294 +493,176 @@ As retries accumulate, the "Previous Attempts" section grows. The `MessageCompos
 
 ### 12.1 Two-Layer Stack
 
-```
-Task result
-     │
-     ▼
-Layer 1: Deterministic criteria
-     │   exit codes, file existence, output matching
-     │
-     │   fail? → append to body, nack
-     │   pass? ──────────────────────────┐
-     │                                    │
-     ▼                                    ▼
-Layer 2: Adversarial LLM evaluation     (if fuzzy criteria
-     │   different persona,              or eval_on = "always")
-     │   optionally different model
-     │
-     │   fail? → append findings to body, nack
-     │   pass? → compose result narrative, ack
-```
+Layer 1: Deterministic criteria parsed from the task body (exit_code, output_contains, file_exists, etc.). Implemented in apex-eval (checks, parser). If any fail, evaluation returns passed=false and no adversarial run.
+
+Layer 2: Adversarial LLM evaluation using `prompts/evaluator.md` persona and (optionally) a separate eval model. Run when `eval_on` is Always, or when FuzzyCriteria and the body has fuzzy criteria. Results (blocking issues, warnings) flow into attempt history for retry context.
 
 ### 12.2 Deterministic Criteria
 
-| Check | Description |
-|---|---|
-| `exit_code` | Command exits with expected code |
-| `output_contains` | stdout contains a string |
-| `output_matches` | stdout matches a regex |
-| `file_exists` | File exists at path |
-| `file_contains` | File contains a string |
-| `file_size` | File size within range |
-| `http_status` | HTTP endpoint returns expected status |
-| `json_path` | JSON field matches expected value |
-| `not_contains` | Output does not contain a string |
+Supported checks include exit_code, output_contains, output_matches, file_exists, file_contains, and similar. Parsed from the task body; executed by apex-eval checks module.
 
 ### 12.3 Adversarial LLM Evaluation
 
-Different persona (`prompts/evaluator.md`), optionally different model (`eval_model`). Finds blocking issues and warnings. Specific findings flow into the message body's attempt history for retry context.
-
-```toml
-[eval]
-eval_model = "claude-sonnet-4-20250514"
-eval_on = "fuzzy_criteria"
-```
+Persona from `prompts/evaluator.md`; optional `eval_model` in agent config. EvalConfig has `eval_on: EvalOn` (Always | Never | FuzzyCriteria).
 
 ### 12.4 Criteria Template Accumulation
 
-Successful criteria are stored in the skill's `criteria_template`. Reused on future instances of the same task pattern. Criteria that catch real failures are promoted. Evaluation quality compounds with use.
+Successful criteria can be stored in skills and reused; consolidation updates skill/strategy fitness and criteria templates from task outcomes.
 
 ---
 
 ## 13. Fan-Out
 
-Independent subtasks execute in parallel. Each subtask's message body carries its own embedded context:
-
-```
-Goal: "Set up monitoring with Prometheus and Grafana"
-
-Subtasks pushed to work/:
-  task-A body: full context for installing Prometheus
-  task-B body: full context for installing Grafana
-  task-C body: full context for Prometheus config (Depends-On: A)
-  task-D body: full context for Grafana dashboard (Depends-On: B, C)
-  task-E body: full context for e2e test (Depends-On: D)
-  continuation: instructions for final assembly (Depends-On: E)
-```
-
-Multiple agent loop instances pop from the same queue. `Queue::ready()` ensures ordering. Each subtask is self-contained — no shared state between parallel tasks.
+Independent subtasks are pushed with `depends_on` IDs. Multiple workers can pop from the same queue; dependency ordering is respected by the queue (rfbmq). Each subtask body is self-contained with embedded context.
 
 ---
 
 ## 14. Consolidation
 
-When a `continuation` fires:
-
-1. Read subtask results from `done/` — each is a complete narrative with "New Facts Discovered" and execution details.
-2. Extract facts → `store_fact`.
-3. Update skill fitness → `update_skill_fitness`.
-4. Update skill `criteria_template` with criteria that caught real failures.
-5. Update strategy fitness → `update_strategy_fitness`.
-6. Record new skills if novel approaches succeeded.
-7. Compose job-complete narrative → write to message body.
-8. Archive or delete working memory.
-9. Purge `scratch/` files.
-
-Consolidation reads primarily from message bodies in `done/`, not from scattered logs or databases. The `## New Facts Discovered` section in each result body tells the consolidation step exactly what to extract.
+When a continuation is processed: read subtask results from done/ via `list_done` and `read_done_body`, extract facts and update skills/strategies (when consolidation is enabled in config), compose job-complete narrative with `compose_job_complete`, update message body, ack. Working memory can be archived or cleared; scratch files purged as appropriate.
 
 ---
 
 ## 15. Configuration Layers
 
 ```
-invariants.toml    (immutable — operator sets at deploy)
+config/invariants.toml   (immutable — operator sets at deploy)
        ↓ constrains
-agent.toml         (mutable — agent modifies via update_config)
+config/agent.toml        (mutable — agent modifies via update_config tool)
        ↓ read by
-agent_loop         (runtime)
+worker_loop / execute_claim
 ```
 
-### 15.1 Invariants
+Path resolution: `APEX_ROOT` or current directory; config dir = `{root}/config/`.
 
-```toml
-[limits]
-max_depth = 5
-max_concurrent = 8
-max_tools = 200
-max_pending = 5000
-max_memory_per_sandbox = "512M"
-max_cpu_time_per_tool = "60s"
-max_working_memory_size = "1M"
-max_fact_count = 10000
-max_body_tokens = 12000
-max_tool_output = "64KB"
-```
+### 15.1 Invariants (invariants.toml)
 
-### 15.2 Agent Config
+Operator-defined ceilings. Loaded via `ConfigLoader::load_invariants`. Structure (apex-core):
 
-```toml
-[agent]
-persona = "prompts/agent.md"
-model = "claude-sonnet-4-20250514"
-tools = ["shell_exec", "file_read", "file_write", "file_list",
-         "http_request", "memory_store_fact", "memory_query_facts",
-         "memory_store_skill", "memory_query_skill",
-         "memory_store_strategy", "working_memory_read",
-         "working_memory_update", "queue_push", "queue_depth",
-         "queue_read_done", "create_tool", "decompose_goal",
-         "sandbox_exec", "update_config"]
-max_concurrent = 4
-max_depth = 2
-lease_secs = 120
-max_retries = 3
-poll_interval_ms = 1000
+- `limits.max_depth` (default 5)
+- `limits.max_concurrent` (default 8)
+- `limits.max_tools` (default 50)
+- `limits.max_body_tokens` (default 100_000)
+- `limits.max_retries` (default 10)
 
-[eval]
-eval_model = "claude-sonnet-4-20250514"
-eval_on = "fuzzy_criteria"
+Agent config is validated against these in `validate_against_invariants`.
 
-[context_budget]
-max_body_tokens = 6000
-max_task_tokens = 1000
-max_facts_tokens = 1000
-max_skill_tokens = 500
-max_criteria_tokens = 500
-max_attempts_tokens = 2000
-max_persona_tokens = 500
+### 15.2 Agent Config (agent.toml)
 
-[consolidation]
-auto = true
-extract_facts = true
-update_skills = true
-update_strategies = true
-archive_working_memory = true
+- **agent:** model, max_concurrent, max_depth, max_retries, tools (optional list of enabled tool names; empty = all).
+- **eval:** eval_model (optional override), eval_on ("always" | "never" | "fuzzy_criteria").
+- **context_budget:** max_body_tokens, max_tool_result_tokens.
+- **consolidation:** enabled, extract_facts, extract_skills, extract_strategies.
+- **fitness:** min_pass_rate, min_uses.
 
-[fitness]
-min_success_rate = 0.70
-min_samples = 5
-auto_retire_below = 0.30
-```
+Defaults and full shape are in [crates/apex-core/src/config/agent.rs](crates/apex-core/src/config/agent.rs).
 
 ---
 
 ## 16. Sandbox Model
 
-- **Mount namespace**: read-only root, writable tmpfs for workspace
-- **PID namespace**: isolated process tree
-- **Network namespace**: disabled by default, opt-in per tool
-- **Seccomp filter**: syscall whitelist
-- **Cgroups**: memory and CPU limits from config/invariants
-- **UID mapping**: unprivileged user inside namespace
-
-`NoopSandbox` for devices with limited namespace support.
+The current implementation does not include a dedicated sandbox crate or Sandbox trait. Built-in tools such as `shell_exec` run in the process. Future versions may introduce Linux namespaces, seccomp, or cgroups for isolation; that would be documented here.
 
 ---
 
 ## 17. CLI Interface
 
+Implemented commands:
+
 ```
-apex init                                     # Create runtime directory structure
-apex run "set up a backup cron job"           # Submit a goal
-apex status                                    # Show active jobs
-apex status job-42                            # Show working memory
-apex queue                                     # Show queue depth
-apex queue inspect                             # List pending messages
-apex queue reap                                # Reclaim expired leases
-apex queue purge                               # Clean old done/ messages
-apex cat <message-path>                        # Read any message body
-apex tools list                                # List registered tools
-apex tools invoke shell_exec '{"cmd":"ls"}'    # Direct tool invocation
-apex memory facts                              # List stored facts
-apex memory skills                             # List skills with fitness
-apex memory strategies                         # List strategies with fitness
-apex memory working                            # List active scratchpads
-apex memory calibration                        # Show token estimator state
-apex config show                               # Show current agent config
-apex config invariants                         # Show operator invariants
-apex validate                                  # Validate all declarations
-apex scratch ls                                # List spilled output files
-apex version                                   # Print version
+apex init                           # Create runtime directory structure (queues, memory, scratch, config, tools/custom, default config files)
+apex run "task description"         # Submit a goal (stdin or args), then process queue
+apex work                           # Process queue (run workers until idle)
+apex status                         # Show active jobs / status
+apex queue                          # Show queue depth
+apex queue reap                     # Reclaim expired leases
+apex cat <message-path>             # Read any message body
+apex tools list                     # List registered tools
+apex memory facts                   # List stored facts
+apex memory skills                  # List skills
+apex memory strategies              # List strategies
+apex memory calibration             # Show token estimator state
+apex memory                         # Same as facts + skills + strategies
+apex scratch ls                     # List spilled output files
+apex config show                    # Show current agent config
+apex config invariants              # Show operator invariants
+apex validate                       # Validate config and prompts
 ```
 
-`apex cat` is the primary debugging tool. Any message in any queue directory — pending, processing, done, failed — is a self-contained Markdown document.
+There are no separate commands for `queue inspect`, `queue purge`, `tools invoke`, `memory working`, or `version` in the current implementation. `apex cat` is the primary way to inspect any message file.
 
 ---
 
 ## 18. Cross-Compilation & Deployment
 
 ```bash
-cargo build --release                                          # native
-cross build --release --target armv7-unknown-linux-musleabihf   # RPi
-cross build --release --target aarch64-unknown-linux-musl       # AArch64
-cross build --release --target riscv64gc-unknown-linux-musl     # RISC-V
+cargo build --release
+cross build --release --target armv7-unknown-linux-musleabihf
+cross build --release --target aarch64-unknown-linux-musl
+cross build --release --target riscv64gc-unknown-linux-musl
 ```
 
-Deployment: copy one `apex` binary. Run `apex init`. Done.
+Deployment: copy the `apex` binary, set `APEX_ROOT` if desired, run `apex init`. Place prompts (agent.md, evaluator.md) in `prompts/` as needed.
 
 ---
 
 ## 19. Error Handling
 
+Error types (apex-core `error.rs`):
+
 | Error | Meaning |
-|---|---|
-| `QueueError::Empty` | No ready messages |
-| `QueueError::Full` | Backpressure engaged |
-| `LlmError::RateLimited { retry_after }` | Back off and retry |
-| `LlmError::ContextOverflow { estimated, limit }` | Body + persona exceeded model window |
-| `SandboxError::TimedOut { duration }` | Tool exceeded time limit |
-| `ToolError::NotFound(name)` | Tool not in registry |
-| `ToolError::OutputSpilled { path, size }` | Output exceeded budget (informational) |
-| `ConfigError::ExceedsInvariant { field, requested, ceiling }` | Agent tried to exceed limits |
-| `DepthError::MaxReached { current, max }` | Decomposition depth exceeded |
-| `EvalError::DeterministicFailed(Vec<CriterionFailure>)` | Specific checks that failed |
-| `EvalError::AdversarialFailed(Vec<BlockingIssue>)` | Adversarial eval found problems |
-| `ComposerError::BodyExceedsBudget { tokens, budget }` | Message body too large to compose |
+|-------|---------|
+| `QueueError::NotFound`, `AlreadyExists`, `Empty`, `Full`, `Io`, `Parse` | Queue operations |
+| `LlmError::Http`, `Api`, `Serialization`, `UnexpectedResponse` | LLM provider |
+| `ToolError::UnknownTool(name)` | Tool not in registry |
+| `ToolError::InvalidInput`, `Execution` | Tool execution |
+| `MemoryError::Io`, `Parse`, `NotFound`, `Database` | Memory store |
+
+Config validation reports issues when agent config exceeds invariants (see `ValidationIssue`, `validate_against_invariants`). Evaluation failures are represented in the `Evaluation` and attempt/failure bodies rather than as separate error enums in the core.
 
 ---
 
 ## 20. Observability
 
 | What | How |
-|---|---|
+|------|-----|
 | Pending tasks | `ls queues/work/pending/` — each file is a complete task document |
-| Active task | `cat queues/work/processing/*.md` — see what the agent is working on with full context |
-| Completed tasks | `cat queues/work/done/*.md` — full execution narrative per task |
-| Failed tasks | `cat queues/work/failed/*.md` — full failure narrative with all attempts |
-| Job history | `grep -r "Correlation-Id: job-42" queues/work/done/` then `cat` each |
-| Discovered facts | `grep -r "New Facts Discovered" queues/work/done/` |
-| Working memory | `cat memory/working/job-42.md` — lightweight decomposition index |
-| Long-term facts | `sqlite3 memory/long-term/apex.db "SELECT * FROM facts"` |
-| Skill fitness | `sqlite3 ... "SELECT task_pattern, fitness FROM skills ORDER BY fitness DESC"` |
+| Active task | `cat queues/work/processing/*.md` |
+| Completed tasks | `cat queues/work/done/*.md` |
+| Failed tasks | `cat queues/work/failed/*.md` |
+| Job history | grep by correlation_id in done/ then cat each |
+| Working memory | `cat memory/working/{job_id}.md` |
+| Long-term facts | `sqlite3 memory/long-term/memory.db "SELECT * FROM facts"` |
+| Skills / strategies | Same DB, tables skills, strategies |
 | Token calibration | `apex memory calibration` |
-| Spilled outputs | `ls scratch/` |
-| Context budget | Logged per iteration: body 5200t + persona 480t = 5680t / 6500t budget |
-| Structured logs | JSON to stderr with Correlation-Id |
+| Spilled outputs | `apex scratch ls` or `ls scratch/` |
 
-The primary observability surface is `cat` on message files. Every message in every queue state tells a complete story.
+The primary observability surface is `cat` on message files and queue directories.
 
 ---
 
 ## 21. Resource Footprint
 
-| Component | Size |
-|---|---|
-| apex binary (rfbmq-core + rusqlite + LTO + strip) | 3–6 MB |
-| SQLite database | < 1 MB |
-| Working memory per active job | < 10 KB (lightweight index) |
-| Message files (pending + processing) | 2–8 KB each |
-| Message files (done, before purge) | 2–8 KB each |
-| Scratch files | Ephemeral, purged on ack |
-| Runtime memory | ~15–35 MB |
-| **Total** | **< 45 MB** |
-
-Message bodies are larger than before (2-8 KB vs. ~200 bytes) but queue turnover is fast and `done/` is purged after consolidation. On tmpfs-constrained devices, tune `max_body_tokens` lower.
+| Component | Notes |
+|-----------|--------|
+| apex binary | Size depends on build (LTO, strip); target on the order of single-digit MB with rfbmq + rusqlite |
+| SQLite (memory.db) | Grows with facts, skills, strategies |
+| Working memory | One file per active job; lightweight markdown |
+| Message files | 2–8 KB typical per message |
+| Scratch | Ephemeral; purged on ack or cleanup |
+| Runtime memory | Process heap for LLM client, tools, conversation buffers |
 
 ---
 
 ## 22. Open Design Questions
 
-| # | Question | Options | Recommendation |
-|---|---|---|---|
-| 1 | rfbmq-core vendoring | Git subtree vs. path dep vs. crates.io | Path dependency, publish for releases |
-| 2 | Polling vs. inotify | Poll with backoff vs. inotifywait | Poll for v1, inotify for v1.1 |
-| 3 | Fact confidence decay | Time-based vs. usage-based | Time-based with configurable half-life |
-| 4 | Concurrent loop instances | Threads vs. async tasks | Async tasks via tokio |
-| 5 | Config hot-reload | Restart vs. SIGHUP | Restart for v1, SIGHUP for v1.1 |
-| 6 | Done/ retention | Keep vs. auto-purge | Purge after consolidation, configurable retention window |
-| 7 | Spill pattern detection | Regex set vs. fixed | Configurable regex set per tool |
-| 8 | Token estimator scope | Per-model vs. global | Global for v1, per-model for v1.1 |
-| 9 | FsyncMode default | Full vs. Batch | Batch for v1, explicit `apex queue sync` |
-| 10 | Adversarial eval token budget | Shared vs. separate | Separate — eval shouldn't compete with execution context |
-| 11 | update_body atomicity | Write-then-rename vs. in-place | Write-then-rename (consistent with rfbmq philosophy) |
-| 12 | Message body format versioning | Implicit vs. explicit `Body-Version` header | Explicit header for forward compatibility |
-| 13 | Continuation: read subtask results | Scan done/ vs. embed in continuation body | Scan done/ — subtask results may be large, embedding all would blow budget |
+| # | Question | Notes |
+|---|----------|--------|
+| 1 | rfbmq-core vendoring | Path dependency in use; publish or subtree for releases |
+| 2 | Polling vs inotify | Current: poll with sleep when empty |
+| 3 | Sandbox isolation | No sandbox crate yet; shell_exec runs in-process |
+| 4 | Concurrent workers | Async tasks via tokio; max_concurrent from config |
+| 5 | Config hot-reload | Restart to pick up config changes |
+| 6 | Done/ retention | Purge/cleanup policy left to operator or future tooling |
+| 7 | Token estimator scope | Global calibration; per-model possible later |
+| 8 | Adversarial eval token budget | Eval uses separate call; persona and model configurable |
