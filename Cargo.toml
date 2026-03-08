@@ -3,8 +3,10 @@ resolver = "2"
 members = [
     "crates/apex-core",
     "crates/apex-llm",
+    "crates/apex-queue",
     "crates/apex-tools",
     "crates/apex-bin",
+    "crates/apex-context",
 ]
 default-members = ["crates/apex-bin"]
 

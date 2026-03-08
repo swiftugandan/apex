@@ -1,0 +1,13 @@
+[package]
+name = "apex-queue"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+apex-core = { path = "../apex-core" }
+rfbmq-core = { path = "../../vendor/rfbmq-core" }
+async-trait.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,7 @@
+[package]
+name = "apex-context"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+apex-core = { path = "../apex-core" }

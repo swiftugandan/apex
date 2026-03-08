@@ -144,6 +144,87 @@ impl CompletionResponse {
     }
 }
 
+/// Type of a queue message (used in Type header).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageType {
+    Task,
+}
+
+/// Headers for apex queue messages (mapped to rfbmq custom headers).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageHeaders {
+    pub message_type: MessageType,
+    pub correlation_id: String,
+    pub depth: u32,
+    pub retry_count: u32,
+}
+
+/// A queue message with headers and markdown body.
+#[derive(Debug, Clone)]
+pub struct QueueMessage {
+    pub headers: MessageHeaders,
+    pub body: String,
+}
+
+/// A claimed message from the queue (in processing state).
+#[derive(Debug, Clone)]
+pub struct ClaimedTask {
+    pub id: String,
+    pub claim_path: String,
+    pub headers: MessageHeaders,
+    pub body: String,
+}
+
+/// Queue depth info.
+#[derive(Debug, Clone, Default)]
+pub struct QueueDepth {
+    pub pending: u32,
+    pub processing: u32,
+}
+
+/// Reap results.
+#[derive(Debug, Clone, Default)]
+pub struct ReapResult {
+    pub lease_reaped: u32,
+}
+
+/// An attempt record capturing a full execution attempt for a task.
+#[derive(Debug, Clone)]
+pub struct AttemptRecord {
+    pub attempt_number: u32,
+    pub started_at: String,
+    pub finished_at: String,
+    pub turns: Vec<TurnRecord>,
+    pub final_text: Option<String>,
+    pub outcome: AttemptOutcome,
+    pub failure_reason: Option<String>,
+}
+
+/// A single LLM turn within an attempt.
+#[derive(Debug, Clone)]
+pub struct TurnRecord {
+    pub tool_calls: Vec<ToolCallRecord>,
+    pub usage: TokenUsage,
+}
+
+/// A tool call record with timing.
+#[derive(Debug, Clone)]
+pub struct ToolCallRecord {
+    pub name: String,
+    pub input_summary: String,
+    pub output_summary: String,
+    pub is_error: bool,
+    pub duration_ms: u64,
+}
+
+/// Outcome of an attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptOutcome {
+    Success,
+    Failed,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

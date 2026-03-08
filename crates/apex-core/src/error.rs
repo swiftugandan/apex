@@ -21,3 +21,19 @@ pub enum ToolError {
     #[error("execution failed: {0}")]
     Execution(String),
 }
+
+#[derive(Debug, Error)]
+pub enum QueueError {
+    #[error("queue not found: {0}")]
+    NotFound(String),
+    #[error("queue already exists: {0}")]
+    AlreadyExists(String),
+    #[error("queue is empty")]
+    Empty,
+    #[error("queue is full")]
+    Full,
+    #[error("queue I/O error: {0}")]
+    Io(String),
+    #[error("message parse error: {0}")]
+    Parse(String),
+}

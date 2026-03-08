@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 
 use crate::domain::{
-    CompletionRequest, CompletionResponse, ToolCall, ToolCompletionResponse, ToolDef, ToolResult,
-    ToolSchema,
+    ClaimedTask, CompletionRequest, CompletionResponse, QueueDepth, QueueMessage, ReapResult,
+    ToolCall, ToolCompletionResponse, ToolDef, ToolResult, ToolSchema,
 };
-use crate::error::{LlmError, ToolError};
+use crate::error::{LlmError, QueueError, ToolError};
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -30,4 +30,15 @@ pub trait ToolRegistry: Send + Sync {
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError>;
+}
+
+#[async_trait]
+pub trait Queue: Send + Sync {
+    async fn push(&self, msg: QueueMessage) -> Result<String, QueueError>;
+    async fn pop(&self) -> Result<Option<ClaimedTask>, QueueError>;
+    async fn update_body(&self, claimed: &ClaimedTask, new_body: &str) -> Result<(), QueueError>;
+    async fn ack(&self, claimed: &ClaimedTask) -> Result<(), QueueError>;
+    async fn nack(&self, claimed: &ClaimedTask) -> Result<(), QueueError>;
+    async fn depth(&self) -> Result<QueueDepth, QueueError>;
+    async fn reap(&self) -> Result<ReapResult, QueueError>;
 }
