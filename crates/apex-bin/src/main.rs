@@ -140,7 +140,7 @@ async fn main() -> Result<()> {
 async fn cmd_init() -> Result<()> {
     let paths = ApexPaths::resolve()?;
 
-    std::fs::create_dir_all(&paths.queue_dir.parent().unwrap())
+    std::fs::create_dir_all(paths.queue_dir.parent().unwrap())
         .context("failed to create queues/ directory")?;
 
     std::fs::create_dir_all(&paths.memory_dir)
@@ -618,6 +618,7 @@ async fn execute_task(
                     final_text: None,
                     outcome: AttemptOutcome::Failed,
                     failure_reason: Some(format!("LLM error: {err}")),
+                    eval_summary: None,
                 };
                 return Err((record, format!("LLM error: {err}"), scratchpad));
             }
@@ -699,6 +700,30 @@ async fn execute_task(
     }
     let _ = memory.save(&scratchpad).await;
 
+    // Step 7: Deterministic evaluation
+    let eval_summary = match apex_eval::Evaluator::run_deterministic(&claimed.body).await {
+        Some(eval_result) if !eval_result.all_passed() => {
+            let summary = eval_result.failure_summary();
+            eprintln!("  eval: {}/{} checks failed", eval_result.failed, eval_result.total);
+            let record = AttemptRecord {
+                attempt_number: claimed.headers.retry_count + 1,
+                started_at,
+                finished_at: now_iso(),
+                turns,
+                final_text,
+                outcome: AttemptOutcome::Failed,
+                failure_reason: Some("deterministic evaluation failed".into()),
+                eval_summary: Some(summary),
+            };
+            return Err((record, "deterministic evaluation failed".into(), scratchpad));
+        }
+        Some(eval_result) => {
+            eprintln!("  eval: {}/{} checks passed", eval_result.passed, eval_result.total);
+            Some(eval_result.full_summary())
+        }
+        None => None,
+    };
+
     let record = AttemptRecord {
         attempt_number: claimed.headers.retry_count + 1,
         started_at,
@@ -707,6 +732,7 @@ async fn execute_task(
         final_text,
         outcome: AttemptOutcome::Success,
         failure_reason: None,
+        eval_summary,
     };
 
     Ok(record)
@@ -743,6 +769,7 @@ async fn execute_continuation(
                 final_text: None,
                 outcome: AttemptOutcome::Failed,
                 failure_reason: Some(format!("Failed to list done messages: {e}")),
+                eval_summary: None,
             };
             (record, e.to_string(), scratchpad.clone())
         })?;
@@ -792,6 +819,7 @@ async fn execute_continuation(
                     final_text: None,
                     outcome: AttemptOutcome::Failed,
                     failure_reason: Some(format!("LLM error: {err}")),
+                    eval_summary: None,
                 };
                 return Err((record, format!("LLM error: {err}"), scratchpad));
             }
@@ -865,6 +893,30 @@ async fn execute_continuation(
         });
     }
 
+    // Deterministic evaluation for continuation
+    let eval_summary = match apex_eval::Evaluator::run_deterministic(&claimed.body).await {
+        Some(eval_result) if !eval_result.all_passed() => {
+            let summary = eval_result.failure_summary();
+            eprintln!("  eval: {}/{} checks failed", eval_result.failed, eval_result.total);
+            let record = AttemptRecord {
+                attempt_number: claimed.headers.retry_count + 1,
+                started_at,
+                finished_at: now_iso(),
+                turns,
+                final_text,
+                outcome: AttemptOutcome::Failed,
+                failure_reason: Some("deterministic evaluation failed".into()),
+                eval_summary: Some(summary),
+            };
+            return Err((record, "deterministic evaluation failed".into(), scratchpad));
+        }
+        Some(eval_result) => {
+            eprintln!("  eval: {}/{} checks passed", eval_result.passed, eval_result.total);
+            Some(eval_result.full_summary())
+        }
+        None => None,
+    };
+
     let record = AttemptRecord {
         attempt_number: claimed.headers.retry_count + 1,
         started_at,
@@ -873,6 +925,7 @@ async fn execute_continuation(
         final_text,
         outcome: AttemptOutcome::Success,
         failure_reason: None,
+        eval_summary,
     };
 
     Ok(record)

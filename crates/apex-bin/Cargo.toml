@@ -14,6 +14,7 @@ apex-tools = { path = "../apex-tools" }
 apex-queue = { path = "../apex-queue" }
 apex-context = { path = "../apex-context" }
 apex-memory = { path = "../apex-memory" }
+apex-eval = { path = "../apex-eval" }
 rfbmq-core = { path = "../../vendor/rfbmq-core" }
 anyhow.workspace = true
 async-trait.workspace = true

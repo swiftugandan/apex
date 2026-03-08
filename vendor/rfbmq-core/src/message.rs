@@ -31,30 +31,30 @@ impl Message {
 
         // Writing to a String via fmt::Write is infallible (only fails on OOM,
         // which aborts), so unwrap() is appropriate here.
-        write!(buf, "Id: {}\n", id).unwrap();
-        write!(buf, "Created-At: {}\n", h.created_at).unwrap();
-        write!(buf, "Created-By: {}\n", h.created_by).unwrap();
-        write!(buf, "Priority: {}\n", h.priority).unwrap();
-        write!(buf, "Retry-Count: {}\n", h.retry_count).unwrap();
-        write!(buf, "TTL: {}\n", h.ttl).unwrap();
+        writeln!(buf, "Id: {}", id).unwrap();
+        writeln!(buf, "Created-At: {}", h.created_at).unwrap();
+        writeln!(buf, "Created-By: {}", h.created_by).unwrap();
+        writeln!(buf, "Priority: {}", h.priority).unwrap();
+        writeln!(buf, "Retry-Count: {}", h.retry_count).unwrap();
+        writeln!(buf, "TTL: {}", h.ttl).unwrap();
 
         if !h.tags.is_empty() {
-            write!(buf, "Tags: {}\n", h.tags.join(", ")).unwrap();
+            writeln!(buf, "Tags: {}", h.tags.join(", ")).unwrap();
         }
         if let Some(ref cid) = h.correlation_id {
-            write!(buf, "Correlation-Id: {}\n", cid).unwrap();
+            writeln!(buf, "Correlation-Id: {}", cid).unwrap();
         }
         if let Some(ref rt) = h.reply_to {
-            write!(buf, "Reply-To: {}\n", rt).unwrap();
+            writeln!(buf, "Reply-To: {}", rt).unwrap();
         }
         if !h.depends_on.is_empty() {
             let dep_str: Vec<&str> = h.depends_on.iter().map(|id| id.as_str()).collect();
-            write!(buf, "Depends-On: {}\n", dep_str.join(", ")).unwrap();
+            writeln!(buf, "Depends-On: {}", dep_str.join(", ")).unwrap();
         }
         if !h.custom.is_empty() {
             buf.push_str("Custom:\n");
             for line in &h.custom {
-                write!(buf, "  {}\n", line).unwrap();
+                writeln!(buf, "  {}", line).unwrap();
             }
         }
 
@@ -206,7 +206,7 @@ fn parse_header_block(block: &str) -> Result<Header> {
             "correlation-id" => header.correlation_id = Some(value.to_string()),
             "reply-to" => {
                 // Reply-To value may contain colons (e.g. paths), so rejoin
-                let full_value = line.splitn(2, ':').nth(1).unwrap_or("").trim();
+                let full_value = line.split_once(':').map(|x| x.1).unwrap_or("").trim();
                 header.reply_to = Some(full_value.to_string());
             }
             "depends-on" => {

@@ -225,7 +225,7 @@ impl ToolRegistry for QueueToolRegistry {
             ToolDef {
                 schema: ToolSchema {
                     name: "decompose_goal".to_string(),
-                    description: "Decompose a complex goal into subtasks that will be executed independently and in parallel where possible. Use this when a task has 2 or more independent steps. Each subtask becomes a separate queue message processed by an agent instance.".to_string(),
+                    description: "Decompose a complex goal into subtasks that will be executed independently and in parallel where possible. Use this when a task has 2 or more independent steps. Each subtask becomes a separate queue message processed by an agent instance. Write deterministic acceptance_criteria using the structured format so the system can auto-verify completion.".to_string(),
                     input_schema: json!({
                         "type": "object",
                         "properties": {
@@ -241,7 +241,7 @@ impl ToolRegistry for QueueToolRegistry {
                                         },
                                         "acceptance_criteria": {
                                             "type": "string",
-                                            "description": "How to verify the subtask is complete"
+                                            "description": "Deterministic checks to auto-verify completion. Use the structured format: start with '### Deterministic' followed by criteria lines. Command checks: '- command: `<cmd>`\\n  expect: exit_code 0' or 'output_contains \"text\"' or 'output_matches \"regex\"' or 'not_contains \"text\"'. Shorthand checks: '- file_exists \"/path\"', '- file_contains \"/path\" \"text\"', '- http_status \"url\" 200'. Example: '### Deterministic\\n- command: `test -f /tmp/out.txt`\\n  expect: exit_code 0\\n- command: `cat /tmp/out.txt`\\n  expect: output_contains \"hello\"'"
                                         },
                                         "depends_on": {
                                             "type": "array",

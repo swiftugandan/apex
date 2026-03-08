@@ -111,19 +111,14 @@ impl fmt::Display for ClaimedMessage {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Priority {
     Critical = 0,
     High = 1,
+    #[default]
     Normal = 2,
     Low = 3,
-}
-
-impl Default for Priority {
-    fn default() -> Self {
-        Priority::Normal
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,20 +183,15 @@ impl std::fmt::Display for Priority {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FsyncMode {
+    #[default]
     Full,
     /// Defers directory fsyncs — file data is synced but directory entries are
     /// not until an explicit `Queue::sync()` call. This is a valid optimization
     /// for batch workloads where crash recovery via `reap()` is acceptable.
     Batch,
     None,
-}
-
-impl Default for FsyncMode {
-    fn default() -> Self {
-        FsyncMode::Full
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -237,19 +227,10 @@ impl Default for Header {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Message {
     pub header: Header,
     pub body: String,
-}
-
-impl Default for Message {
-    fn default() -> Self {
-        Message {
-            header: Header::default(),
-            body: String::new(),
-        }
-    }
 }
 
 #[derive(Debug)]

@@ -394,6 +394,7 @@ pub struct AttemptRecord {
     pub final_text: Option<String>,
     pub outcome: AttemptOutcome,
     pub failure_reason: Option<String>,
+    pub eval_summary: Option<String>,
 }
 
 /// A single LLM turn within an attempt.

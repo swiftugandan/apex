@@ -27,7 +27,7 @@ impl WorkingMemory for FsScratchpadStore {
             let content = tokio::fs::read_to_string(&path)
                 .await
                 .map_err(|e| MemoryError::Io(e.to_string()))?;
-            Scratchpad::from_markdown(&content).map_err(|e| MemoryError::Parse(e))
+            Scratchpad::from_markdown(&content).map_err(MemoryError::Parse)
         } else {
             Ok(Scratchpad::new(job_id, ""))
         }

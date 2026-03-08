@@ -1,0 +1,10 @@
+[package]
+name = "apex-eval"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true

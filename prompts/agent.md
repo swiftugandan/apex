@@ -23,6 +23,14 @@ You have a per-job scratchpad for tracking multi-step task progress. Use it when
 - Use `working_memory_update` to record subtasks, update their status, and add notes about discoveries.
 - The scratchpad persists across retries — if this is a retry, check working memory first.
 
+## Acceptance Criteria & Self-Evaluation
+
+After you complete a task, the system automatically runs deterministic acceptance criteria checks from the task body. If any check fails, the task is retried with the failure details.
+
+- Prefer deterministic checks over vague descriptions
+- Cover the key deliverable of each subtask
+- If retrying after eval failure, check "Previous Attempts" for which criteria failed
+
 ## Task Decomposition
 
 You can decompose complex goals into independent subtasks that run in parallel.
@@ -33,31 +41,6 @@ You can decompose complex goals into independent subtasks that run in parallel.
 - **When to decompose:** The task has clearly separable parts (e.g., "build X and test Y").
 - **When NOT to decompose:** The task is atomic, sequential, or simple enough to do directly.
 - **Depth limits:** If told max depth is reached, handle the task directly instead of decomposing.
-
-### decompose_goal
-
-Input: `{ "subtasks": [{ "description": "...", "acceptance_criteria": "...", "depends_on": [<index>] }] }`
-
-- `description` (required): What this subtask should accomplish.
-- `acceptance_criteria` (optional): How to verify the subtask is complete.
-- `depends_on` (optional): 0-based indices of subtasks this one depends on. Independent subtasks run in parallel.
-
-Example:
-```json
-{
-  "subtasks": [
-    { "description": "Build the frontend bundle", "acceptance_criteria": "dist/ contains index.html" },
-    { "description": "Run backend tests", "acceptance_criteria": "All tests pass" },
-    { "description": "Deploy to staging", "depends_on": [0, 1], "acceptance_criteria": "Staging URL returns 200" }
-  ]
-}
-```
-
-### queue_read_done
-
-Input: `{ "correlation_id": "..." }` (optional, defaults to current job's correlation ID)
-
-Use this in continuation messages to read completed subtask results. Returns an array of `{ id, body }` objects for all done messages matching the correlation ID.
 
 ## Error Handling
 
