@@ -30,7 +30,7 @@ const MAX_TOKENS: u32 = 8192;
 
 pub struct WorkerContext {
     pub adapter: Arc<RfbmqAdapter>,
-    pub queue: Arc<dyn Queue>,
+    pub static_tools: Arc<CompositeToolRegistry>,
     pub llm: Arc<AnthropicProvider>,
     pub eval_llm: Arc<dyn LlmProvider>,
     pub memory: Arc<dyn WorkingMemory>,
@@ -49,7 +49,7 @@ pub struct WorkerContext {
 
 // ── CompositeToolRegistry ───────────────────────────────────────────
 
-struct CompositeToolRegistry {
+pub(crate) struct CompositeToolRegistry {
     registries: Vec<Box<dyn ToolRegistry>>,
 }
 
@@ -83,6 +83,45 @@ impl ToolRegistry for CompositeToolRegistry {
     }
 }
 
+/// Delegates to a shared CompositeToolRegistry (used for static tools).
+struct DelegatingToolRegistry(Arc<CompositeToolRegistry>);
+
+#[async_trait]
+impl ToolRegistry for DelegatingToolRegistry {
+    fn definitions(&self) -> Vec<ToolDef> {
+        self.0.definitions()
+    }
+
+    async fn execute(&self, call: &ToolCall) -> std::result::Result<ToolResult, ToolError> {
+        self.0.execute(call).await
+    }
+}
+
+/// Build the static tool registries (Builtin, Memory, Custom, Config) once for the process.
+pub fn build_static_tools(
+    scratch_dir: PathBuf,
+    tools_dir: PathBuf,
+    config_dir: PathBuf,
+    memory: Arc<dyn WorkingMemory>,
+    long_term: Arc<dyn MemoryStore>,
+    invariants: Arc<Invariants>,
+) -> Arc<CompositeToolRegistry> {
+    let memory_tools = MemoryToolRegistry::new(memory, long_term.clone());
+    let custom_spill = SpillManager::new(scratch_dir.clone());
+    let custom_tools = CustomToolRegistry::new(
+        tools_dir.clone(),
+        custom_spill,
+        Some(long_term.clone()),
+    );
+    let config_tools = ConfigToolRegistry::new(config_dir, invariants);
+    Arc::new(CompositeToolRegistry::new(vec![
+        Box::new(BuiltinToolRegistry::new(scratch_dir)),
+        Box::new(memory_tools),
+        Box::new(custom_tools),
+        Box::new(config_tools),
+    ]))
+}
+
 // ── Worker loop ─────────────────────────────────────────────────────
 
 pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
@@ -111,8 +150,6 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
                     return Ok(());
                 }
 
-                check_failed_deps(&ctx.adapter).await?;
-
                 empty_cycles += 1;
                 if empty_cycles > 300 {
                     eprintln!("[worker {worker_id}] giving up after {empty_cycles} empty cycles");
@@ -134,9 +171,9 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
             claimed.id, claimed.headers.depth, claimed.headers.retry_count
         );
 
-        // Build per-task tool registry
+        // Build per-claim tool registry (static tools + queue tools)
         let queue_tools = QueueToolRegistry::new(
-            Arc::clone(&ctx.queue),
+            Arc::clone(&ctx.adapter) as Arc<dyn Queue>,
             claimed.headers.correlation_id.clone(),
             claimed.headers.depth,
             ctx.max_depth,
@@ -144,27 +181,9 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
             claimed.body.clone(),
             Some(Arc::clone(&ctx.long_term)),
         );
-
-        let memory_tools = MemoryToolRegistry::new(
-            Arc::clone(&ctx.memory),
-            Arc::clone(&ctx.long_term),
-        );
-        let custom_spill = SpillManager::new(ctx.scratch_dir.clone());
-        let custom_tools = CustomToolRegistry::new(
-            ctx.tools_dir.clone(),
-            custom_spill,
-            Some(Arc::clone(&ctx.long_term)),
-        );
-        let config_tools = ConfigToolRegistry::new(
-            ctx.config_dir.clone(),
-            Arc::clone(&ctx.invariants),
-        );
         let tools = CompositeToolRegistry::new(vec![
-            Box::new(BuiltinToolRegistry::new(ctx.scratch_dir.clone())),
-            Box::new(memory_tools),
+            Box::new(DelegatingToolRegistry(Arc::clone(&ctx.static_tools))),
             Box::new(queue_tools),
-            Box::new(custom_tools),
-            Box::new(config_tools),
         ]);
 
         let composer = {
@@ -172,14 +191,7 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
             MessageComposer::new(TokenEstimator::new(est.calibration_data().clone()))
         };
 
-        let result = match claimed.headers.message_type {
-            MessageType::Goal | MessageType::Task | MessageType::Subtask => {
-                execute_task(&ctx, &claimed, &tools).await
-            }
-            MessageType::Continuation => {
-                execute_continuation(&ctx, &claimed, &tools).await
-            }
-        };
+        let result = execute_claim(&ctx, &claimed, &tools).await;
 
         match result {
             Ok(record) => {
@@ -416,9 +428,9 @@ async fn evaluate_and_finalize(
     Ok(record)
 }
 
-// ── Task execution ──────────────────────────────────────────────────
+// ── Unified claim execution ──────────────────────────────────────────
 
-async fn execute_task(
+async fn execute_claim(
     ctx: &WorkerContext,
     claimed: &ClaimedTask,
     tools: &dyn ToolRegistry,
@@ -432,19 +444,59 @@ async fn execute_task(
         .await
         .unwrap_or_else(|_| apex_core::domain::Scratchpad::new(job_id, ""));
 
-    if scratchpad.goal.is_empty() {
-        scratchpad.goal = extract_title(&claimed.body);
-        let _ = ctx.memory.save(&scratchpad).await;
-    }
+    let initial_body = match claimed.headers.message_type {
+        MessageType::Goal | MessageType::Task | MessageType::Subtask => {
+            if scratchpad.goal.is_empty() {
+                scratchpad.goal = extract_title(&claimed.body);
+                let _ = ctx.memory.save(&scratchpad).await;
+            }
+            if !scratchpad.subtasks.is_empty() || !scratchpad.notes.is_empty() {
+                format!(
+                    "{}\n\n---\n## Working Memory (from previous iterations)\n{}",
+                    claimed.body,
+                    scratchpad.to_markdown()
+                )
+            } else {
+                claimed.body.clone()
+            }
+        }
+        MessageType::Continuation => {
+            let done_ids = ctx
+                .adapter
+                .list_done(job_id)
+                .await
+                .map_err(|e| {
+                    let record = AttemptRecord {
+                        attempt_number: claimed.headers.retry_count + 1,
+                        started_at: started_at.clone(),
+                        finished_at: now_iso(),
+                        turns: vec![],
+                        final_text: None,
+                        outcome: AttemptOutcome::Failed,
+                        failure_reason: Some(format!("Failed to list done messages: {e}")),
+                        eval_summary: None,
+                    };
+                    (record, e.to_string(), scratchpad.clone())
+                })?;
 
-    let initial_body = if !scratchpad.subtasks.is_empty() || !scratchpad.notes.is_empty() {
-        format!(
-            "{}\n\n---\n## Working Memory (from previous iterations)\n{}",
-            claimed.body,
-            scratchpad.to_markdown()
-        )
-    } else {
-        claimed.body.clone()
+            let mut subtask_results = Vec::new();
+            for id in &done_ids {
+                if let Ok(body) = ctx.adapter.read_done_body(id).await {
+                    subtask_results.push((id.clone(), body));
+                }
+            }
+
+            format!(
+                "{}\n\n---\n## Pre-loaded Results ({} subtasks completed)\n{}",
+                claimed.body,
+                subtask_results.len(),
+                subtask_results
+                    .iter()
+                    .map(|(id, body)| format!("### {id}\n{body}\n"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        }
     };
 
     let messages = vec![ChatMessage::user_text(&initial_body)];
@@ -459,7 +511,6 @@ async fn execute_task(
     )
     .await;
 
-    // Check for LLM error
     if let Some(ref text) = final_text {
         if text.starts_with("LLM error:") {
             let record = AttemptRecord {
@@ -476,107 +527,10 @@ async fn execute_task(
         }
     }
 
-    // Reload scratchpad after execution
     if let Ok(updated_pad) = ctx.memory.load_or_create(job_id).await {
         scratchpad = updated_pad;
     }
     let _ = ctx.memory.save(&scratchpad).await;
-
-    evaluate_and_finalize(
-        claimed,
-        turns,
-        final_text,
-        &scratchpad,
-        started_at,
-        ctx.eval_llm.as_ref(),
-        &ctx.eval_config,
-        &ctx.evaluator_persona,
-        ctx.long_term.as_ref(),
-    )
-    .await
-}
-
-// ── Continuation execution ──────────────────────────────────────────
-
-async fn execute_continuation(
-    ctx: &WorkerContext,
-    claimed: &ClaimedTask,
-    tools: &dyn ToolRegistry,
-) -> std::result::Result<AttemptRecord, (AttemptRecord, String, apex_core::domain::Scratchpad)> {
-    let started_at = now_iso();
-    let job_id = &claimed.headers.correlation_id;
-
-    let scratchpad = ctx
-        .memory
-        .load_or_create(job_id)
-        .await
-        .unwrap_or_else(|_| apex_core::domain::Scratchpad::new(job_id, ""));
-
-    // Read completed subtask results
-    let done_ids = ctx
-        .queue
-        .list_done(job_id)
-        .await
-        .map_err(|e| {
-            let record = AttemptRecord {
-                attempt_number: claimed.headers.retry_count + 1,
-                started_at: started_at.clone(),
-                finished_at: now_iso(),
-                turns: vec![],
-                final_text: None,
-                outcome: AttemptOutcome::Failed,
-                failure_reason: Some(format!("Failed to list done messages: {e}")),
-                eval_summary: None,
-            };
-            (record, e.to_string(), scratchpad.clone())
-        })?;
-
-    let mut subtask_results = Vec::new();
-    for id in &done_ids {
-        if let Ok(body) = ctx.queue.read_done_body(id).await {
-            subtask_results.push((id.clone(), body));
-        }
-    }
-
-    let initial_body = format!(
-        "{}\n\n---\n## Pre-loaded Results ({} subtasks completed)\n{}",
-        claimed.body,
-        subtask_results.len(),
-        subtask_results
-            .iter()
-            .map(|(id, body)| format!("### {id}\n{body}\n"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-
-    let messages = vec![ChatMessage::user_text(&initial_body)];
-
-    let (turns, final_text, _messages) = run_agentic_loop(
-        messages,
-        &ctx.persona,
-        ctx.llm.as_ref(),
-        tools,
-        ctx.long_term.as_ref(),
-        &ctx.estimator,
-    )
-    .await;
-
-    // Check for LLM error
-    if let Some(ref text) = final_text {
-        if text.starts_with("LLM error:") {
-            let record = AttemptRecord {
-                attempt_number: claimed.headers.retry_count + 1,
-                started_at,
-                finished_at: now_iso(),
-                turns,
-                final_text: None,
-                outcome: AttemptOutcome::Failed,
-                failure_reason: Some(text.clone()),
-                eval_summary: None,
-            };
-            return Err((record, text.clone(), scratchpad));
-        }
-    }
 
     evaluate_and_finalize(
         claimed,
@@ -628,12 +582,6 @@ async fn handle_failure(
             max_retries
         );
     }
-    Ok(())
-}
-
-/// Check if any pending messages have dependencies in failed/.
-async fn check_failed_deps(adapter: &RfbmqAdapter) -> Result<()> {
-    let _ = adapter;
     Ok(())
 }
 

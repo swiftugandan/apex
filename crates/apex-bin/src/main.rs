@@ -382,7 +382,6 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
 
     let memory: Arc<dyn WorkingMemory> =
         Arc::new(FsScratchpadStore::new(paths.memory_dir.clone()));
-    let queue: Arc<dyn Queue> = adapter.clone();
 
     let long_term: Arc<dyn apex_core::ports::MemoryStore> = Arc::new(
         SqliteMemoryStore::open(&paths.long_term_db_path())
@@ -392,9 +391,19 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
     let calibration = long_term.load_calibration().await.unwrap_or_default();
     let estimator = Arc::new(Mutex::new(TokenEstimator::new(calibration)));
 
+    let invariants = Arc::new(invariants);
+    let static_tools = agent::build_static_tools(
+        paths.scratch_dir.clone(),
+        paths.tools_dir.clone(),
+        paths.config_dir.clone(),
+        memory.clone(),
+        long_term.clone(),
+        Arc::clone(&invariants),
+    );
+
     let ctx = WorkerContext {
         adapter: adapter.clone(),
-        queue,
+        static_tools,
         llm,
         eval_llm,
         memory,
@@ -407,7 +416,7 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
         scratch_dir: paths.scratch_dir.clone(),
         tools_dir: paths.tools_dir.clone(),
         config_dir: paths.config_dir.clone(),
-        invariants: Arc::new(invariants),
+        invariants,
         estimator,
     };
 
@@ -419,7 +428,7 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
         for worker_id in 0..max_concurrent {
             let ctx = WorkerContext {
                 adapter: Arc::clone(&ctx.adapter),
-                queue: ctx.queue.clone(),
+                static_tools: Arc::clone(&ctx.static_tools),
                 llm: Arc::clone(&ctx.llm),
                 eval_llm: Arc::clone(&ctx.eval_llm),
                 memory: Arc::clone(&ctx.memory),
@@ -501,56 +510,29 @@ async fn cmd_memory_skills() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     use apex_core::ports::MemoryStore;
-    let skill = store.find_skill("").await?;
-
-    let conn = rusqlite::Connection::open(&db_path)
-        .map_err(|e| anyhow::anyhow!("failed to open db: {e}"))?;
-
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, task_pattern, fitness, success_count, failure_count, last_used
-             FROM skills ORDER BY fitness DESC",
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let rows: Vec<(String, String, f64, u32, u32, String)> = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-            ))
-        })
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    if rows.is_empty() {
+    let skills = store.list_skills(100).await?;
+    if skills.is_empty() {
         println!("No skills stored.");
         return Ok(());
     }
 
-    println!("── Skills ({}) ──", rows.len());
+    println!("── Skills ({}) ──", skills.len());
     println!(
         "{:<20} {:<40} {:<10} {:<8} {:<8}",
         "ID", "Pattern", "Fitness", "Success", "Failure"
     );
-    for (id, pattern, fitness, succ, fail, _last_used) in &rows {
-        let short_id = if id.len() > 18 { &id[..18] } else { id };
-        let short_pattern = if pattern.len() > 38 {
-            format!("{}…", &pattern[..37])
+    for s in &skills {
+        let short_id = if s.id.0.len() > 18 { &s.id.0[..18] } else { &s.id.0 };
+        let short_pattern = if s.task_pattern.len() > 38 {
+            format!("{}…", &s.task_pattern[..37])
         } else {
-            pattern.clone()
+            s.task_pattern.clone()
         };
         println!(
             "{:<20} {:<40} {:<10.2} {:<8} {:<8}",
-            short_id, short_pattern, fitness, succ, fail
+            short_id, short_pattern, s.fitness, s.success_count, s.failure_count
         );
     }
-    let _ = skill;
     Ok(())
 }
 
@@ -560,52 +542,31 @@ async fn cmd_memory_strategies() -> Result<()> {
     if !db_path.exists() {
         bail!("no long-term memory database found. Run 'apex init' first.");
     }
-
-    let conn = rusqlite::Connection::open(&db_path)
-        .map_err(|e| anyhow::anyhow!("failed to open db: {e}"))?;
-
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, goal_pattern, fitness, avg_subtasks, success_count, failure_count
-             FROM strategies ORDER BY fitness DESC",
-        )
+    let store = SqliteMemoryStore::open(&db_path)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let rows: Vec<(String, String, f64, f64, u32, u32)> = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-            ))
-        })
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    if rows.is_empty() {
+    use apex_core::ports::MemoryStore;
+    let strategies = store.list_strategies(100).await?;
+    if strategies.is_empty() {
         println!("No strategies stored.");
         return Ok(());
     }
 
-    println!("── Strategies ({}) ──", rows.len());
+    println!("── Strategies ({}) ──", strategies.len());
     println!(
         "{:<20} {:<40} {:<10} {:<12} {:<8} {:<8}",
         "ID", "Goal Pattern", "Fitness", "Avg Subtasks", "Success", "Failure"
     );
-    for (id, pattern, fitness, avg_sub, succ, fail) in &rows {
-        let short_id = if id.len() > 18 { &id[..18] } else { id };
-        let short_pattern = if pattern.len() > 38 {
-            format!("{}…", &pattern[..37])
+    for s in &strategies {
+        let short_id = if s.id.0.len() > 18 { &s.id.0[..18] } else { &s.id.0 };
+        let short_pattern = if s.goal_pattern.len() > 38 {
+            format!("{}…", &s.goal_pattern[..37])
         } else {
-            pattern.clone()
+            s.goal_pattern.clone()
         };
         println!(
             "{:<20} {:<40} {:<10.2} {:<12.1} {:<8} {:<8}",
-            short_id, short_pattern, fitness, avg_sub, succ, fail
+            short_id, short_pattern, s.fitness, s.avg_subtasks, s.success_count, s.failure_count
         );
     }
     Ok(())

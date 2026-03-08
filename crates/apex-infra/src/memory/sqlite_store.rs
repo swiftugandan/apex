@@ -307,6 +307,38 @@ impl MemoryStore for SqliteMemoryStore {
         Ok(result)
     }
 
+    async fn list_skills(&self, limit: usize) -> Result<Vec<Skill>, MemoryError> {
+        let conn = self.conn.lock().await;
+        let limit = limit.min(1000) as i64;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, task_pattern, approach, tools_used, criteria_template,
+                 success_count, failure_count, fitness, min_samples, last_used, notes
+                 FROM skills ORDER BY fitness DESC LIMIT ?1",
+            )
+            .map_err(|e| MemoryError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit], |row| {
+                Ok(Skill {
+                    id: SkillId(row.get(0)?),
+                    task_pattern: row.get(1)?,
+                    approach: row.get(2)?,
+                    tools_used: serde_json::from_str(&row.get::<_, String>(3)?)
+                        .unwrap_or_default(),
+                    criteria_template: row.get(4)?,
+                    success_count: row.get(5)?,
+                    failure_count: row.get(6)?,
+                    fitness: row.get(7)?,
+                    min_samples: row.get(8)?,
+                    last_used: row.get(9)?,
+                    notes: row.get(10)?,
+                })
+            })
+            .map_err(|e| MemoryError::Database(e.to_string()))?;
+        let skills: Vec<Skill> = rows.filter_map(|r| r.ok()).collect();
+        Ok(skills)
+    }
+
     async fn update_skill_fitness(
         &self,
         id: &SkillId,
@@ -431,6 +463,35 @@ impl MemoryStore for SqliteMemoryStore {
             .ok();
 
         Ok(result)
+    }
+
+    async fn list_strategies(&self, limit: usize) -> Result<Vec<Strategy>, MemoryError> {
+        let conn = self.conn.lock().await;
+        let limit = limit.min(1000) as i64;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, goal_pattern, decomposition, avg_subtasks, avg_duration_secs,
+                 success_count, failure_count, fitness, notes
+                 FROM strategies ORDER BY fitness DESC LIMIT ?1",
+            )
+            .map_err(|e| MemoryError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit], |row| {
+                Ok(Strategy {
+                    id: StrategyId(row.get(0)?),
+                    goal_pattern: row.get(1)?,
+                    decomposition: row.get(2)?,
+                    avg_subtasks: row.get(3)?,
+                    avg_duration_secs: row.get(4)?,
+                    success_count: row.get(5)?,
+                    failure_count: row.get(6)?,
+                    fitness: row.get(7)?,
+                    notes: row.get(8)?,
+                })
+            })
+            .map_err(|e| MemoryError::Database(e.to_string()))?;
+        let strategies: Vec<Strategy> = rows.filter_map(|r| r.ok()).collect();
+        Ok(strategies)
     }
 
     async fn update_strategy_fitness(
