@@ -8,6 +8,7 @@ apex-core = { path = "../apex-core" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml = "0.8"
 tokio.workspace = true
 
 [dev-dependencies]

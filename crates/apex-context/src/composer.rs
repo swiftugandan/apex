@@ -72,6 +72,22 @@ impl MessageComposer {
             out.push_str(&format!("\n## Evaluation\n{eval}\n"));
         }
 
+        // Scan for successful create_tool calls
+        let mut new_tools: Vec<String> = Vec::new();
+        for turn in &record.turns {
+            for tc in &turn.tool_calls {
+                if tc.name == "create_tool" && !tc.is_error {
+                    new_tools.push(tc.input_summary.clone());
+                }
+            }
+        }
+        if !new_tools.is_empty() {
+            out.push_str("\n## New Tools Created\n");
+            for tool_info in &new_tools {
+                out.push_str(&format!("- {tool_info}\n"));
+            }
+        }
+
         out
     }
 

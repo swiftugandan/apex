@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use serde::Deserialize;
 
 use apex_context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{
@@ -22,6 +23,7 @@ use apex_llm::anthropic::AnthropicProvider;
 use apex_memory::{FsScratchpadStore, LongTermMemoryToolRegistry, MemoryToolRegistry, SqliteMemoryStore};
 use apex_queue::RfbmqAdapter;
 use apex_tools::BuiltinToolRegistry;
+use apex_tools::CustomToolRegistry;
 use apex_tools::spill::SpillManager;
 
 use crate::queue_tools::QueueToolRegistry;
@@ -76,6 +78,7 @@ struct ApexPaths {
     memory_dir: PathBuf,
     long_term_memory_dir: PathBuf,
     scratch_dir: PathBuf,
+    tools_dir: PathBuf,
 }
 
 impl ApexPaths {
@@ -90,6 +93,7 @@ impl ApexPaths {
             memory_dir: root.join("memory").join("working"),
             long_term_memory_dir: root.join("memory").join("long-term"),
             scratch_dir: root.join("scratch"),
+            tools_dir: root.join("tools"),
             root,
         })
     }
@@ -161,8 +165,15 @@ async fn main() -> Result<()> {
                 Some(sub) => bail!("unknown scratch subcommand: {sub}. Available: ls"),
             }
         }
+        Some("tools") => {
+            let subcmd = args.get(1).map(|s| s.as_str());
+            match subcmd {
+                Some("list") | None => cmd_tools_list().await,
+                Some(sub) => bail!("unknown tools subcommand: {sub}. Available: list"),
+            }
+        }
         Some(cmd) => bail!(
-            "unknown command: {cmd}. Available: init, run, queue, cat, work, status, memory, scratch"
+            "unknown command: {cmd}. Available: init, run, queue, cat, work, status, memory, scratch, tools"
         ),
         None => bail!("no command provided. Usage: apex <command>"),
     }
@@ -185,6 +196,16 @@ async fn cmd_init() -> Result<()> {
     std::fs::create_dir_all(&paths.scratch_dir)
         .context("failed to create scratch/ directory")?;
 
+    std::fs::create_dir_all(paths.tools_dir.join("custom"))
+        .context("failed to create tools/custom/ directory")?;
+
+    // Write empty manifest if absent
+    let manifest_path = paths.tools_dir.join("manifest.toml");
+    if !manifest_path.exists() {
+        std::fs::write(&manifest_path, "")
+            .context("failed to write tools/manifest.toml")?;
+    }
+
     RfbmqAdapter::init(&paths.queue_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     eprintln!("✓ Initialized apex at {}", paths.root.display());
@@ -192,6 +213,7 @@ async fn cmd_init() -> Result<()> {
     eprintln!("  memory:   {}", paths.memory_dir.display());
     eprintln!("  long-term: {}", paths.long_term_memory_dir.display());
     eprintln!("  scratch:  {}", paths.scratch_dir.display());
+    eprintln!("  tools:    {}", paths.tools_dir.display());
     Ok(())
 }
 
@@ -406,6 +428,7 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
     let estimator = Arc::new(Mutex::new(TokenEstimator::new(calibration)));
 
     let scratch_dir = paths.scratch_dir.clone();
+    let tools_dir = paths.tools_dir.clone();
 
     let persona = Arc::new(persona);
     let evaluator_persona = Arc::new(evaluator_persona);
@@ -427,6 +450,7 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
             max_depth,
             0,
             scratch_dir,
+            tools_dir,
             estimator,
         )
         .await
@@ -443,6 +467,7 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
             let evaluator_persona = Arc::clone(&evaluator_persona);
             let eval_config = Arc::clone(&eval_config);
             let scratch_dir = scratch_dir.clone();
+            let tools_dir = tools_dir.clone();
             let estimator = Arc::clone(&estimator);
 
             handles.push(tokio::spawn(async move {
@@ -459,6 +484,7 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
                     max_depth,
                     worker_id,
                     scratch_dir,
+                    tools_dir,
                     estimator,
                 )
                 .await
@@ -486,6 +512,7 @@ async fn worker_loop(
     max_depth: u32,
     worker_id: usize,
     scratch_dir: PathBuf,
+    tools_dir: PathBuf,
     estimator: Arc<Mutex<TokenEstimator>>,
 ) -> Result<()> {
     let mut empty_cycles = 0u32;
@@ -552,11 +579,18 @@ async fn worker_loop(
 
         let memory_tools = MemoryToolRegistry::new(Arc::clone(&memory));
         let lt_memory_tools = LongTermMemoryToolRegistry::new(Arc::clone(&long_term));
+        let custom_spill = SpillManager::new(scratch_dir.clone());
+        let custom_tools = CustomToolRegistry::new(
+            tools_dir.clone(),
+            custom_spill,
+            Some(Arc::clone(&long_term)),
+        );
         let tools = CompositeToolRegistry::new(vec![
             Box::new(BuiltinToolRegistry::new(scratch_dir.clone())),
             Box::new(memory_tools),
             Box::new(lt_memory_tools),
             Box::new(queue_tools),
+            Box::new(custom_tools),
         ]);
 
         // Build composer with current calibration
@@ -712,7 +746,6 @@ async fn execute_task(
     estimator: &Arc<Mutex<TokenEstimator>>,
 ) -> std::result::Result<AttemptRecord, (AttemptRecord, String, apex_core::domain::Scratchpad)> {
     let started_at = now_iso();
-    let schemas = tools.schemas();
 
     // Load or create scratchpad for this job
     let job_id = &claimed.headers.correlation_id;
@@ -743,6 +776,9 @@ async fn execute_task(
     let mut final_text: Option<String> = None;
 
     for turn_num in 0..MAX_TURNS {
+        // Refresh schemas each turn so newly created tools appear immediately
+        let schemas = tools.schemas();
+
         let req = CompletionRequest {
             system_prompt: persona.to_string(),
             messages: messages.clone(),
@@ -984,7 +1020,6 @@ async fn execute_continuation(
 
     // Use the LLM to assemble a coherent summary via the tool loop
     // The continuation body already instructs the agent to use queue_read_done
-    let schemas = tools.schemas();
 
     let initial_body = format!(
         "{}\n\n---\n## Pre-loaded Results ({} subtasks completed)\n{}",
@@ -1002,6 +1037,9 @@ async fn execute_continuation(
     let mut final_text: Option<String> = None;
 
     for turn_num in 0..MAX_TURNS {
+        // Refresh schemas each turn so newly created tools appear immediately
+        let schemas = tools.schemas();
+
         let req = CompletionRequest {
             system_prompt: persona.to_string(),
             messages: messages.clone(),
@@ -1504,6 +1542,50 @@ async fn cmd_scratch_ls() -> Result<()> {
             .to_string_lossy();
         let size_kb = entry.size as f64 / 1024.0;
         println!("  {name:<40} {size_kb:.1} KB");
+    }
+    Ok(())
+}
+
+async fn cmd_tools_list() -> Result<()> {
+    let paths = ApexPaths::resolve()?;
+    let manifest_path = paths.tools_dir.join("manifest.toml");
+
+    if !manifest_path.exists() {
+        println!("No custom tools. Run 'apex init' first.");
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&manifest_path)
+        .context("failed to read tools/manifest.toml")?;
+
+    if content.trim().is_empty() {
+        println!("No custom tools registered.");
+        return Ok(());
+    }
+
+    #[derive(Deserialize)]
+    struct Manifest {
+        #[serde(default)]
+        tool: Vec<ToolEntry>,
+    }
+    #[derive(Deserialize)]
+    struct ToolEntry {
+        name: String,
+        description: String,
+        created_at: String,
+    }
+
+    let manifest: Manifest = toml::de::from_str(&content)
+        .context("failed to parse manifest.toml")?;
+
+    if manifest.tool.is_empty() {
+        println!("No custom tools registered.");
+        return Ok(());
+    }
+
+    println!("── Custom tools ({}) ──", manifest.tool.len());
+    for entry in &manifest.tool {
+        println!("  {:<24} {} (created: {})", entry.name, entry.description, entry.created_at);
     }
     Ok(())
 }

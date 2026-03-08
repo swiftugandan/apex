@@ -20,4 +20,6 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+toml = "0.8"
