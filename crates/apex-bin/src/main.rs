@@ -331,13 +331,18 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
 
     let llm = Arc::new(AnthropicProvider::from_env());
 
-    let eval_llm: Arc<dyn LlmProvider> = if let Some(ref eval_model) = eval_config.eval_model {
-        let api_key =
-            std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY must be set");
-        Arc::new(AnthropicProvider::new(api_key, eval_model.clone(), 200_000))
-    } else {
-        Arc::clone(&llm) as Arc<dyn LlmProvider>
-    };
+    let eval_llm: Option<Arc<dyn LlmProvider>> =
+        if let Some(ref eval_model) = eval_config.eval_model {
+            let api_key =
+                std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY must be set");
+            Some(Arc::new(AnthropicProvider::new(
+                api_key,
+                eval_model.clone(),
+                200_000,
+            )))
+        } else {
+            None
+        };
 
     let memory: Arc<dyn WorkingMemory> =
         Arc::new(FsScratchpadStore::new(paths.memory_dir.clone()));
@@ -395,117 +400,117 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
 
 // ── CLI memory commands ───────────────────────────────────────────
 
-async fn cmd_memory_facts() -> Result<()> {
-    let paths = ApexPaths::resolve()?;
+/// Open the long-term memory store and run the given closure. Single place that opens the DB
+/// for memory subcommands.
+async fn with_memory_store<F, Fut>(paths: &ApexPaths, f: F) -> Result<()>
+where
+    F: FnOnce(SqliteMemoryStore) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let db_path = paths.long_term_db_path();
     if !db_path.exists() {
         bail!("no long-term memory database found. Run 'apex init' first.");
     }
-    let store = SqliteMemoryStore::open(&db_path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let store = SqliteMemoryStore::open(&db_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    f(store).await
+}
 
-    use apex_core::ports::MemoryStore;
-    let facts = store.query_facts("", 100).await?;
-    if facts.is_empty() {
-        println!("No facts stored.");
-        return Ok(());
-    }
-
-    println!("── Facts ({}) ──", facts.len());
-    println!(
-        "{:<20} {:<50} {:<10} {:<20}",
-        "ID", "Content", "Confidence", "Tags"
-    );
-    for f in &facts {
-        let short_id = if f.id.0.len() > 18 {
-            &f.id.0[..18]
-        } else {
-            &f.id.0
-        };
-        let content = if f.content.len() > 48 {
-            format!("{}…", &f.content[..47])
-        } else {
-            f.content.clone()
-        };
-        let tags = f.tags.join(", ");
+async fn cmd_memory_facts() -> Result<()> {
+    let paths = ApexPaths::resolve()?;
+    with_memory_store(&paths, |store| async move {
+        use apex_core::ports::MemoryStore;
+        let facts = store.query_facts("", 100).await?;
+        if facts.is_empty() {
+            println!("No facts stored.");
+            return Ok(());
+        }
+        println!("── Facts ({}) ──", facts.len());
         println!(
-            "{:<20} {:<50} {:<10.2} {:<20}",
-            short_id, content, f.confidence, tags
+            "{:<20} {:<50} {:<10} {:<20}",
+            "ID", "Content", "Confidence", "Tags"
         );
-    }
-    Ok(())
+        for f in &facts {
+            let short_id = if f.id.0.len() > 18 {
+                &f.id.0[..18]
+            } else {
+                &f.id.0
+            };
+            let content = if f.content.len() > 48 {
+                format!("{}…", &f.content[..47])
+            } else {
+                f.content.clone()
+            };
+            let tags = f.tags.join(", ");
+            println!(
+                "{:<20} {:<50} {:<10.2} {:<20}",
+                short_id, content, f.confidence, tags
+            );
+        }
+        Ok(())
+    })
+    .await
 }
 
 async fn cmd_memory_skills() -> Result<()> {
     let paths = ApexPaths::resolve()?;
-    let db_path = paths.long_term_db_path();
-    if !db_path.exists() {
-        bail!("no long-term memory database found. Run 'apex init' first.");
-    }
-    let store = SqliteMemoryStore::open(&db_path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    use apex_core::ports::MemoryStore;
-    let skills = store.list_skills(100).await?;
-    if skills.is_empty() {
-        println!("No skills stored.");
-        return Ok(());
-    }
-
-    println!("── Skills ({}) ──", skills.len());
-    println!(
-        "{:<20} {:<40} {:<10} {:<8} {:<8}",
-        "ID", "Pattern", "Fitness", "Success", "Failure"
-    );
-    for s in &skills {
-        let short_id = if s.id.0.len() > 18 { &s.id.0[..18] } else { &s.id.0 };
-        let short_pattern = if s.task_pattern.len() > 38 {
-            format!("{}…", &s.task_pattern[..37])
-        } else {
-            s.task_pattern.clone()
-        };
+    with_memory_store(&paths, |store| async move {
+        use apex_core::ports::MemoryStore;
+        let skills = store.list_skills(100).await?;
+        if skills.is_empty() {
+            println!("No skills stored.");
+            return Ok(());
+        }
+        println!("── Skills ({}) ──", skills.len());
         println!(
-            "{:<20} {:<40} {:<10.2} {:<8} {:<8}",
-            short_id, short_pattern, s.fitness, s.success_count, s.failure_count
+            "{:<20} {:<40} {:<10} {:<8} {:<8}",
+            "ID", "Pattern", "Fitness", "Success", "Failure"
         );
-    }
-    Ok(())
+        for s in &skills {
+            let short_id = if s.id.0.len() > 18 { &s.id.0[..18] } else { &s.id.0 };
+            let short_pattern = if s.task_pattern.len() > 38 {
+                format!("{}…", &s.task_pattern[..37])
+            } else {
+                s.task_pattern.clone()
+            };
+            println!(
+                "{:<20} {:<40} {:<10.2} {:<8} {:<8}",
+                short_id, short_pattern, s.fitness, s.success_count, s.failure_count
+            );
+        }
+        Ok(())
+    })
+    .await
 }
 
 async fn cmd_memory_strategies() -> Result<()> {
     let paths = ApexPaths::resolve()?;
-    let db_path = paths.long_term_db_path();
-    if !db_path.exists() {
-        bail!("no long-term memory database found. Run 'apex init' first.");
-    }
-    let store = SqliteMemoryStore::open(&db_path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    use apex_core::ports::MemoryStore;
-    let strategies = store.list_strategies(100).await?;
-    if strategies.is_empty() {
-        println!("No strategies stored.");
-        return Ok(());
-    }
-
-    println!("── Strategies ({}) ──", strategies.len());
-    println!(
-        "{:<20} {:<40} {:<10} {:<12} {:<8} {:<8}",
-        "ID", "Goal Pattern", "Fitness", "Avg Subtasks", "Success", "Failure"
-    );
-    for s in &strategies {
-        let short_id = if s.id.0.len() > 18 { &s.id.0[..18] } else { &s.id.0 };
-        let short_pattern = if s.goal_pattern.len() > 38 {
-            format!("{}…", &s.goal_pattern[..37])
-        } else {
-            s.goal_pattern.clone()
-        };
+    with_memory_store(&paths, |store| async move {
+        use apex_core::ports::MemoryStore;
+        let strategies = store.list_strategies(100).await?;
+        if strategies.is_empty() {
+            println!("No strategies stored.");
+            return Ok(());
+        }
+        println!("── Strategies ({}) ──", strategies.len());
         println!(
-            "{:<20} {:<40} {:<10.2} {:<12.1} {:<8} {:<8}",
-            short_id, short_pattern, s.fitness, s.avg_subtasks, s.success_count, s.failure_count
+            "{:<20} {:<40} {:<10} {:<12} {:<8} {:<8}",
+            "ID", "Goal Pattern", "Fitness", "Avg Subtasks", "Success", "Failure"
         );
-    }
-    Ok(())
+        for s in &strategies {
+            let short_id = if s.id.0.len() > 18 { &s.id.0[..18] } else { &s.id.0 };
+            let short_pattern = if s.goal_pattern.len() > 38 {
+                format!("{}…", &s.goal_pattern[..37])
+            } else {
+                s.goal_pattern.clone()
+            };
+            println!(
+                "{:<20} {:<40} {:<10.2} {:<12.1} {:<8} {:<8}",
+                short_id, short_pattern, s.fitness, s.avg_subtasks, s.success_count, s.failure_count
+            );
+        }
+        Ok(())
+    })
+    .await
 }
 
 // ── Scratch and calibration CLI commands ───────────────────────────
@@ -578,21 +583,17 @@ async fn cmd_tools_list() -> Result<()> {
 
 async fn cmd_memory_calibration() -> Result<()> {
     let paths = ApexPaths::resolve()?;
-    let db_path = paths.long_term_db_path();
-    if !db_path.exists() {
-        bail!("no long-term memory database found. Run 'apex init' first.");
-    }
-    let store = SqliteMemoryStore::open(&db_path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    use apex_core::ports::MemoryStore;
-    let cal = store.load_calibration().await?;
-    println!("── Token Calibration ──");
-    println!("  Prose ratio:  {:.3} chars/token", cal.chars_per_token_prose);
-    println!("  Code ratio:   {:.3} chars/token", cal.chars_per_token_code);
-    println!("  Mixed ratio:  {:.3} chars/token", cal.chars_per_token_mixed);
-    println!("  Sample count: {}", cal.sample_count);
-    Ok(())
+    with_memory_store(&paths, |store| async move {
+        use apex_core::ports::MemoryStore;
+        let cal = store.load_calibration().await?;
+        println!("── Token Calibration ──");
+        println!("  Prose ratio:  {:.3} chars/token", cal.chars_per_token_prose);
+        println!("  Code ratio:   {:.3} chars/token", cal.chars_per_token_code);
+        println!("  Mixed ratio:  {:.3} chars/token", cal.chars_per_token_mixed);
+        println!("  Sample count: {}", cal.sample_count);
+        Ok(())
+    })
+    .await
 }
 
 // ── Config commands ────────────────────────────────────────────────

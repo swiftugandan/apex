@@ -31,9 +31,10 @@ const MAX_TOKENS: u32 = 8192;
 #[derive(Clone)]
 pub struct WorkerContext {
     pub adapter: Arc<RfbmqAdapter>,
-    pub static_tools: Arc<CompositeToolRegistry>,
+    pub static_tools: Arc<StaticToolRegistry>,
     pub llm: Arc<AnthropicProvider>,
-    pub eval_llm: Arc<dyn LlmProvider>,
+    /// When set, used for adversarial evaluation; otherwise main llm is used.
+    pub eval_llm: Option<Arc<dyn LlmProvider>>,
     pub memory: Arc<dyn WorkingMemory>,
     pub long_term: Arc<dyn MemoryStore>,
     pub persona: Arc<String>,
@@ -44,20 +45,31 @@ pub struct WorkerContext {
     pub estimator: Arc<Mutex<TokenEstimator>>,
 }
 
-// ── CompositeToolRegistry ───────────────────────────────────────────
+/// Builds a MessageComposer from the shared token estimator. Single place that knows how to
+/// obtain a composer for push-time composition (queue tools, failure body updates).
+async fn composer_from_estimator(estimator: &Arc<Mutex<TokenEstimator>>) -> MessageComposer {
+    let cal = {
+        let est = estimator.lock().await;
+        est.calibration_data().clone()
+    };
+    MessageComposer::new(TokenEstimator::new(cal))
+}
 
-pub(crate) struct CompositeToolRegistry {
+// ── StaticToolRegistry ──────────────────────────────────────────────
+
+/// Aggregates builtin, memory, custom, and config tool registries; built once per process.
+pub(crate) struct StaticToolRegistry {
     registries: Vec<Box<dyn ToolRegistry>>,
 }
 
-impl CompositeToolRegistry {
+impl StaticToolRegistry {
     fn new(registries: Vec<Box<dyn ToolRegistry>>) -> Self {
         Self { registries }
     }
 }
 
 #[async_trait]
-impl ToolRegistry for CompositeToolRegistry {
+impl ToolRegistry for StaticToolRegistry {
     fn definitions(&self) -> Vec<ToolDef> {
         self.registries
             .iter()
@@ -82,7 +94,7 @@ impl ToolRegistry for CompositeToolRegistry {
 
 /// Single registry that dispatches to static tools first, then per-claim queue tools.
 pub(crate) struct ApexToolRegistry {
-    static_tools: Arc<CompositeToolRegistry>,
+    static_tools: Arc<StaticToolRegistry>,
     queue_tools: QueueToolRegistry,
 }
 
@@ -116,7 +128,7 @@ pub fn build_static_tools(
     memory: Arc<dyn WorkingMemory>,
     long_term: Arc<dyn MemoryStore>,
     invariants: Arc<Invariants>,
-) -> Arc<CompositeToolRegistry> {
+) -> Arc<StaticToolRegistry> {
     let memory_tools = MemoryToolRegistry::new(memory, long_term.clone());
     let custom_spill = SpillManager::new(scratch_dir.clone());
     let custom_tools = CustomToolRegistry::new(
@@ -125,7 +137,7 @@ pub fn build_static_tools(
         Some(long_term.clone()),
     );
     let config_tools = ConfigToolRegistry::new(config_dir, invariants);
-    Arc::new(CompositeToolRegistry::new(vec![
+    Arc::new(StaticToolRegistry::new(vec![
         Box::new(BuiltinToolRegistry::new(scratch_dir)),
         Box::new(memory_tools),
         Box::new(custom_tools),
@@ -183,6 +195,7 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
         );
 
         // Build per-claim tool registry (static tools + queue tools)
+        let composer = composer_from_estimator(&ctx.estimator).await;
         let queue_tools = QueueToolRegistry::new(
             Arc::clone(&ctx.adapter) as Arc<dyn Queue>,
             claimed.headers.correlation_id.clone(),
@@ -191,7 +204,7 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
             extract_title(&claimed.body),
             claimed.body.clone(),
             Some(Arc::clone(&ctx.long_term)),
-            Some(Arc::clone(&ctx.estimator)),
+            composer,
         );
         let tools = ApexToolRegistry {
             static_tools: Arc::clone(&ctx.static_tools),
@@ -218,10 +231,7 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
                 );
             }
             Err((record, err, scratchpad)) => {
-                let composer = {
-                    let est = ctx.estimator.lock().await;
-                    MessageComposer::new(TokenEstimator::new(est.calibration_data().clone()))
-                };
+                let composer = composer_from_estimator(&ctx.estimator).await;
                 handle_failure(
                     &ctx.adapter, &claimed, &record, &err, &scratchpad,
                     worker_id, &composer, ctx.max_retries,
@@ -510,7 +520,7 @@ async fn execute_claim(
         final_text,
         &scratchpad,
         started_at,
-        ctx.eval_llm.as_ref(),
+        ctx.eval_llm.as_deref().unwrap_or(ctx.llm.as_ref()),
         &ctx.eval_config,
         &ctx.evaluator_persona,
         ctx.long_term.as_ref(),

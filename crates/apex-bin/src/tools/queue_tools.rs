@@ -2,9 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
 
-use apex_core::context::{MessageComposer, TokenEstimator};
+use apex_core::context::MessageComposer;
 use apex_core::domain::{
     MessageHeaders, MessageType, QueueMessage, ToolCall, ToolDef, ToolResult, ToolSchema,
 };
@@ -20,8 +19,6 @@ pub struct QueueToolRegistry {
     parent_body: String,
     store: Option<Arc<dyn MemoryStore>>,
     composer: MessageComposer,
-    /// When set, used to build a calibrated composer for push-time subtask composition.
-    estimator: Option<Arc<Mutex<TokenEstimator>>>,
 }
 
 impl QueueToolRegistry {
@@ -33,7 +30,7 @@ impl QueueToolRegistry {
         parent_goal: String,
         parent_body: String,
         store: Option<Arc<dyn MemoryStore>>,
-        estimator: Option<Arc<Mutex<TokenEstimator>>>,
+        composer: MessageComposer,
     ) -> Self {
         Self {
             queue,
@@ -43,25 +40,7 @@ impl QueueToolRegistry {
             parent_goal,
             parent_body,
             store,
-            composer: MessageComposer::default(),
-            estimator,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn with_composer(mut self, composer: MessageComposer) -> Self {
-        self.composer = composer;
-        self
-    }
-
-    /// Build the composer to use for this call: calibrated from shared estimator if available.
-    async fn composer(&self) -> MessageComposer {
-        match &self.estimator {
-            Some(est) => {
-                let cal = est.lock().await;
-                MessageComposer::new(TokenEstimator::new(cal.calibration_data().clone()))
-            }
-            None => self.composer.clone(),
+            composer,
         }
     }
 
@@ -84,7 +63,7 @@ impl QueueToolRegistry {
             ));
         }
 
-        let composer = self.composer().await;
+        let composer = &self.composer;
 
         struct SubtaskInfo {
             description: String,
