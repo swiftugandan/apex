@@ -107,7 +107,7 @@ pub async fn execute(call: &ToolCall, spill: &SpillManager) -> Result<ToolResult
                         )
                     } else {
                         // Spill failed, fall back to truncation
-                        let t = &stdout[..max_output];
+                        let t = apex_core::truncate_str(&stdout, max_output);
                         (t.to_string(), None, None, true)
                     }
                 } else {

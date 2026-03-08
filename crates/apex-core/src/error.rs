@@ -10,6 +10,8 @@ pub enum LlmError {
     Serialization(String),
     #[error("unexpected response: {0}")]
     UnexpectedResponse(String),
+    #[error("configuration error: {0}")]
+    Configuration(String),
 }
 
 #[derive(Debug, Error)]

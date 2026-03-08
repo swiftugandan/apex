@@ -223,8 +223,19 @@ impl Evaluation {
                     out.push('\n');
                 }
                 out.push_str("### Adversarial: FAIL\n");
-                for finding in &adv.blocking_issues {
-                    out.push_str(&format!("- [BLOCK] {}\n", finding.description));
+                if adv.blocking_issues.is_empty() {
+                    // No structured findings parsed — include truncated raw response
+                    let raw = adv.raw_response.trim();
+                    let truncated = apex_core::truncate_str(raw, 500);
+                    out.push_str(truncated);
+                    if truncated.len() < raw.len() {
+                        out.push_str("...");
+                    }
+                    out.push('\n');
+                } else {
+                    for finding in &adv.blocking_issues {
+                        out.push_str(&format!("- [BLOCK] {}\n", finding.description));
+                    }
                 }
             }
         }

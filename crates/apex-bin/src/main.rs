@@ -2,7 +2,7 @@ mod agent;
 mod tools;
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -171,6 +171,10 @@ async fn cmd_init() -> Result<()> {
     ConfigLoader::write_default_invariants(&paths.config_dir)?;
     ConfigLoader::write_default_agent_config(&paths.config_dir)?;
 
+    std::fs::create_dir_all(&paths.prompts_dir)
+        .context("failed to create prompts/ directory")?;
+    write_default_prompts(&paths.prompts_dir)?;
+
     RfbmqAdapter::init(&paths.queue_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     eprintln!("✓ Initialized apex at {}", paths.root.display());
@@ -180,12 +184,19 @@ async fn cmd_init() -> Result<()> {
     eprintln!("  scratch:  {}", paths.scratch_dir.display());
     eprintln!("  tools:    {}", paths.tools_dir.display());
     eprintln!("  config:   {}", paths.config_dir.display());
+    eprintln!("  prompts:  {}", paths.prompts_dir.display());
     Ok(())
 }
 
 async fn cmd_run(task: String) -> Result<()> {
     let paths = ApexPaths::resolve()?;
     let adapter = open_queue(&paths)?;
+
+    // Drain stale pending messages from previous runs
+    let drained = drain_pending(&adapter).await?;
+    if drained > 0 {
+        eprintln!("⚠ Drained {drained} stale pending message(s) from previous runs");
+    }
 
     let correlation_id = format!("job-{}", &uuid_v4()[..8]);
     let body = MessageComposer::compose_task_body(&task);
@@ -205,6 +216,28 @@ async fn cmd_run(task: String) -> Result<()> {
     eprintln!("▶ Queued goal {id} (correlation: {correlation_id})");
 
     process_queue(&paths, Arc::new(adapter)).await
+}
+
+/// Pop and reject all stale pending messages, moving them to failed/.
+async fn drain_pending(adapter: &RfbmqAdapter) -> Result<u32> {
+    let mut count = 0u32;
+    loop {
+        let claimed = adapter
+            .pop()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        match claimed {
+            Some(task) => {
+                adapter
+                    .reject(&task)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                count += 1;
+            }
+            None => break,
+        }
+    }
+    Ok(count)
 }
 
 async fn cmd_work() -> Result<()> {
@@ -291,6 +324,118 @@ async fn cmd_status() -> Result<()> {
     Ok(())
 }
 
+// ── Default prompts ───────────────────────────────────────────────
+
+fn write_default_prompts(prompts_dir: &Path) -> Result<()> {
+    let agent_path = prompts_dir.join("agent.md");
+    if !agent_path.exists() {
+        std::fs::write(&agent_path, DEFAULT_AGENT_PROMPT)
+            .context("failed to write prompts/agent.md")?;
+    }
+
+    let evaluator_path = prompts_dir.join("evaluator.md");
+    if !evaluator_path.exists() {
+        std::fs::write(&evaluator_path, DEFAULT_EVALUATOR_PROMPT)
+            .context("failed to write prompts/evaluator.md")?;
+    }
+
+    Ok(())
+}
+
+const DEFAULT_AGENT_PROMPT: &str = r#"You are Apex, an autonomous AI agent running on a Linux device. You accomplish tasks by reasoning step-by-step and using the tools available to you.
+
+## Principles
+
+- **Think before acting.** Understand the task fully before making tool calls. Break complex tasks into steps.
+- **Verify your work.** After performing an action, confirm it succeeded. Check exit codes, read output, verify files exist.
+- **Be precise.** Use exact paths, exact commands. Do not guess or assume.
+- **Report clearly.** When the task is complete, summarize what you did and the outcome.
+
+## Tool Usage
+
+- Use `shell_exec` to run shell commands. Check exit codes and stderr for errors.
+- Use `file_read` to inspect file contents before modifying them.
+- Use `file_write` to create or modify files. Create parent directories if needed.
+- Prefer targeted commands over broad ones. Use `grep`, `find`, `head`, `tail` to filter output.
+- If a command produces large output, use flags to limit it.
+
+## Working Memory
+
+You have a per-job scratchpad for tracking multi-step task progress. Use it when tasks require multiple steps.
+
+- Use `working_memory_read` to check your current decomposition state.
+- Use `working_memory_update` to record subtasks, update their status, and add notes about discoveries.
+- The scratchpad persists across retries — if this is a retry, check working memory first.
+
+## Acceptance Criteria & Self-Evaluation
+
+After you complete a task, the system automatically runs deterministic acceptance criteria checks from the task body. If any check fails, the task is retried with the failure details.
+
+- Prefer deterministic checks over vague descriptions
+- Cover the key deliverable of each subtask
+- If retrying after eval failure, check "Previous Attempts" for which criteria failed
+- `### Fuzzy` criteria under `## Acceptance Criteria` define qualitative checks evaluated by an adversarial LLM reviewer after deterministic checks pass
+- Fuzzy criteria trigger a second evaluation pass — ensure your work satisfies both concrete and qualitative requirements
+
+## Task Decomposition
+
+You can decompose complex goals into independent subtasks that run in parallel.
+
+- Use `decompose_goal` when a task has 2 or more independent steps that can be done in parallel.
+- Each subtask becomes a separate queue message processed by another agent instance.
+- After all subtasks complete, a continuation message assembles the final result.
+- **When to decompose:** The task has clearly separable parts (e.g., "build X and test Y").
+- **When NOT to decompose:** The task is atomic, sequential, or simple enough to do directly.
+- **Depth limits:** If told max depth is reached, handle the task directly instead of decomposing.
+
+## Error Handling
+
+- If a command fails, read the error output carefully and diagnose the issue.
+- Try a different approach if the first one fails. Do not repeat the same failing command.
+- If you cannot complete a task after reasonable effort, explain what you tried and what went wrong.
+"#;
+
+const DEFAULT_EVALUATOR_PROMPT: &str = r#"You are an adversarial evaluator. Your job is to find problems with an agent's work product.
+
+## Input
+
+You will receive:
+1. **Original task** — the task the agent was asked to complete
+2. **Agent's result** — what the agent produced
+3. **Fuzzy criteria** — qualitative checks the result must satisfy
+
+## Required Output Format
+
+You MUST structure your response with exactly these sections:
+
+## Blocking Issues
+List genuine problems that make the result unacceptable:
+- [BLOCK] description of the issue with specific evidence
+
+If there are no blocking issues, write: None.
+
+## Warnings
+List minor concerns or improvements that don't block acceptance:
+- [WARN] description of the concern
+
+If there are no warnings, write: None.
+
+## Verdict
+Write exactly one word: PASS or FAIL
+
+PASS means the result is acceptable despite any warnings.
+FAIL means there are blocking issues that must be fixed.
+
+## Instructions
+
+- Be specific. Cite evidence from the result for every finding.
+- Do not invent problems. Only flag issues you can demonstrate.
+- Focus on the fuzzy criteria provided. Evaluate whether each criterion is satisfied.
+- A missing or incomplete criterion is a blocking issue.
+- Minor style or optimization concerns are warnings, not blocks.
+- Only mark FAIL if there are genuine blocking issues.
+"#;
+
 // ── Queue helpers ──────────────────────────────────────────────────
 
 fn open_queue(paths: &ApexPaths) -> Result<RfbmqAdapter> {
@@ -329,17 +474,17 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
         },
     };
 
-    let llm = Arc::new(AnthropicProvider::from_env());
+    let llm = Arc::new(
+        AnthropicProvider::from_env_with_model(&agent_config.agent.model)
+            .context("failed to create LLM provider")?
+    );
 
     let eval_llm: Option<Arc<dyn LlmProvider>> =
         if let Some(ref eval_model) = eval_config.eval_model {
-            let api_key =
-                std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY must be set");
-            Some(Arc::new(AnthropicProvider::new(
-                api_key,
-                eval_model.clone(),
-                200_000,
-            )))
+            Some(Arc::new(
+                AnthropicProvider::from_env_with_model(eval_model)
+                    .context("failed to create eval LLM provider")?
+            ))
         } else {
             None
         };
@@ -436,7 +581,7 @@ async fn cmd_memory_facts() -> Result<()> {
                 &f.id.0
             };
             let content = if f.content.len() > 48 {
-                format!("{}…", &f.content[..47])
+                format!("{}…", apex_core::truncate_str(&f.content, 47))
             } else {
                 f.content.clone()
             };
@@ -468,7 +613,7 @@ async fn cmd_memory_skills() -> Result<()> {
         for s in &skills {
             let short_id = if s.id.0.len() > 18 { &s.id.0[..18] } else { &s.id.0 };
             let short_pattern = if s.task_pattern.len() > 38 {
-                format!("{}…", &s.task_pattern[..37])
+                format!("{}…", apex_core::truncate_str(&s.task_pattern, 37))
             } else {
                 s.task_pattern.clone()
             };
@@ -499,7 +644,7 @@ async fn cmd_memory_strategies() -> Result<()> {
         for s in &strategies {
             let short_id = if s.id.0.len() > 18 { &s.id.0[..18] } else { &s.id.0 };
             let short_pattern = if s.goal_pattern.len() > 38 {
-                format!("{}…", &s.goal_pattern[..37])
+                format!("{}…", apex_core::truncate_str(&s.goal_pattern, 37))
             } else {
                 s.goal_pattern.clone()
             };

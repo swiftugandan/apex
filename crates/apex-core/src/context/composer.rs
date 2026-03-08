@@ -28,7 +28,7 @@ impl MessageComposer {
     /// Compose the initial task body for a new queue message.
     pub fn compose_task_body(task: &str) -> String {
         let title = task.lines().next().unwrap_or(task);
-        let title = if title.len() > 80 { &title[..80] } else { title };
+        let title = crate::truncate_str(title, 80);
 
         format!(
             "# Task: {title}\n\n\

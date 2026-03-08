@@ -157,6 +157,20 @@ impl Queue for RfbmqAdapter {
         Ok(())
     }
 
+    async fn reject(&self, claimed: &ClaimedTask) -> Result<(), QueueError> {
+        let claim_path = std::path::Path::new(&claimed.claim_path);
+        let failed_path = self
+            .queue
+            .root()
+            .join("failed")
+            .join(format!("{}.md", claimed.id));
+
+        rfbmq_core::fs_utils::durable_rename(claim_path, &failed_path, self.queue.fsync_mode())
+            .map_err(|e| QueueError::Io(e.to_string()))?;
+
+        Ok(())
+    }
+
     async fn depth(&self) -> Result<QueueDepth, QueueError> {
         let total = self
             .queue
@@ -285,7 +299,6 @@ fn headers_to_custom(headers: &MessageHeaders) -> Vec<String> {
     vec![
         format!("Type: {}", type_str),
         format!("Depth: {}", headers.depth),
-        format!("Retry-Count: {}", headers.retry_count),
     ]
 }
 
@@ -296,7 +309,6 @@ fn custom_to_headers(
 ) -> MessageHeaders {
     let mut message_type = MessageType::Task;
     let mut depth: u32 = 0;
-    let mut custom_retry: Option<u32> = None;
 
     for line in custom {
         if let Some((key, value)) = line.split_once(':') {
@@ -316,11 +328,6 @@ fn custom_to_headers(
                         depth = d;
                     }
                 }
-                "Retry-Count" => {
-                    if let Ok(r) = value.parse() {
-                        custom_retry = Some(r);
-                    }
-                }
                 _ => {}
             }
         }
@@ -330,7 +337,7 @@ fn custom_to_headers(
         message_type,
         correlation_id: correlation_id.clone().unwrap_or_default(),
         depth,
-        retry_count: custom_retry.unwrap_or(retry_count),
+        retry_count,
         depends_on: vec![],
     }
 }
@@ -481,7 +488,8 @@ mod tests {
         };
 
         let custom = headers_to_custom(&headers);
-        let restored = custom_to_headers(&custom, &Some("abc-123".to_string()), 0);
+        // retry_count comes from the RFBMQ header, not custom headers
+        let restored = custom_to_headers(&custom, &Some("abc-123".to_string()), 1);
 
         assert_eq!(restored.correlation_id, "abc-123");
         assert_eq!(restored.depth, 3);

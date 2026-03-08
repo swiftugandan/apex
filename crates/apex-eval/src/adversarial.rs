@@ -68,17 +68,31 @@ pub fn parse_adversarial_response(
     for line in text.lines() {
         let trimmed = line.trim();
 
-        if let Some(rest) = trimmed.strip_prefix("- [BLOCK]") {
+        // Strip optional leading markdown list markers: "- ", "* ", "1. "
+        let content = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .unwrap_or(trimmed);
+
+        // Match [BLOCK] with optional bold markers
+        if let Some(rest) = content
+            .strip_prefix("[BLOCK]")
+            .or_else(|| content.strip_prefix("**[BLOCK]**"))
+        {
             blocking.push(AdversarialFinding {
                 severity: FindingSeverity::Blocking,
                 description: rest.trim().to_string(),
             });
-        } else if let Some(rest) = trimmed.strip_prefix("- [WARN]") {
+        } else if let Some(rest) = content
+            .strip_prefix("[WARN]")
+            .or_else(|| content.strip_prefix("**[WARN]**"))
+        {
             warnings.push(AdversarialFinding {
                 severity: FindingSeverity::Warning,
                 description: rest.trim().to_string(),
             });
-        } else if verdict.is_none() {
+        } else {
+            // Only match verdict on standalone lines (after ## Verdict header typically)
             let upper = trimmed.to_uppercase();
             if upper == "PASS" || upper == "**PASS**" {
                 verdict = Some(true);

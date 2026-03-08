@@ -121,7 +121,7 @@ impl QueueToolRegistry {
 
         for info in &infos {
             let title = info.description.lines().next().unwrap_or(&info.description);
-            let title = if title.len() > 80 { &title[..80] } else { title };
+            let title = apex_core::truncate_str(title, 80);
 
             let (facts, skill) = if let Some(ref store) = self.store {
                 let facts = store.query_facts(&info.description, 3).await.ok().unwrap_or_default();

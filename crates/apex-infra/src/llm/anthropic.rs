@@ -36,14 +36,26 @@ impl AnthropicProvider {
         }
     }
 
-    pub fn from_env() -> Self {
-        let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY must be set");
+    pub fn from_env() -> Result<Self, LlmError> {
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .map_err(|_| LlmError::Configuration("ANTHROPIC_API_KEY environment variable must be set".into()))?;
         let model = std::env::var("APEX_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
         let context_window = std::env::var("APEX_CONTEXT_WINDOW")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
-        Self::new(api_key, model, context_window)
+        Ok(Self::new(api_key, model, context_window))
+    }
+
+    /// Create from an explicit model name, reading only the API key from the environment.
+    pub fn from_env_with_model(model: impl Into<String>) -> Result<Self, LlmError> {
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .map_err(|_| LlmError::Configuration("ANTHROPIC_API_KEY environment variable must be set".into()))?;
+        let context_window = std::env::var("APEX_CONTEXT_WINDOW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        Ok(Self::new(api_key, model, context_window))
     }
 
     async fn send_request(&self, body: Value) -> Result<ApiResponse, LlmError> {

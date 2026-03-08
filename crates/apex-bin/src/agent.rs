@@ -377,10 +377,11 @@ async fn evaluate_and_finalize(
     evaluator_persona: &str,
     long_term: &dyn MemoryStore,
 ) -> std::result::Result<AttemptRecord, (AttemptRecord, String, apex_core::domain::Scratchpad)> {
-    let result_text = final_text.as_deref().unwrap_or("");
+    // Build rich result text: tool call summaries + final agent message
+    let result_text = build_result_text_for_eval(&turns, final_text.as_deref());
     let evaluation = apex_eval::Evaluator::evaluate(
         &claimed.body,
-        result_text,
+        &result_text,
         evaluator_persona,
         eval_llm,
         eval_config,
@@ -528,7 +529,60 @@ async fn execute_claim(
     .await
 }
 
+// ── Evaluation helpers ──────────────────────────────────────────────
+
+/// Build a result text for the adversarial evaluator that includes
+/// a summary of tool calls (so the evaluator can see what the agent actually did).
+fn build_result_text_for_eval(
+    turns: &[apex_core::domain::TurnRecord],
+    final_text: Option<&str>,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(2048);
+
+    out.push_str("## Agent Actions\n\n");
+    for (i, turn) in turns.iter().enumerate() {
+        for tc in &turn.tool_calls {
+            let status = if tc.is_error { "ERROR" } else { "ok" };
+            let _ = writeln!(
+                out,
+                "- Turn {}: {}({}) → [{}] {}",
+                i + 1,
+                tc.name,
+                apex_core::truncate_str(&tc.input_summary, 80),
+                status,
+                apex_core::truncate_str(&tc.output_summary, 200),
+            );
+        }
+    }
+
+    if let Some(text) = final_text {
+        out.push_str("\n## Agent's Final Response\n\n");
+        out.push_str(apex_core::truncate_str(text, 2000));
+    }
+
+    out
+}
+
 // ── Failure handling ────────────────────────────────────────────────
+
+/// Returns true if the error is non-retryable (e.g. auth, billing, invalid config).
+fn is_non_retryable(err: &str) -> bool {
+    // 400-class API errors that will never succeed on retry
+    let non_retryable_patterns = [
+        "credit balance is too low",
+        "invalid x-api-key",
+        "invalid api key",
+        "authentication_error",
+        "permission_error",
+        "not_found_error",
+        "configuration error:",
+    ];
+    let lower = err.to_lowercase();
+    non_retryable_patterns
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+}
 
 async fn handle_failure(
     adapter: &RfbmqAdapter,
@@ -550,13 +604,22 @@ async fn handle_failure(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    if is_non_retryable(err) {
+        adapter
+            .reject(claimed)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        eprintln!("[worker {worker_id}]   ↳ Non-retryable error, moved to failed/");
+        return Ok(());
+    }
+
     adapter
         .nack(claimed)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if claimed.headers.retry_count + 1 >= max_retries {
-        eprintln!("[worker {worker_id}]   ↳ Max retries reached, message moved to failed/");
+        eprintln!("[worker {worker_id}]   ↳ Max retries reached, moved to failed/");
     } else {
         eprintln!(
             "[worker {worker_id}]   ↳ Requeued for retry (attempt {} of {})",
@@ -737,7 +800,8 @@ fn summarize_json(value: &serde_json::Value, max_len: usize) -> String {
     if s.len() <= max_len {
         s
     } else {
-        format!("{}…", &s[..max_len])
+        let truncated = apex_core::truncate_str(&s, max_len);
+        format!("{truncated}…")
     }
 }
 
