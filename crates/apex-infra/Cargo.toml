@@ -1,18 +1,18 @@
 [package]
-name = "apex-tools"
+name = "apex-infra"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 apex-core = { path = "../apex-core" }
-apex-config = { path = "../apex-config" }
 async-trait.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-toml = "0.8"
+thiserror.workspace = true
 tokio.workspace = true
+rfbmq-core = { path = "../../vendor/rfbmq-core" }
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-uuid = { version = "1", features = ["v4"] }
 tempfile = "3"

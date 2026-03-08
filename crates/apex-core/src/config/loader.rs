@@ -2,8 +2,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::agent::AgentConfig;
-use crate::invariants::Invariants;
+use super::agent::AgentConfig;
+use super::invariants::Invariants;
 
 pub struct ConfigLoader;
 
@@ -118,19 +118,14 @@ mod tests {
 
     #[test]
     fn env_var_override_logic() {
-        // Test the override logic without actually touching process env vars
-        // (which race with parallel tests). Instead, verify that load_agent_config
-        // applies overrides by testing the file-based portion and the override code paths.
         let dir = TempDir::new().unwrap();
 
-        // Write a config with specific values
         let mut config = AgentConfig::default();
         config.agent.model = "file-model".to_string();
         config.agent.max_concurrent = 2;
         config.agent.max_depth = 2;
         ConfigLoader::save_agent_config(dir.path(), &config).unwrap();
 
-        // Verify the file content is correct
         let loaded = AgentConfig::from_toml(
             &std::fs::read_to_string(dir.path().join("agent.toml")).unwrap(),
         )
@@ -146,7 +141,6 @@ mod tests {
         ConfigLoader::write_default_invariants(dir.path()).unwrap();
         ConfigLoader::write_default_agent_config(dir.path()).unwrap();
 
-        // Second call should not overwrite
         let inv1 = std::fs::read_to_string(dir.path().join("invariants.toml")).unwrap();
         ConfigLoader::write_default_invariants(dir.path()).unwrap();
         let inv2 = std::fs::read_to_string(dir.path().join("invariants.toml")).unwrap();

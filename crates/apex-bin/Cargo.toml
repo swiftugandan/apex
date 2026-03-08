@@ -9,13 +9,8 @@ path = "src/main.rs"
 
 [dependencies]
 apex-core = { path = "../apex-core" }
-apex-llm = { path = "../apex-llm" }
-apex-tools = { path = "../apex-tools" }
-apex-queue = { path = "../apex-queue" }
-apex-context = { path = "../apex-context" }
-apex-memory = { path = "../apex-memory" }
+apex-infra = { path = "../apex-infra" }
 apex-eval = { path = "../apex-eval" }
-apex-config = { path = "../apex-config" }
 rfbmq-core = { path = "../../vendor/rfbmq-core" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 anyhow.workspace = true
@@ -24,3 +19,7 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }

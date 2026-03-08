@@ -43,49 +43,31 @@ name = "apex-bin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "apex-config",
- "apex-context",
  "apex-core",
  "apex-eval",
- "apex-llm",
- "apex-memory",
- "apex-queue",
- "apex-tools",
+ "apex-infra",
  "async-trait",
  "rfbmq-core",
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
-]
-
-[[package]]
-name = "apex-config"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "tempfile",
- "toml",
-]
-
-[[package]]
-name = "apex-context"
-version = "0.1.0"
-dependencies = [
- "apex-core",
+ "uuid",
 ]
 
 [[package]]
 name = "apex-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -101,54 +83,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "apex-llm"
+name = "apex-infra"
 version = "0.1.0"
 dependencies = [
  "apex-core",
  "async-trait",
  "reqwest",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "apex-memory"
-version = "0.1.0"
-dependencies = [
- "apex-core",
- "async-trait",
+ "rfbmq-core",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
-]
-
-[[package]]
-name = "apex-queue"
-version = "0.1.0"
-dependencies = [
- "apex-core",
- "async-trait",
- "rfbmq-core",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "apex-tools"
-version = "0.1.0"
-dependencies = [
- "apex-config",
- "apex-core",
- "async-trait",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "uuid",
 ]
 
 [[package]]

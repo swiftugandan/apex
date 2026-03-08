@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use apex_context::MessageComposer;
+use apex_core::context::MessageComposer;
 use apex_core::domain::{
     MessageHeaders, MessageType, QueueMessage, ToolCall, ToolDef, ToolResult, ToolSchema,
 };
@@ -68,7 +68,6 @@ impl QueueToolRegistry {
             ));
         }
 
-        // Validate and collect subtask metadata first
         struct SubtaskInfo {
             description: String,
             acceptance_criteria: String,
@@ -101,7 +100,6 @@ impl QueueToolRegistry {
                 })
                 .unwrap_or_default();
 
-            // Validate indices
             for &dep_idx in &depends_on_indices {
                 if dep_idx >= subtasks.len() {
                     return Err(ToolError::InvalidInput(format!(
@@ -122,14 +120,12 @@ impl QueueToolRegistry {
             });
         }
 
-        // Push subtasks in order, resolving depends_on indices to message IDs
         let mut subtask_ids: Vec<String> = Vec::new();
 
         for info in &infos {
             let title = info.description.lines().next().unwrap_or(&info.description);
             let title = if title.len() > 80 { &title[..80] } else { title };
 
-            // Query long-term memory for relevant facts and skills
             let (facts, skill) = if let Some(ref store) = self.store {
                 let facts = store.query_facts(&info.description, 3).await.ok().unwrap_or_default();
                 let skill = store.find_skill(&info.description).await.ok().flatten();
@@ -184,7 +180,6 @@ impl QueueToolRegistry {
             subtask_ids.push(id);
         }
 
-        // Push continuation message that depends on all subtasks
         let continuation_body = MessageComposer::compose_continuation(
             &self.correlation_id,
             &self.parent_goal,

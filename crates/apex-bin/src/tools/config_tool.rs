@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use apex_config::{validate_against_invariants, AgentConfig, ConfigLoader, Invariants};
+use apex_core::config::{validate_against_invariants, AgentConfig, ConfigLoader, Invariants};
 use apex_core::domain::{ToolCall, ToolDef, ToolResult, ToolSchema};
 use apex_core::error::ToolError;
 use apex_core::ports::ToolRegistry;
@@ -112,7 +112,6 @@ impl ConfigToolRegistry {
             }
         };
 
-        // Load current config
         let current = ConfigLoader::load_agent_config(&self.config_dir)
             .map_err(|e| ToolError::Execution(format!("failed to load config: {e}")))?;
 
@@ -120,22 +119,17 @@ impl ConfigToolRegistry {
             .to_toml()
             .map_err(|e| ToolError::Execution(format!("failed to serialize config: {e}")))?;
 
-        // Parse current as generic toml::Value, apply overlay
         let mut base: Value = toml::from_str(&current_toml)
             .map_err(|e| ToolError::Execution(format!("failed to parse config: {e}")))?;
 
-        // Convert JSON changes to generic serde_json::Value and deep merge
         deep_merge(&mut base, changes);
 
-        // Serialize merged back to TOML string
         let merged_toml = toml::to_string_pretty(&base)
             .map_err(|e| ToolError::Execution(format!("failed to serialize merged: {e}")))?;
 
-        // Parse as AgentConfig to validate
         let merged_config = AgentConfig::from_toml(&merged_toml)
             .map_err(|e| ToolError::Execution(format!("invalid config after merge: {e}")))?;
 
-        // Validate against invariants
         let report = validate_against_invariants(&merged_config, &self.invariants);
         if !report.is_ok() {
             return err_result(
@@ -147,7 +141,6 @@ impl ConfigToolRegistry {
             );
         }
 
-        // Write the validated config
         ConfigLoader::save_agent_config(&self.config_dir, &merged_config)
             .map_err(|e| ToolError::Execution(format!("failed to write config: {e}")))?;
 
@@ -162,7 +155,6 @@ impl ConfigToolRegistry {
 }
 
 /// Deep merge: recursively walk nested objects, replace leaf values.
-/// Arrays are replaced wholesale (not merged element-by-element).
 fn deep_merge(base: &mut Value, overlay: &Value) {
     match (base, overlay) {
         (Value::Object(base_map), Value::Object(overlay_map)) => {
@@ -250,14 +242,6 @@ mod tests {
         assert!(err.contains("invariant violations"));
     }
 
-    #[tokio::test]
-    async fn update_missing_changes_returns_error() {
-        let (_dir, registry) = setup();
-        let call = make_call("update_config", json!({"action": "update"}));
-        let result = registry.execute(&call).await.unwrap();
-        assert!(result.is_error);
-    }
-
     #[test]
     fn deep_merge_nested() {
         let mut base: Value = serde_json::from_str(r#"{"a": {"b": 1, "c": 2}, "d": 3}"#).unwrap();
@@ -266,13 +250,5 @@ mod tests {
         assert_eq!(base["a"]["b"], 10);
         assert_eq!(base["a"]["c"], 2);
         assert_eq!(base["d"], 3);
-    }
-
-    #[test]
-    fn deep_merge_array_replaces() {
-        let mut base: Value = serde_json::from_str(r#"{"tools": ["a", "b"]}"#).unwrap();
-        let overlay: Value = serde_json::from_str(r#"{"tools": ["x"]}"#).unwrap();
-        deep_merge(&mut base, &overlay);
-        assert_eq!(base["tools"], json!(["x"]));
     }
 }

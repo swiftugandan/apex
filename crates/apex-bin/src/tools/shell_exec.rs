@@ -4,7 +4,7 @@ use serde_json::json;
 use std::time::Instant;
 use tokio::process::Command;
 
-use crate::spill::SpillManager;
+use super::spill::SpillManager;
 
 pub fn definition() -> ToolDef {
     ToolDef {

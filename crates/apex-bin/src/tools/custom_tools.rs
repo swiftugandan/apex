@@ -11,7 +11,7 @@ use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
-use crate::spill::SpillManager;
+use super::spill::SpillManager;
 
 // ── Manifest types ────────────────────────────────────────────────
 

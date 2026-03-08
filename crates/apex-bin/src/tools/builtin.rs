@@ -5,10 +5,10 @@ use apex_core::error::ToolError;
 use apex_core::ports::ToolRegistry;
 use async_trait::async_trait;
 
-use crate::file_read;
-use crate::file_write;
-use crate::shell_exec;
-use crate::spill::SpillManager;
+use super::file_read;
+use super::file_write;
+use super::shell_exec;
+use super::spill::SpillManager;
 
 pub struct BuiltinToolRegistry {
     spill: SpillManager,

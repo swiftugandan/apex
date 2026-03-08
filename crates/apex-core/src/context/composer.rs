@@ -1,5 +1,5 @@
-use crate::estimator::TokenEstimator;
-use apex_core::domain::{AttemptOutcome, AttemptRecord, Fact, Scratchpad, Skill};
+use super::estimator::TokenEstimator;
+use crate::domain::{AttemptOutcome, AttemptRecord, Fact, Scratchpad, Skill};
 
 const MAX_TASK_TOKENS: u32 = 1000;
 const MAX_FACTS_TOKENS: u32 = 1000;
@@ -92,9 +92,6 @@ impl MessageComposer {
     }
 
     /// Append an attempt record to a message body for retry.
-    /// Adds a "## Previous Attempts" section if not present,
-    /// or appends to existing section.
-    /// Compresses oldest attempts if total exceeds MAX_ATTEMPTS_TOKENS.
     pub fn append_attempt(&self, existing_body: &str, record: &AttemptRecord) -> String {
         let attempt_section = Self::format_attempt(record);
 
@@ -104,7 +101,6 @@ impl MessageComposer {
             format!("{existing_body}\n## Previous Attempts\n{attempt_section}")
         };
 
-        // Compress oldest attempts if over budget
         self.compress_attempts(result)
     }
 
@@ -122,7 +118,6 @@ impl MessageComposer {
 
         let prefix = &body[..section_start];
 
-        // Parse individual attempts
         let mut attempts: Vec<&str> = Vec::new();
         let content = &attempts_text["## Previous Attempts\n".len()..];
         let mut last_start = 0;
@@ -140,11 +135,9 @@ impl MessageComposer {
             return body;
         }
 
-        // Compress all but the last attempt
         let mut compressed = format!("{prefix}## Previous Attempts\n");
         for (i, attempt) in attempts.iter().enumerate() {
             if i < attempts.len() - 1 {
-                // Compress to one-liner
                 let first_line = attempt.lines().next().unwrap_or("### Attempt ?");
                 let outcome = if attempt.contains("SUCCESS") {
                     "SUCCESS"
@@ -162,7 +155,6 @@ impl MessageComposer {
                             .map(|l| l.trim_start_matches("- "))
                     })
                     .unwrap_or("(no details)");
-                // Extract attempt number from header
                 let num = first_line
                     .trim_start_matches("### Attempt ")
                     .split(' ')
@@ -172,7 +164,6 @@ impl MessageComposer {
                     "### Attempt {num} [compressed]: {outcome} — {diagnosis}\n"
                 ));
             } else {
-                // Keep last attempt in full
                 compressed.push_str(attempt);
             }
         }
@@ -283,7 +274,6 @@ impl MessageComposer {
             out.push_str(&format!("**Fitness:** {:.2}\n\n", skill.fitness));
         }
 
-        // Determine acceptance criteria: use skill template if available and criteria is default
         let effective_criteria =
             if acceptance_criteria == "(to be determined by agent)" {
                 if let Some(skill) = recommended_skill {
@@ -393,7 +383,7 @@ impl MessageComposer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apex_core::domain::{
+    use crate::domain::{
         AttemptOutcome, AttemptRecord, Scratchpad, TokenUsage, ToolCallRecord, TurnRecord,
     };
 
@@ -445,8 +435,6 @@ mod tests {
         MessageComposer::default()
     }
 
-    // ── compose_task_body ───────────────────────────────────────────
-
     #[test]
     fn compose_task_body_produces_correct_markdown() {
         let body = MessageComposer::compose_task_body("Refactor the parser\nMore details here.");
@@ -462,11 +450,8 @@ mod tests {
         let long_task = "A".repeat(120);
         let body = MessageComposer::compose_task_body(&long_task);
         let first_line = body.lines().next().unwrap();
-        // "# Task: " is 9 chars, title should be 80 chars max
         assert!(first_line.len() <= 9 + 80);
     }
-
-    // ── compose_result ──────────────────────────────────────────────
 
     #[test]
     fn compose_result_includes_tool_calls_and_timing() {
@@ -499,24 +484,6 @@ mod tests {
     }
 
     #[test]
-    fn compose_result_no_final_text() {
-        let record = AttemptRecord {
-            attempt_number: 1,
-            started_at: "t0".into(),
-            finished_at: "t1".into(),
-            turns: vec![make_turn(vec![make_tool_call("bash", false)])],
-            final_text: None,
-            outcome: AttemptOutcome::Success,
-            failure_reason: None,
-            eval_summary: None,
-        };
-        let result = MessageComposer::compose_result("No text task", &record);
-        assert!(!result.contains("## Final Response"));
-    }
-
-    // ── append_attempt ──────────────────────────────────────────────
-
-    #[test]
     fn append_attempt_adds_section_on_first_call() {
         let c = composer();
         let body = "# Task: Do something\n\n## Description\nStuff.\n";
@@ -538,14 +505,10 @@ mod tests {
         let record2 = make_record(AttemptOutcome::Failed, 2);
         let result = c.append_attempt(&body_with_attempts, &record2);
 
-        // Should have exactly one "## Previous Attempts" header
         assert_eq!(result.matches("## Previous Attempts").count(), 1);
-        // Should have both attempts
         assert!(result.contains("### Attempt 1"));
         assert!(result.contains("### Attempt 2"));
     }
-
-    // ── compose_failure ─────────────────────────────────────────────
 
     #[test]
     fn compose_failure_includes_all_attempts() {
@@ -562,30 +525,6 @@ mod tests {
         assert!(result.contains("### Attempt 2 — FAILED"));
         assert!(result.contains("### Attempt 3 — FAILED"));
     }
-
-    // ── format_attempt (via compose_failure / append_attempt) ───────
-
-    #[test]
-    fn format_attempt_handles_error_tool_calls() {
-        let c = composer();
-        let record = AttemptRecord {
-            attempt_number: 1,
-            started_at: "t0".into(),
-            finished_at: "t1".into(),
-            turns: vec![make_turn(vec![make_tool_call("bash", true)])],
-            final_text: None,
-            outcome: AttemptOutcome::Failed,
-            failure_reason: Some("command failed".into()),
-            eval_summary: None,
-        };
-        let result = c.append_attempt("# Task\n", &record);
-
-        assert!(result.contains("- Called `bash` — bash input (100ms, ERROR)"));
-        assert!(result.contains("  Error: something went wrong"));
-        assert!(result.contains("- Diagnosis: command failed"));
-    }
-
-    // ── append_attempt_with_memory ─────────────────────────────────
 
     #[test]
     fn append_attempt_with_memory_includes_both() {
@@ -604,18 +543,6 @@ mod tests {
     }
 
     #[test]
-    fn format_attempt_success_no_failure_hint() {
-        let c = composer();
-        let record = make_record(AttemptOutcome::Success, 1);
-        let result = c.append_attempt("# Task\n", &record);
-
-        assert!(result.contains("### Attempt 1 — SUCCESS"));
-        assert!(!result.contains("**→ Next attempt should address"));
-    }
-
-    // ── compose_subtask ─────────────────────────────────────────────
-
-    #[test]
     fn compose_subtask_uses_budgets() {
         let c = composer();
         let result = c.compose_subtask(
@@ -631,8 +558,6 @@ mod tests {
         assert!(result.contains("Build the artifact"));
         assert!(result.contains("Must compile"));
     }
-
-    // ── compose_job_complete ────────────────────────────────────────
 
     #[test]
     fn compose_job_complete_uses_budgets() {

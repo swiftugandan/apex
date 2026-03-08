@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use crate::agent::AgentConfig;
-use crate::invariants::Invariants;
+use super::agent::AgentConfig;
+use super::invariants::Invariants;
 
 /// A single validation issue.
 #[derive(Debug, Clone)]
@@ -167,8 +167,6 @@ pub fn validate_full(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::*;
-    use crate::invariants::*;
     use tempfile::TempDir;
 
     #[test]
