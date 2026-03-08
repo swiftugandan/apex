@@ -8,7 +8,7 @@ use apex_core::domain::{
 use apex_core::error::QueueError;
 use apex_core::ports::Queue;
 
-use rfbmq_core::{ClaimedMessage, Header, Message, Queue as RfbmqQueue};
+use rfbmq_core::{ClaimedMessage, Header, Message, MessageId, Queue as RfbmqQueue};
 
 pub struct RfbmqAdapter {
     queue: RfbmqQueue,
@@ -37,9 +37,17 @@ impl RfbmqAdapter {
 #[async_trait]
 impl Queue for RfbmqAdapter {
     async fn push(&self, msg: QueueMessage) -> Result<String, QueueError> {
+        let depends_on: Vec<MessageId> = msg
+            .headers
+            .depends_on
+            .iter()
+            .filter_map(|s| s.parse::<MessageId>().ok())
+            .collect();
+
         let mut rfbmq_msg = Message {
             header: Header {
                 correlation_id: Some(msg.headers.correlation_id.clone()),
+                depends_on,
                 custom: headers_to_custom(&msg.headers),
                 ..Header::default()
             },
@@ -55,31 +63,46 @@ impl Queue for RfbmqAdapter {
     }
 
     async fn pop(&self) -> Result<Option<ClaimedTask>, QueueError> {
-        let claimed = self
+        // Use dependency-aware list_ready to find messages whose deps are satisfied
+        let ready_ids = self
             .queue
-            .dequeue()
+            .list_ready()
             .map_err(|e| QueueError::Io(e.to_string()))?;
 
-        let claimed = match claimed {
-            Some(c) => c,
-            None => return Ok(None),
-        };
+        if ready_ids.is_empty() {
+            return Ok(None);
+        }
 
-        let rfbmq_msg =
-            Message::from_file(claimed.path()).map_err(|e| QueueError::Parse(e.to_string()))?;
+        // Try to claim the first available ready message
+        for ready_id in &ready_ids {
+            let claimed = self
+                .queue
+                .dequeue_id(ready_id)
+                .map_err(|e| QueueError::Io(e.to_string()))?;
 
-        let headers = custom_to_headers(
-            &rfbmq_msg.header.custom,
-            &rfbmq_msg.header.correlation_id,
-            rfbmq_msg.header.retry_count,
-        );
+            let claimed = match claimed {
+                Some(c) => c,
+                None => continue, // Another worker claimed it
+            };
 
-        Ok(Some(ClaimedTask {
-            id: claimed.id().to_string(),
-            claim_path: claimed.path().to_string_lossy().into_owned(),
-            headers,
-            body: rfbmq_msg.body,
-        }))
+            let rfbmq_msg = Message::from_file(claimed.path())
+                .map_err(|e| QueueError::Parse(e.to_string()))?;
+
+            let headers = custom_to_headers(
+                &rfbmq_msg.header.custom,
+                &rfbmq_msg.header.correlation_id,
+                rfbmq_msg.header.retry_count,
+            );
+
+            return Ok(Some(ClaimedTask {
+                id: claimed.id().to_string(),
+                claim_path: claimed.path().to_string_lossy().into_owned(),
+                headers,
+                body: rfbmq_msg.body,
+            }));
+        }
+
+        Ok(None)
     }
 
     async fn update_body(&self, claimed: &ClaimedTask, new_body: &str) -> Result<(), QueueError> {
@@ -155,11 +178,49 @@ impl Queue for RfbmqAdapter {
             lease_reaped: reaped,
         })
     }
+
+    async fn list_done(&self, correlation_id: &str) -> Result<Vec<String>, QueueError> {
+        let done_dir = self.queue.root().join("done");
+        if !done_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut result = Vec::new();
+        let entries =
+            std::fs::read_dir(&done_dir).map_err(|e| QueueError::Io(e.to_string()))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| QueueError::Io(e.to_string()))?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+
+            let msg = Message::from_file(&path).map_err(|e| QueueError::Parse(e.to_string()))?;
+            if msg.header.correlation_id.as_deref() == Some(correlation_id) {
+                if let Some(id) = msg.header.id {
+                    result.push(id.to_string());
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    async fn read_done_body(&self, id: &str) -> Result<String, QueueError> {
+        let done_path = self.queue.root().join("done").join(format!("{id}.md"));
+        let msg = Message::from_file(&done_path)
+            .map_err(|e| QueueError::NotFound(e.to_string()))?;
+        Ok(msg.body)
+    }
 }
 
 fn headers_to_custom(headers: &MessageHeaders) -> Vec<String> {
     let type_str = match headers.message_type {
         MessageType::Task => "task",
+        MessageType::Goal => "goal",
+        MessageType::Subtask => "subtask",
+        MessageType::Continuation => "continuation",
     };
     vec![
         format!("Type: {}", type_str),
@@ -183,9 +244,12 @@ fn custom_to_headers(
             let value = value.trim();
             match key {
                 "Type" => {
-                    if value == "task" {
-                        message_type = MessageType::Task;
-                    }
+                    message_type = match value {
+                        "goal" => MessageType::Goal,
+                        "subtask" => MessageType::Subtask,
+                        "continuation" => MessageType::Continuation,
+                        _ => MessageType::Task,
+                    };
                 }
                 "Depth" => {
                     if let Ok(d) = value.parse() {
@@ -207,6 +271,7 @@ fn custom_to_headers(
         correlation_id: correlation_id.clone().unwrap_or_default(),
         depth,
         retry_count: custom_retry.unwrap_or(retry_count),
+        depends_on: vec![],
     }
 }
 
@@ -222,6 +287,7 @@ mod tests {
                 correlation_id: "corr-001".to_string(),
                 depth: 0,
                 retry_count: 0,
+                depends_on: vec![],
             },
             body: body.to_string(),
         }
@@ -351,6 +417,7 @@ mod tests {
             correlation_id: "abc-123".to_string(),
             depth: 3,
             retry_count: 1,
+            depends_on: vec![],
         };
 
         let custom = headers_to_custom(&headers);

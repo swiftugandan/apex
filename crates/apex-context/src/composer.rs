@@ -1,3 +1,4 @@
+use crate::estimator::TokenEstimator;
 use apex_core::domain::{AttemptOutcome, AttemptRecord, Scratchpad};
 
 pub struct MessageComposer;
@@ -90,6 +91,68 @@ impl MessageComposer {
         for attempt in attempts {
             out.push_str(&Self::format_attempt(attempt));
             out.push('\n');
+        }
+
+        out
+    }
+
+    /// Compose a subtask message body with embedded parent context.
+    pub fn compose_subtask(
+        title: &str,
+        description: &str,
+        acceptance_criteria: &str,
+        parent_goal: &str,
+        parent_context: &str,
+    ) -> String {
+        let budgeted_goal = TokenEstimator::budget(parent_goal, 500);
+        let budgeted_context = TokenEstimator::budget(parent_context, 1000);
+
+        format!(
+            "# Subtask: {title}\n\n\
+             ## Parent Goal\n\
+             {budgeted_goal}\n\n\
+             ## Context\n\
+             {budgeted_context}\n\n\
+             ## Task\n\
+             {description}\n\n\
+             ## Acceptance Criteria\n\
+             {acceptance_criteria}\n"
+        )
+    }
+
+    /// Compose a continuation message body that triggers result assembly.
+    pub fn compose_continuation(
+        correlation_id: &str,
+        goal: &str,
+        subtask_ids: &[String],
+    ) -> String {
+        let ids = subtask_ids.join(", ");
+        format!(
+            "# Continuation: {correlation_id}\n\n\
+             ## Parent Goal\n\
+             {goal}\n\n\
+             ## Completed Subtask IDs\n\
+             {ids}\n\n\
+             ## Instructions\n\
+             Read subtask results with queue_read_done, assemble final deliverable.\n"
+        )
+    }
+
+    /// Compose a job-complete body summarizing all subtask results.
+    pub fn compose_job_complete(
+        title: &str,
+        subtask_results: &[(String, String)], // (id, body)
+    ) -> String {
+        let mut out = format!(
+            "# Result: {title}\n\n\
+             ## Outcome\n\
+             SUCCESS\n\n\
+             ## Subtask Results\n"
+        );
+
+        for (id, body) in subtask_results {
+            let summary = TokenEstimator::budget(body, 500);
+            out.push_str(&format!("### {id}\n{summary}\n\n"));
         }
 
         out

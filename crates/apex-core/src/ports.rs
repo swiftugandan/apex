@@ -41,6 +41,8 @@ pub trait Queue: Send + Sync {
     async fn nack(&self, claimed: &ClaimedTask) -> Result<(), QueueError>;
     async fn depth(&self) -> Result<QueueDepth, QueueError>;
     async fn reap(&self) -> Result<ReapResult, QueueError>;
+    async fn list_done(&self, correlation_id: &str) -> Result<Vec<String>, QueueError>;
+    async fn read_done_body(&self, id: &str) -> Result<String, QueueError>;
 }
 
 #[async_trait]

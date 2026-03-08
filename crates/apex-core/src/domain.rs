@@ -149,6 +149,9 @@ impl CompletionResponse {
 #[serde(rename_all = "lowercase")]
 pub enum MessageType {
     Task,
+    Goal,
+    Subtask,
+    Continuation,
 }
 
 /// Headers for apex queue messages (mapped to rfbmq custom headers).
@@ -158,6 +161,7 @@ pub struct MessageHeaders {
     pub correlation_id: String,
     pub depth: u32,
     pub retry_count: u32,
+    pub depends_on: Vec<String>,
 }
 
 /// A queue message with headers and markdown body.

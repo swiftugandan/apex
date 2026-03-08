@@ -29,6 +29,7 @@ dependencies = [
  "apex-queue",
  "apex-tools",
  "async-trait",
+ "rfbmq-core",
  "serde_json",
  "tokio",
 ]

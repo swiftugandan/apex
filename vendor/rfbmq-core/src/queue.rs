@@ -430,6 +430,42 @@ impl Queue {
         Ok(ready)
     }
 
+    /// Dequeue a specific message by its ID. Scans pending directories for a
+    /// filename containing the target ID and atomically renames it to processing/.
+    pub fn dequeue_id(&self, target: &MessageId) -> Result<Option<ClaimedMessage>> {
+        let processing_dir = self.root().join("processing");
+
+        for dir in &self.all_pending_dirs() {
+            let names = collect_md_files(dir)?;
+            for name in &names {
+                if let Some(id) = extract_id_from_pending(name) {
+                    if &id == target {
+                        let src = dir.join(name);
+                        let claim_name = format!("{}.{}.md", format_ts(Utc::now()), id);
+                        let dst = processing_dir.join(&claim_name);
+
+                        match fs::rename(&src, &dst) {
+                            Ok(()) => {
+                                fsync_dir(&processing_dir, self.fsync_mode())?;
+                                fsync_dir(dir, self.fsync_mode())?;
+                                return Ok(Some(ClaimedMessage::from_path(dst)?));
+                            }
+                            Err(e)
+                                if e.kind() == std::io::ErrorKind::NotFound
+                                    || e.kind() == std::io::ErrorKind::AlreadyExists =>
+                            {
+                                return Ok(None);
+                            }
+                            Err(e) => return Err(Error::Io(e)),
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────
 
     fn pending_dir_for(&self, priority: Priority) -> PathBuf {
