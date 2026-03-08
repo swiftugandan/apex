@@ -26,10 +26,6 @@ impl BuiltinToolRegistry {
             spill: SpillManager::new(scratch_dir),
         }
     }
-
-    pub fn spill_manager(&self) -> &SpillManager {
-        &self.spill
-    }
 }
 
 #[async_trait]

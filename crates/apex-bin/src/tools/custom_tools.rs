@@ -110,11 +110,6 @@ impl CustomToolRegistry {
         std::fs::write(&path, content).map_err(|e| format!("write manifest: {e}"))?;
         Ok(())
     }
-
-    /// List all registered custom tool entries.
-    pub async fn list_entries(&self) -> Vec<ManifestEntry> {
-        self.entries.read().await.clone()
-    }
 }
 
 // ── create_tool definition ────────────────────────────────────────

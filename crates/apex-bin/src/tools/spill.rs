@@ -141,6 +141,7 @@ impl SpillManager {
     }
 
     /// Delete a specific spill file.
+    #[allow(dead_code)] // Public API; used in tests and for future single-file cleanup
     pub fn delete(&self, spill_path: &str) -> io::Result<()> {
         std::fs::remove_file(spill_path)
     }
