@@ -7,7 +7,7 @@ pub struct AgentConfig {
     pub agent: AgentSection,
 
     #[serde(default)]
-    pub sub_agent: SubAgentSection,
+    pub roles: Vec<RoleProfile>,
 
     #[serde(default)]
     pub context_budget: ContextBudgetSection,
@@ -42,11 +42,54 @@ pub struct AgentSection {
     pub tools: Vec<String>,
 }
 
+/// A named role profile for sub-agent delegation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SubAgentSection {
-    /// Override model for sub-agents (None = use agent model).
+pub struct RoleProfile {
+    /// Unique role name (e.g. "coder", "reviewer").
+    pub name: String,
+
+    /// Persona filename in prompts/ directory. None = use parent's persona.
+    #[serde(default)]
+    pub persona: Option<String>,
+
+    /// LLM model override. None = use parent's model.
     #[serde(default)]
     pub model: Option<String>,
+
+    /// Tool names this role can use. Empty = all available.
+    #[serde(default)]
+    pub tools: Vec<String>,
+
+    /// Maximum subtask recursion depth for this role.
+    #[serde(default = "default_max_depth")]
+    pub max_depth: u32,
+
+    /// Maximum retries per task for this role.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+
+    /// Maximum concurrent workers for this role.
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: usize,
+
+    /// Memory sharing mode: shared (uses parent's long-term memory) or isolated.
+    #[serde(default)]
+    pub memory: MemoryMode,
+
+    /// Whether this role can spawn further sub-agents via delegate.
+    #[serde(default = "default_true")]
+    pub can_delegate: bool,
+}
+
+/// Controls how a sub-agent's long-term memory relates to the parent's.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryMode {
+    /// Sub-agent shares the parent's long-term memory store.
+    #[default]
+    Shared,
+    /// Sub-agent gets its own isolated memory store.
+    Isolated,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -124,7 +167,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             agent: AgentSection::default(),
-            sub_agent: SubAgentSection::default(),
+            roles: Vec::new(),
             context_budget: ContextBudgetSection::default(),
             consolidation: ConsolidationSection::default(),
             fitness: FitnessSection::default(),
@@ -140,14 +183,6 @@ impl Default for AgentSection {
             max_depth: default_max_depth(),
             max_retries: default_max_retries(),
             tools: vec![],
-        }
-    }
-}
-
-impl Default for SubAgentSection {
-    fn default() -> Self {
-        Self {
-            model: None,
         }
     }
 }
@@ -215,6 +250,6 @@ max_depth = 5
         assert_eq!(config.agent.max_depth, 5);
         assert_eq!(config.agent.max_concurrent, 1); // default
         assert_eq!(config.agent.max_retries, 3); // default
-        assert!(config.sub_agent.model.is_none()); // default
+        assert!(config.roles.is_empty()); // default
     }
 }

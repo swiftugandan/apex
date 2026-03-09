@@ -28,6 +28,10 @@ pub struct InvariantLimits {
     /// Maximum retries per task.
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
+
+    /// Maximum nesting depth for sub-agent delegation.
+    #[serde(default = "default_max_sub_agent_depth")]
+    pub max_sub_agent_depth: u32,
 }
 
 fn default_max_depth() -> u32 {
@@ -45,6 +49,9 @@ fn default_max_body_tokens() -> usize {
 fn default_max_retries() -> u32 {
     10
 }
+fn default_max_sub_agent_depth() -> u32 {
+    2
+}
 
 impl Default for InvariantLimits {
     fn default() -> Self {
@@ -54,6 +61,7 @@ impl Default for InvariantLimits {
             max_tools: default_max_tools(),
             max_body_tokens: default_max_body_tokens(),
             max_retries: default_max_retries(),
+            max_sub_agent_depth: default_max_sub_agent_depth(),
         }
     }
 }

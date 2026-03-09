@@ -136,7 +136,81 @@ pub fn validate_full(
         });
     }
 
+    // Validate role profiles
+    validate_roles(config, invariants, prompts_dir, &mut report);
+
     report
+}
+
+/// Validate role profiles: unique names, persona files exist, constraints within ceilings.
+fn validate_roles(
+    config: &AgentConfig,
+    invariants: &Invariants,
+    prompts_dir: &Path,
+    report: &mut ValidationReport,
+) {
+    let mut seen_names = std::collections::HashSet::new();
+
+    for (idx, role) in config.roles.iter().enumerate() {
+        let field_prefix = format!("roles[{}]", idx);
+
+        // Check unique name
+        if !seen_names.insert(&role.name) {
+            report.issues.push(ValidationIssue {
+                field: format!("{field_prefix}.name"),
+                message: format!("duplicate role name '{}'", role.name),
+                severity: IssueSeverity::Error,
+            });
+        }
+
+        // Check persona file exists if specified
+        if let Some(ref persona) = role.persona {
+            let persona_path = prompts_dir.join(persona);
+            if !persona_path.exists() {
+                report.issues.push(ValidationIssue {
+                    field: format!("{field_prefix}.persona"),
+                    message: format!("persona file '{}' not found", persona),
+                    severity: IssueSeverity::Error,
+                });
+            }
+        }
+
+        // Check max_depth doesn't exceed invariant ceiling
+        if role.max_depth > invariants.limits.max_depth {
+            report.issues.push(ValidationIssue {
+                field: format!("{field_prefix}.max_depth"),
+                message: format!(
+                    "value {} exceeds invariant ceiling of {}",
+                    role.max_depth, invariants.limits.max_depth
+                ),
+                severity: IssueSeverity::Error,
+            });
+        }
+
+        // Check max_retries doesn't exceed invariant ceiling
+        if role.max_retries > invariants.limits.max_retries {
+            report.issues.push(ValidationIssue {
+                field: format!("{field_prefix}.max_retries"),
+                message: format!(
+                    "value {} exceeds invariant ceiling of {}",
+                    role.max_retries, invariants.limits.max_retries
+                ),
+                severity: IssueSeverity::Error,
+            });
+        }
+
+        // Check max_concurrent doesn't exceed invariant ceiling
+        if role.max_concurrent > invariants.limits.max_concurrent {
+            report.issues.push(ValidationIssue {
+                field: format!("{field_prefix}.max_concurrent"),
+                message: format!(
+                    "value {} exceeds invariant ceiling of {}",
+                    role.max_concurrent, invariants.limits.max_concurrent
+                ),
+                severity: IssueSeverity::Error,
+            });
+        }
+    }
 }
 
 #[cfg(test)]

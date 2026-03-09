@@ -1,8 +1,5 @@
-mod agent;
-mod tools;
-
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -12,47 +9,12 @@ use serde::Deserialize;
 use apex_core::config::{ConfigLoader, validate_full};
 use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{MessageHeaders, MessageType, QueueMessage};
-use apex_core::ports::{LlmProvider, Queue, WorkingMemory};
+use apex_core::ports::{MemoryStore, Queue, WorkingMemory};
+use apex_engine::{
+    InProcessSpawner, ProjectPaths, WorkerContext, build_static_tools, worker_loop,
+};
 use apex_infra::{AnthropicProvider, FsScratchpadStore, RfbmqAdapter, SqliteMemoryStore};
-
-use crate::agent::WorkerContext;
-use crate::tools::spill::SpillManager;
-
-// ── Path resolution ────────────────────────────────────────────────
-
-struct ApexPaths {
-    root: PathBuf,
-    prompts_dir: PathBuf,
-    queue_dir: PathBuf,
-    memory_dir: PathBuf,
-    long_term_memory_dir: PathBuf,
-    scratch_dir: PathBuf,
-    tools_dir: PathBuf,
-    config_dir: PathBuf,
-}
-
-impl ApexPaths {
-    fn resolve() -> Result<Self> {
-        let root = std::env::var("APEX_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-        Ok(Self {
-            prompts_dir: root.join("prompts"),
-            queue_dir: root.join("queues").join("work"),
-            memory_dir: root.join("memory").join("working"),
-            long_term_memory_dir: root.join("memory").join("long-term"),
-            scratch_dir: root.join("scratch"),
-            tools_dir: root.join("tools"),
-            config_dir: root.join("config"),
-            root,
-        })
-    }
-
-    fn long_term_db_path(&self) -> PathBuf {
-        self.long_term_memory_dir.join("memory.db")
-    }
-}
+use apex_tools::spill::SpillManager;
 
 // ── CLI ────────────────────────────────────────────────────────────
 
@@ -142,25 +104,8 @@ async fn main() -> Result<()> {
 // ── Commands ───────────────────────────────────────────────────────
 
 async fn cmd_init() -> Result<()> {
-    let paths = ApexPaths::resolve()?;
-
-    std::fs::create_dir_all(paths.queue_dir.parent().unwrap())
-        .context("failed to create queues/ directory")?;
-
-    std::fs::create_dir_all(&paths.memory_dir)
-        .context("failed to create memory/working/ directory")?;
-
-    std::fs::create_dir_all(&paths.long_term_memory_dir)
-        .context("failed to create memory/long-term/ directory")?;
-
-    std::fs::create_dir_all(&paths.scratch_dir)
-        .context("failed to create scratch/ directory")?;
-
-    std::fs::create_dir_all(paths.tools_dir.join("custom"))
-        .context("failed to create tools/custom/ directory")?;
-
-    std::fs::create_dir_all(&paths.config_dir)
-        .context("failed to create config/ directory")?;
+    let paths = ProjectPaths::resolve()?;
+    paths.create_dirs()?;
 
     let manifest_path = paths.tools_dir.join("manifest.toml");
     if !manifest_path.exists() {
@@ -171,16 +116,14 @@ async fn cmd_init() -> Result<()> {
     ConfigLoader::write_default_invariants(&paths.config_dir)?;
     ConfigLoader::write_default_agent_config(&paths.config_dir)?;
 
-    std::fs::create_dir_all(&paths.prompts_dir)
-        .context("failed to create prompts/ directory")?;
     write_default_prompts(&paths.prompts_dir)?;
 
-    RfbmqAdapter::init(&paths.queue_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    RfbmqAdapter::init(&paths.work_queue).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     eprintln!("✓ Initialized apex at {}", paths.root.display());
-    eprintln!("  queue:    {}", paths.queue_dir.display());
-    eprintln!("  memory:   {}", paths.memory_dir.display());
-    eprintln!("  long-term: {}", paths.long_term_memory_dir.display());
+    eprintln!("  queue:    {}", paths.work_queue.display());
+    eprintln!("  memory:   {}", paths.working_memory.display());
+    eprintln!("  long-term: {}", paths.long_term_dir.display());
     eprintln!("  scratch:  {}", paths.scratch_dir.display());
     eprintln!("  tools:    {}", paths.tools_dir.display());
     eprintln!("  config:   {}", paths.config_dir.display());
@@ -189,7 +132,7 @@ async fn cmd_init() -> Result<()> {
 }
 
 async fn cmd_run(task: String) -> Result<()> {
-    let paths = ApexPaths::resolve()?;
+    let paths = ProjectPaths::resolve()?;
     let adapter = open_queue(&paths)?;
 
     // Drain stale pending messages from previous runs
@@ -241,13 +184,13 @@ async fn drain_pending(adapter: &RfbmqAdapter) -> Result<u32> {
 }
 
 async fn cmd_work() -> Result<()> {
-    let paths = ApexPaths::resolve()?;
+    let paths = ProjectPaths::resolve()?;
     let adapter = open_queue(&paths)?;
     process_queue(&paths, Arc::new(adapter)).await
 }
 
 async fn cmd_queue_depth() -> Result<()> {
-    let paths = ApexPaths::resolve()?;
+    let paths = ProjectPaths::resolve()?;
     let adapter = open_queue(&paths)?;
 
     let d = adapter
@@ -260,7 +203,7 @@ async fn cmd_queue_depth() -> Result<()> {
 }
 
 async fn cmd_queue_reap() -> Result<()> {
-    let paths = ApexPaths::resolve()?;
+    let paths = ProjectPaths::resolve()?;
     let adapter = open_queue(&paths)?;
 
     let result = adapter
@@ -292,7 +235,7 @@ async fn cmd_cat(path: &str) -> Result<()> {
 }
 
 async fn cmd_status() -> Result<()> {
-    let paths = ApexPaths::resolve()?;
+    let paths = ProjectPaths::resolve()?;
     let adapter = open_queue(&paths)?;
 
     let dirs = ["pending", "processing", "done", "failed"];
@@ -361,22 +304,20 @@ You have a per-job scratchpad for tracking multi-step task progress. Use it when
 - Use `working_memory_update` to record subtasks, update their status, and add notes about discoveries.
 - The scratchpad persists across retries — if this is a retry, check working memory first.
 
-## Sub-Agents
+## Delegation
 
-You can spawn sub-agents with `agent` to get independent perspectives on your work.
+You can delegate tasks to sub-agents using the `delegate` tool. Sub-agents run with their own persona and tool access. Delegation is blocking.
 
-- Use `agent` with a verifier persona to independently check your work before completing a task
-- Sub-agents have their own tool access (you specify which tools they get)
-- Available sub-agent tools: `shell_exec`, `file_read`, `file_write`
-- Sub-agents cannot spawn their own sub-agents (no recursion)
+### Named roles (from config)
+- `delegate(role="coder", task="Implement module X")`
+- `delegate(role="reviewer", task="Review this code")`
 
-## Verification
+### Ad-hoc roles (inline)
+- `delegate(system_prompt="You are a verifier...", task="Check this work", tools=["shell_exec", "file_read"])`
 
-Before completing a task, spawn a verification sub-agent to independently check your work:
+### Verification
 
-1. Call `agent` with a verifier system prompt and your work summary as the task
-2. Give it `["shell_exec", "file_read"]` tools so it can run tests and inspect files
-3. If the verifier finds issues, fix them and verify again
+Before completing a task, delegate to a reviewer or verifier to independently check your work.
 
 ## Task Decomposition
 
@@ -398,18 +339,18 @@ You can decompose complex goals into independent subtasks that run in parallel.
 
 // ── Queue helpers ──────────────────────────────────────────────────
 
-fn open_queue(paths: &ApexPaths) -> Result<RfbmqAdapter> {
-    RfbmqAdapter::open(&paths.queue_dir).map_err(|e| {
+fn open_queue(paths: &ProjectPaths) -> Result<RfbmqAdapter> {
+    RfbmqAdapter::open(&paths.work_queue).map_err(|e| {
         anyhow::anyhow!(
             "failed to open queue at {}. Run 'apex init' first. Error: {e}",
-            paths.queue_dir.display()
+            paths.work_queue.display()
         )
     })
 }
 
 // ── Queue processing loop ──────────────────────────────────────────
 
-async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<()> {
+async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Result<()> {
     let persona_path = paths.prompts_dir.join("agent.md");
     let persona =
         std::fs::read_to_string(&persona_path).context("failed to read prompts/agent.md")?;
@@ -421,28 +362,19 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
     let max_depth = agent_config.agent.max_depth;
     let max_retries = agent_config.agent.max_retries;
     let max_tool_result_bytes = agent_config.context_budget.max_tool_result_tokens * 4;
+    let remaining_delegate_depth = invariants.limits.max_sub_agent_depth;
+    let roles = agent_config.roles.clone();
 
-    let llm = Arc::new(
+    let llm: Arc<dyn apex_core::ports::LlmProvider> = Arc::new(
         AnthropicProvider::from_env_with_model(&agent_config.agent.model)
             .context("failed to create LLM provider")?
     );
 
-    // Use sub-agent model if configured, otherwise main LLM
-    let sub_agent_llm: Arc<dyn LlmProvider> =
-        if let Some(ref sub_model) = agent_config.sub_agent.model {
-            Arc::new(
-                AnthropicProvider::from_env_with_model(sub_model)
-                    .context("failed to create sub-agent LLM provider")?
-            )
-        } else {
-            llm.clone()
-        };
-
     let memory: Arc<dyn WorkingMemory> =
-        Arc::new(FsScratchpadStore::new(paths.memory_dir.clone()));
+        Arc::new(FsScratchpadStore::new(paths.working_memory.clone()));
 
-    let long_term: Arc<dyn apex_core::ports::MemoryStore> = Arc::new(
-        SqliteMemoryStore::open(&paths.long_term_db_path())
+    let long_term: Arc<dyn MemoryStore> = Arc::new(
+        SqliteMemoryStore::open(&paths.long_term_db())
             .context("failed to open long-term memory database")?,
     );
 
@@ -450,21 +382,48 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
     let estimator = Arc::new(Mutex::new(TokenEstimator::new(calibration)));
 
     let invariants = Arc::new(invariants);
-    let static_tools = agent::build_static_tools(
-        paths.scratch_dir.clone(),
-        paths.tools_dir.clone(),
-        paths.config_dir.clone(),
+
+    // Build the SubAgentSpawner with factory closures for infra creation
+    let spawner: Arc<dyn apex_tools::SubAgentSpawner> = Arc::new(InProcessSpawner {
+        project_paths: paths.clone(),
+        parent_long_term: long_term.clone(),
+        llm: llm.clone(),
+        estimator: estimator.clone(),
+        invariants: Arc::clone(&invariants),
+        roles: roles.clone(),
+        max_tool_result_bytes,
+        remaining_delegate_depth,
+        queue_factory: Arc::new(|path| {
+            RfbmqAdapter::init(path)
+                .map(|a| Arc::new(a) as Arc<dyn Queue>)
+                .map_err(|e| e.to_string())
+        }),
+        working_memory_factory: Arc::new(|path| {
+            Arc::new(FsScratchpadStore::new(path.to_path_buf())) as Arc<dyn WorkingMemory>
+        }),
+        memory_store_factory: Arc::new(|path| {
+            SqliteMemoryStore::open(path)
+                .map(|s| Arc::new(s) as Arc<dyn MemoryStore>)
+                .map_err(|e| e.to_string())
+        }),
+    });
+
+    let static_tools = build_static_tools(
+        paths,
         memory.clone(),
         long_term.clone(),
         Arc::clone(&invariants),
-        sub_agent_llm,
-        estimator.clone(),
+        spawner,
         max_tool_result_bytes,
+        roles,
+        remaining_delegate_depth,
     );
 
+    let queue: Arc<dyn Queue> = adapter.clone();
+
     let ctx = WorkerContext {
-        adapter: adapter.clone(),
-        static_tools,
+        queue,
+        tools: static_tools,
         llm,
         memory,
         long_term,
@@ -476,13 +435,13 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
     };
 
     if max_concurrent <= 1 {
-        agent::worker_loop(ctx, 0).await
+        worker_loop(ctx, 0).await
     } else {
         let mut handles = Vec::new();
         for worker_id in 0..max_concurrent {
             let worker_ctx = ctx.clone();
             handles.push(tokio::spawn(async move {
-                agent::worker_loop(worker_ctx, worker_id as usize).await
+                worker_loop(worker_ctx, worker_id as usize).await
             }));
         }
 
@@ -495,14 +454,13 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
 
 // ── CLI memory commands ───────────────────────────────────────────
 
-/// Open the long-term memory store and run the given closure. Single place that opens the DB
-/// for memory subcommands.
-async fn with_memory_store<F, Fut>(paths: &ApexPaths, f: F) -> Result<()>
+/// Open the long-term memory store and run the given closure.
+async fn with_memory_store<F, Fut>(paths: &ProjectPaths, f: F) -> Result<()>
 where
     F: FnOnce(SqliteMemoryStore) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let db_path = paths.long_term_db_path();
+    let db_path = paths.long_term_db();
     if !db_path.exists() {
         bail!("no long-term memory database found. Run 'apex init' first.");
     }
@@ -511,7 +469,7 @@ where
 }
 
 async fn cmd_memory_facts() -> Result<()> {
-    let paths = ApexPaths::resolve()?;
+    let paths = ProjectPaths::resolve()?;
     with_memory_store(&paths, |store| async move {
         use apex_core::ports::MemoryStore;
         let facts = store.query_facts("", 100).await?;
@@ -547,7 +505,7 @@ async fn cmd_memory_facts() -> Result<()> {
 }
 
 async fn cmd_memory_skills() -> Result<()> {
-    let paths = ApexPaths::resolve()?;
+    let paths = ProjectPaths::resolve()?;
     with_memory_store(&paths, |store| async move {
         use apex_core::ports::MemoryStore;
         let skills = store.list_skills(100).await?;
@@ -578,7 +536,7 @@ async fn cmd_memory_skills() -> Result<()> {
 }
 
 async fn cmd_memory_strategies() -> Result<()> {
-    let paths = ApexPaths::resolve()?;
+    let paths = ProjectPaths::resolve()?;
     with_memory_store(&paths, |store| async move {
         use apex_core::ports::MemoryStore;
         let strategies = store.list_strategies(100).await?;
@@ -611,7 +569,7 @@ async fn cmd_memory_strategies() -> Result<()> {
 // ── Scratch and calibration CLI commands ───────────────────────────
 
 async fn cmd_scratch_ls() -> Result<()> {
-    let paths = ApexPaths::resolve()?;
+    let paths = ProjectPaths::resolve()?;
     let spill = SpillManager::new(paths.scratch_dir);
     let entries = spill.list().map_err(|e| anyhow::anyhow!("failed to list scratch: {e}"))?;
 
@@ -633,7 +591,7 @@ async fn cmd_scratch_ls() -> Result<()> {
 }
 
 async fn cmd_tools_list() -> Result<()> {
-    let paths = ApexPaths::resolve()?;
+    let paths = ProjectPaths::resolve()?;
     let manifest_path = paths.tools_dir.join("manifest.toml");
 
     if !manifest_path.exists() {
@@ -677,7 +635,7 @@ async fn cmd_tools_list() -> Result<()> {
 }
 
 async fn cmd_memory_calibration() -> Result<()> {
-    let paths = ApexPaths::resolve()?;
+    let paths = ProjectPaths::resolve()?;
     with_memory_store(&paths, |store| async move {
         use apex_core::ports::MemoryStore;
         let cal = store.load_calibration().await?;
@@ -694,7 +652,7 @@ async fn cmd_memory_calibration() -> Result<()> {
 // ── Config commands ────────────────────────────────────────────────
 
 async fn cmd_config_show() -> Result<()> {
-    let paths = ApexPaths::resolve()?;
+    let paths = ProjectPaths::resolve()?;
     let config = ConfigLoader::load_agent_config(&paths.config_dir)?;
     let toml_str = config.to_toml()?;
     println!("{toml_str}");
@@ -702,7 +660,7 @@ async fn cmd_config_show() -> Result<()> {
 }
 
 async fn cmd_config_invariants() -> Result<()> {
-    let paths = ApexPaths::resolve()?;
+    let paths = ProjectPaths::resolve()?;
     let invariants = ConfigLoader::load_invariants(&paths.config_dir)?;
     let toml_str = invariants.to_toml()?;
     println!("{toml_str}");
@@ -710,7 +668,7 @@ async fn cmd_config_invariants() -> Result<()> {
 }
 
 async fn cmd_validate() -> Result<()> {
-    let paths = ApexPaths::resolve()?;
+    let paths = ProjectPaths::resolve()?;
     let invariants = ConfigLoader::load_invariants(&paths.config_dir)?;
     let config = ConfigLoader::load_agent_config(&paths.config_dir)?;
     let report = validate_full(&config, &invariants, &paths.prompts_dir);

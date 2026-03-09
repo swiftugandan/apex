@@ -1,25 +1,18 @@
 [package]
-name = "apex-bin"
+name = "apex-tools"
 version.workspace = true
 edition.workspace = true
 
-[[bin]]
-name = "apex"
-path = "src/main.rs"
-
 [dependencies]
 apex-core = { path = "../apex-core" }
-apex-engine = { path = "../apex-engine" }
-apex-tools = { path = "../apex-tools" }
-apex-infra = { path = "../apex-infra" }
-rfbmq-core = { path = "../../vendor/rfbmq-core" }
-anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+anyhow.workspace = true
 toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
+apex-infra = { path = "../apex-infra" }

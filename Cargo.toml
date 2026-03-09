@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/apex-core",
+    "crates/apex-tools",
+    "crates/apex-engine",
     "crates/apex-infra",
     "crates/apex-bin",
 ]
