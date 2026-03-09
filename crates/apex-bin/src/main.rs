@@ -142,7 +142,7 @@ async fn cmd_run(task: String) -> Result<()> {
         eprintln!("⚠ Drained {drained} stale pending message(s) from previous runs");
     }
 
-    let correlation_id = format!("job-{}", &uuid_v4()[..8]);
+    let correlation_id = apex_core::generate_id("job");
     let body = MessageComposer::compose_task_body(&task);
 
     let msg = QueueMessage {
@@ -371,7 +371,6 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         long_term.clone(),
         Arc::clone(&invariants),
         spawner,
-        max_tool_result_bytes,
         roles,
         remaining_delegate_depth,
     );
@@ -411,6 +410,10 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
 
 // ── CLI memory commands ───────────────────────────────────────────
 
+fn short_id(id: &str, max: usize) -> &str {
+    if id.len() > max { &id[..max] } else { id }
+}
+
 /// Open the long-term memory store and run the given closure.
 async fn with_memory_store<F, Fut>(paths: &ProjectPaths, f: F) -> Result<()>
 where
@@ -440,11 +443,7 @@ async fn cmd_memory_facts() -> Result<()> {
             "ID", "Content", "Confidence", "Tags"
         );
         for f in &facts {
-            let short_id = if f.id.0.len() > 18 {
-                &f.id.0[..18]
-            } else {
-                &f.id.0
-            };
+            let short_id = short_id(&f.id.0, 18);
             let content = if f.content.len() > 48 {
                 format!("{}…", apex_core::truncate_str(&f.content, 47))
             } else {
@@ -476,7 +475,7 @@ async fn cmd_memory_skills() -> Result<()> {
             "ID", "Pattern", "Fitness", "Success", "Failure"
         );
         for s in &skills {
-            let short_id = if s.id.0.len() > 18 { &s.id.0[..18] } else { &s.id.0 };
+            let short_id = short_id(&s.id.0, 18);
             let short_pattern = if s.task_pattern.len() > 38 {
                 format!("{}…", apex_core::truncate_str(&s.task_pattern, 37))
             } else {
@@ -507,7 +506,7 @@ async fn cmd_memory_strategies() -> Result<()> {
             "ID", "Goal Pattern", "Fitness", "Avg Subtasks", "Success", "Failure"
         );
         for s in &strategies {
-            let short_id = if s.id.0.len() > 18 { &s.id.0[..18] } else { &s.id.0 };
+            let short_id = short_id(&s.id.0, 18);
             let short_pattern = if s.goal_pattern.len() > 38 {
                 format!("{}…", apex_core::truncate_str(&s.goal_pattern, 37))
             } else {
@@ -640,14 +639,3 @@ async fn cmd_validate() -> Result<()> {
     }
 }
 
-// ── Utilities ──────────────────────────────────────────────────────
-
-fn uuid_v4() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pid = std::process::id();
-    format!("{:016x}{:08x}", t, pid)
-}

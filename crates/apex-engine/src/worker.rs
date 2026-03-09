@@ -14,7 +14,7 @@ use apex_tools::QueueToolRegistry;
 use crate::agentic_loop::{run_agentic_loop, LoopConfig};
 use crate::consolidation::consolidate_learnings;
 use crate::registry::{ApexToolRegistry, CompositeToolRegistry};
-use crate::util::{composer_from_estimator, extract_title, now_iso};
+use crate::util::{composer_from_estimator, extract_title, now_unix_ts};
 
 // ── WorkerContext ───────────────────────────────────────────────────
 
@@ -83,12 +83,13 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
 
         // Build per-claim tool registry (static tools + queue tools)
         let composer = composer_from_estimator(&ctx.estimator).await;
+        let title = extract_title(&claimed.body);
         let queue_tools = QueueToolRegistry::new(
             Arc::clone(&ctx.queue),
             claimed.headers.correlation_id.clone(),
             claimed.headers.depth,
             ctx.max_depth,
-            extract_title(&claimed.body),
+            title.clone(),
             claimed.body.clone(),
             Some(Arc::clone(&ctx.long_term)),
             composer,
@@ -103,7 +104,6 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
 
         match result {
             Ok(record) => {
-                let title = extract_title(&claimed.body);
                 let result_body = MessageComposer::compose_result(&title, &record);
                 ctx.queue
                     .update_body(&claimed, &result_body)
@@ -137,7 +137,7 @@ async fn execute_claim(
     claimed: &ClaimedTask,
     tools: &dyn ToolRegistry,
 ) -> std::result::Result<AttemptRecord, (AttemptRecord, String, apex_core::domain::Scratchpad)> {
-    let started_at = now_iso();
+    let started_at = now_unix_ts();
     let job_id = &claimed.headers.correlation_id;
 
     let mut scratchpad = ctx
@@ -192,7 +192,7 @@ async fn execute_claim(
             let record = AttemptRecord {
                 attempt_number: claimed.headers.retry_count + 1,
                 started_at,
-                finished_at: now_iso(),
+                finished_at: now_unix_ts(),
                 turns,
                 final_text: None,
                 outcome: AttemptOutcome::Failed,
@@ -213,7 +213,7 @@ async fn execute_claim(
     let record = AttemptRecord {
         attempt_number: claimed.headers.retry_count + 1,
         started_at,
-        finished_at: now_iso(),
+        finished_at: now_unix_ts(),
         turns,
         final_text,
         outcome: AttemptOutcome::Success,

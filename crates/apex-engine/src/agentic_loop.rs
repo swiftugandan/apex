@@ -10,7 +10,7 @@ use apex_core::domain::{
 };
 use apex_core::ports::{LlmProvider, ToolRegistry, WorkingMemory};
 
-use crate::util::summarize_json;
+use apex_core::summarize_json;
 
 const MAX_TURNS: usize = 32;
 const MAX_TOKENS: u32 = 8192;
@@ -41,6 +41,7 @@ pub async fn run_agentic_loop(
     let mut final_text: Option<String> = None;
     let deadline = config.timeout.map(|d| Instant::now() + d);
     let schemas = config.tools.schemas();
+    let system_prompt = config.persona.to_string();
 
     for turn_num in 0..MAX_TURNS {
         // Check cancellation and timeout before each turn
@@ -58,7 +59,7 @@ pub async fn run_agentic_loop(
         }
 
         let req = CompletionRequest {
-            system_prompt: config.persona.to_string(),
+            system_prompt: system_prompt.clone(),
             messages: messages.clone(),
             max_tokens: MAX_TOKENS,
             temperature: Some(0.2),

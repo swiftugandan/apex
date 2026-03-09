@@ -117,7 +117,6 @@ pub fn build_static_tools(
     long_term: Arc<dyn MemoryStore>,
     invariants: Arc<Invariants>,
     spawner: Arc<dyn SubAgentSpawner>,
-    _max_tool_result_bytes: usize,
     roles: Vec<RoleProfile>,
     remaining_delegate_depth: u32,
 ) -> Arc<CompositeToolRegistry> {

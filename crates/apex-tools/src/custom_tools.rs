@@ -544,12 +544,7 @@ fn error_result(call: &ToolCall, msg: &str, start: Instant) -> ToolResult {
 }
 
 fn now_iso() -> String {
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = d.as_secs();
-    // Simple ISO-ish timestamp without chrono dependency
-    format!("{secs}")
+    apex_core::now_unix_ts()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────

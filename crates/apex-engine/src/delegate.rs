@@ -50,24 +50,16 @@ impl SubAgentSpawner for InProcessSpawner {
         role: &RoleProfile,
         persona: &str,
     ) -> Result<SubAgentResult, ToolError> {
-        let short_uuid = {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let t = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let pid = std::process::id();
-            format!("{:08x}{:04x}", (t & 0xFFFF_FFFF) as u32, (pid & 0xFFFF) as u32)
-        };
+        let short_uuid = apex_core::generate_id(&role.name);
 
         // 1. Create ephemeral queue
-        let sub_queue_dir = self.project_paths.queues_dir.join(format!("sub-{}-{}", role.name, short_uuid));
+        let sub_queue_dir = self.project_paths.queues_dir.join(format!("sub-{}", short_uuid));
         let sub_queue = (self.infra.queue)(&sub_queue_dir)
             .map_err(|e| ToolError::Execution(format!("failed to create sub-agent queue: {e}")))?;
 
         // 2. Create ephemeral working memory directory
         let sub_memory_dir = self.project_paths.working_memory.join(format!("sub-{}", short_uuid));
-        std::fs::create_dir_all(&sub_memory_dir)
+        tokio::fs::create_dir_all(&sub_memory_dir).await
             .map_err(|e| ToolError::Execution(format!("failed to create sub-agent memory dir: {e}")))?;
         let sub_memory = (self.infra.working_memory)(&sub_memory_dir);
 
@@ -114,26 +106,21 @@ impl SubAgentSpawner for InProcessSpawner {
             sub_long_term.clone(),
             Arc::clone(&self.config.invariants),
             sub_spawner,
-            self.config.max_tool_result_bytes,
             self.config.roles.clone(),
             sub_depth,
         );
 
-        // 7. Apply tool filtering if the role specifies a tools list
-        let filtered_static_tools: Arc<CompositeToolRegistry> = if !role.tools.is_empty() {
-            let mut allowed: HashSet<String> = role.tools.iter().cloned().collect();
+        // 7. Apply tool filtering if the role restricts tools or delegation
+        let needs_filtering = !role.tools.is_empty() || !role.can_delegate;
+        let filtered_static_tools: Arc<CompositeToolRegistry> = if needs_filtering {
+            let mut allowed: HashSet<String> = if !role.tools.is_empty() {
+                role.tools.iter().cloned().collect()
+            } else {
+                sub_static_tools.definitions().iter().map(|d| d.schema.name.clone()).collect()
+            };
             if !role.can_delegate {
                 allowed.remove("delegate");
             }
-            let filtered = OwnedFilteredToolRegistry::new(sub_static_tools, allowed);
-            Arc::new(CompositeToolRegistry::new(vec![Box::new(filtered)]))
-        } else if !role.can_delegate {
-            let mut allowed: HashSet<String> = sub_static_tools
-                .definitions()
-                .iter()
-                .map(|d| d.schema.name.clone())
-                .collect();
-            allowed.remove("delegate");
             let filtered = OwnedFilteredToolRegistry::new(sub_static_tools, allowed);
             Arc::new(CompositeToolRegistry::new(vec![Box::new(filtered)]))
         } else {
@@ -201,7 +188,7 @@ impl SubAgentSpawner for InProcessSpawner {
         for meta in &failed_metas {
             // Read failed message bodies from failed/ directory
             let failed_path = sub_queue_dir.join("failed").join(format!("{}.md", meta.id));
-            if let Ok(content) = std::fs::read_to_string(&failed_path) {
+            if let Ok(content) = tokio::fs::read_to_string(&failed_path).await {
                 // Extract body after the header separator
                 if let Some(pos) = content.find("\n\n") {
                     failed_bodies.push(content[pos + 2..].to_string());
@@ -212,12 +199,12 @@ impl SubAgentSpawner for InProcessSpawner {
         }
 
         // 11. Cleanup ephemeral dirs (best-effort)
-        let _ = std::fs::remove_dir_all(&sub_queue_dir);
-        let _ = std::fs::remove_dir_all(&sub_memory_dir);
+        let _ = tokio::fs::remove_dir_all(&sub_queue_dir).await;
+        let _ = tokio::fs::remove_dir_all(&sub_memory_dir).await;
         // Clean up isolated long-term memory if used
         if role.memory == MemoryMode::Isolated {
             let isolated_dir = self.project_paths.long_term_dir.join(format!("sub-{}", short_uuid));
-            let _ = std::fs::remove_dir_all(&isolated_dir);
+            let _ = tokio::fs::remove_dir_all(&isolated_dir).await;
         }
 
         Ok(SubAgentResult {

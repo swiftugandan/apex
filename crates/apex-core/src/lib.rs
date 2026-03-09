@@ -15,3 +15,33 @@ pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
     }
     &s[..end]
 }
+
+/// Current time as a Unix timestamp string (e.g. "1709913600").
+pub fn now_unix_ts() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{secs}")
+}
+
+/// Generate a pseudo-unique ID with a prefix (e.g. "fact-00a1b2c3d4e5f67800ab").
+pub fn generate_id(prefix: &str) -> String {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    format!("{prefix}-{:016x}{:04x}", t, pid & 0xFFFF)
+}
+
+/// Summarize a JSON value to a max length string.
+pub fn summarize_json(value: &serde_json::Value, max_len: usize) -> String {
+    let s = value.to_string();
+    if s.len() <= max_len {
+        s
+    } else {
+        let truncated = truncate_str(&s, max_len);
+        format!("{truncated}…")
+    }
+}

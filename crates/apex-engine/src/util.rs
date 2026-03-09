@@ -3,6 +3,9 @@ use tokio::sync::Mutex;
 
 use apex_core::context::{MessageComposer, TokenEstimator};
 
+// Re-export from apex-core for convenience
+pub use apex_core::{now_unix_ts, summarize_json};
+
 /// Builds a MessageComposer from the shared token estimator.
 pub async fn composer_from_estimator(estimator: &Arc<Mutex<TokenEstimator>>) -> MessageComposer {
     let cal = {
@@ -29,24 +32,4 @@ pub fn extract_title(body: &str) -> String {
         }
     }
     "Untitled".to_string()
-}
-
-/// Summarize a JSON value to a max length string.
-pub fn summarize_json(value: &serde_json::Value, max_len: usize) -> String {
-    let s = value.to_string();
-    if s.len() <= max_len {
-        s
-    } else {
-        let truncated = apex_core::truncate_str(&s, max_len);
-        format!("{truncated}…")
-    }
-}
-
-/// Current time as a Unix timestamp string.
-pub fn now_iso() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("{now}")
 }

@@ -77,20 +77,11 @@ impl SqliteMemoryStore {
     }
 
     fn now_iso() -> String {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        format!("{secs}")
+        apex_core::now_unix_ts()
     }
 
     fn generate_id(prefix: &str) -> String {
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let pid = std::process::id();
-        format!("{prefix}-{:016x}{:04x}", t, pid & 0xFFFF)
+        apex_core::generate_id(prefix)
     }
 
     /// Decay confidence based on time since last verification.

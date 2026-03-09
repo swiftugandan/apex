@@ -53,7 +53,7 @@ impl DelegateToolRegistry {
     }
 
     /// Resolve a role profile from a named role or inline ad-hoc parameters.
-    fn resolve_role(&self, call: &ToolCall) -> Result<(RoleProfile, String), ToolError> {
+    async fn resolve_role(&self, call: &ToolCall) -> Result<(RoleProfile, String), ToolError> {
         let has_role = call.input.get("role").and_then(|v| v.as_str()).is_some();
         let has_system_prompt = call.input.get("system_prompt").and_then(|v| v.as_str()).is_some();
 
@@ -79,21 +79,14 @@ impl DelegateToolRegistry {
                 .clone();
 
             // Load persona from file or use default
-            let persona = if let Some(ref persona_file) = role.persona {
-                let path = self.prompts_dir.join(persona_file);
-                std::fs::read_to_string(&path).map_err(|e| {
-                    ToolError::Execution(format!(
-                        "failed to read persona file '{}': {e}",
-                        path.display()
-                    ))
-                })?
-            } else {
-                // Use parent's persona (agent.md)
-                let path = self.prompts_dir.join("agent.md");
-                std::fs::read_to_string(&path).map_err(|e| {
-                    ToolError::Execution(format!("failed to read agent.md: {e}"))
-                })?
-            };
+            let persona_file = role.persona.as_deref().unwrap_or("agent.md");
+            let path = self.prompts_dir.join(persona_file);
+            let persona = tokio::fs::read_to_string(&path).await.map_err(|e| {
+                ToolError::Execution(format!(
+                    "failed to read persona file '{}': {e}",
+                    path.display()
+                ))
+            })?;
 
             Ok((role, persona))
         } else if has_system_prompt {
@@ -209,7 +202,7 @@ impl ToolRegistry for DelegateToolRegistry {
             .ok_or_else(|| ToolError::InvalidInput("missing 'task' field".into()))?
             .to_string();
 
-        let (role, persona) = self.resolve_role(call)?;
+        let (role, persona) = self.resolve_role(call).await?;
 
         eprintln!(
             "  [delegate:{}] spawning subprocess",
