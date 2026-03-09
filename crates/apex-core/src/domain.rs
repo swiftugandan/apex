@@ -308,6 +308,17 @@ pub struct Strategy {
 
 // ── Working Memory types ──────────────────────────────────────────
 
+/// A single log entry in the scratchpad execution log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub turn: u32,
+    pub tool_name: String,
+    pub input_summary: String,
+    pub output_summary: String,
+    pub is_error: bool,
+    pub duration_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SubtaskStatus {
@@ -332,6 +343,8 @@ pub struct Scratchpad {
     pub subtasks: Vec<SubtaskEntry>,
     pub status_summary: String,
     pub notes: Vec<String>,
+    #[serde(default)]
+    pub log: Vec<LogEntry>,
 }
 
 impl Scratchpad {
@@ -342,6 +355,7 @@ impl Scratchpad {
             subtasks: Vec::new(),
             status_summary: String::new(),
             notes: Vec::new(),
+            log: Vec::new(),
         }
     }
 
@@ -379,6 +393,20 @@ impl Scratchpad {
             }
         }
 
+        out.push_str("\n## Execution Log\n");
+        if self.log.is_empty() {
+            out.push_str("(none)\n");
+        } else {
+            for entry in &self.log {
+                let status = if entry.is_error { "ERR" } else { "ok" };
+                out.push_str(&format!(
+                    "- [turn {}] `{}` — {} ({}ms, {})\n",
+                    entry.turn, entry.tool_name, entry.input_summary,
+                    entry.duration_ms, status,
+                ));
+            }
+        }
+
         out
     }
 
@@ -388,9 +416,10 @@ impl Scratchpad {
         let mut subtasks = Vec::new();
         let mut status_summary = String::new();
         let mut notes = Vec::new();
+        let mut log = Vec::new();
 
         #[derive(PartialEq)]
-        enum Section { None, Goal, Decomposition, Status, Notes }
+        enum Section { None, Goal, Decomposition, Status, Notes, Log }
         let mut section = Section::None;
 
         for line in md.lines() {
@@ -412,6 +441,10 @@ impl Scratchpad {
             }
             if line == "## Job-Level Notes" {
                 section = Section::Notes;
+                continue;
+            }
+            if line == "## Execution Log" {
+                section = Section::Log;
                 continue;
             }
 
@@ -449,6 +482,14 @@ impl Scratchpad {
                         notes.push(note.to_string());
                     }
                 }
+                Section::Log => {
+                    if line == "(none)" || line.is_empty() {
+                        continue;
+                    }
+                    if let Some(entry) = parse_log_line(line) {
+                        log.push(entry);
+                    }
+                }
                 Section::None => {}
             }
         }
@@ -457,7 +498,7 @@ impl Scratchpad {
             return Err("missing job_id header".to_string());
         }
 
-        Ok(Scratchpad { job_id, goal, subtasks, status_summary, notes })
+        Ok(Scratchpad { job_id, goal, subtasks, status_summary, notes, log })
     }
 }
 
@@ -497,6 +538,39 @@ fn parse_subtask_line(line: &str) -> Option<SubtaskEntry> {
     Some(SubtaskEntry { index, description, status, task_id, depends_on })
 }
 
+/// Parse a log line: "- [turn 1] `shell_exec` — ls -la (250ms, ok)"
+fn parse_log_line(line: &str) -> Option<LogEntry> {
+    let rest = line.strip_prefix("- [turn ")?;
+    let bracket_end = rest.find(']')?;
+    let turn: u32 = rest[..bracket_end].parse().ok()?;
+
+    let rest = rest[bracket_end + 2..].strip_prefix('`')?;
+    let backtick_end = rest.find('`')?;
+    let tool_name = rest[..backtick_end].to_string();
+
+    // After "` — "
+    let rest = rest.get(backtick_end + 1..)?.strip_prefix(" — ")?;
+
+    // Find the trailing " (NNNms, ok)" or " (NNNms, ERR)"
+    let paren_start = rest.rfind(" (")?;
+    let input_summary = rest[..paren_start].to_string();
+    let trailer = rest[paren_start + 2..].trim_end_matches(')');
+
+    // "250ms, ok" or "250ms, ERR"
+    let comma_pos = trailer.find(", ")?;
+    let duration_ms: u64 = trailer[..comma_pos].trim_end_matches("ms").parse().ok()?;
+    let is_error = trailer[comma_pos + 2..] == *"ERR";
+
+    Some(LogEntry {
+        turn,
+        tool_name,
+        input_summary,
+        output_summary: String::new(), // not stored in markdown format
+        is_error,
+        duration_ms,
+    })
+}
+
 /// An attempt record capturing a full execution attempt for a task.
 #[derive(Debug, Clone)]
 pub struct AttemptRecord {
@@ -507,7 +581,6 @@ pub struct AttemptRecord {
     pub final_text: Option<String>,
     pub outcome: AttemptOutcome,
     pub failure_reason: Option<String>,
-    pub eval_summary: Option<String>,
 }
 
 /// A single LLM turn within an attempt.
@@ -907,6 +980,24 @@ mod tests {
             ],
             status_summary: "Step 1 done, step 2 running".into(),
             notes: vec!["Found a config issue".into(), "Retrying with fix".into()],
+            log: vec![
+                LogEntry {
+                    turn: 1,
+                    tool_name: "shell_exec".into(),
+                    input_summary: "ls -la".into(),
+                    output_summary: "file1 file2".into(),
+                    is_error: false,
+                    duration_ms: 250,
+                },
+                LogEntry {
+                    turn: 2,
+                    tool_name: "file_write".into(),
+                    input_summary: "/tmp/out.txt".into(),
+                    output_summary: "ok".into(),
+                    is_error: true,
+                    duration_ms: 15,
+                },
+            ],
         };
 
         let md = pad.to_markdown();
@@ -921,6 +1012,18 @@ mod tests {
         assert_eq!(parsed.subtasks[2].task_id, None);
         assert_eq!(parsed.status_summary, "Step 1 done, step 2 running");
         assert_eq!(parsed.notes, vec!["Found a config issue", "Retrying with fix"]);
+
+        // Verify log roundtrip
+        assert_eq!(parsed.log.len(), 2);
+        assert_eq!(parsed.log[0].turn, 1);
+        assert_eq!(parsed.log[0].tool_name, "shell_exec");
+        assert_eq!(parsed.log[0].input_summary, "ls -la");
+        assert!(!parsed.log[0].is_error);
+        assert_eq!(parsed.log[0].duration_ms, 250);
+        assert_eq!(parsed.log[1].turn, 2);
+        assert_eq!(parsed.log[1].tool_name, "file_write");
+        assert!(parsed.log[1].is_error);
+        assert_eq!(parsed.log[1].duration_ms, 15);
     }
 
     #[test]
@@ -933,6 +1036,7 @@ mod tests {
         assert!(parsed.goal.is_empty());
         assert!(parsed.subtasks.is_empty());
         assert!(parsed.notes.is_empty());
+        assert!(parsed.log.is_empty());
     }
 
     #[test]
@@ -949,5 +1053,6 @@ mod tests {
         assert!(pad.subtasks.is_empty());
         assert!(pad.status_summary.is_empty());
         assert!(pad.notes.is_empty());
+        assert!(pad.log.is_empty());
     }
 }

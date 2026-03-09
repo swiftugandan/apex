@@ -46,11 +46,8 @@ impl ConfigLoader {
                 config.agent.max_depth = n;
             }
         }
-        if let Ok(model) = std::env::var("APEX_EVAL_MODEL") {
-            config.eval.eval_model = Some(model);
-        }
-        if let Ok(val) = std::env::var("APEX_EVAL_ON") {
-            config.eval.eval_on = val.to_lowercase();
+        if let Ok(model) = std::env::var("APEX_SUB_AGENT_MODEL") {
+            config.sub_agent.model = Some(model);
         }
 
         Ok(config)

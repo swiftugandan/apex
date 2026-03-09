@@ -1,3 +1,4 @@
+mod agent_tool;
 mod builtin;
 mod config_tool;
 mod custom_tools;
@@ -8,6 +9,7 @@ mod queue_tools;
 mod shell_exec;
 pub mod spill;
 
+pub use agent_tool::AgentToolRegistry;
 pub use builtin::BuiltinToolRegistry;
 pub use config_tool::ConfigToolRegistry;
 pub use custom_tools::CustomToolRegistry;

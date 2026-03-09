@@ -7,7 +7,7 @@ pub struct AgentConfig {
     pub agent: AgentSection,
 
     #[serde(default)]
-    pub eval: EvalSection,
+    pub sub_agent: SubAgentSection,
 
     #[serde(default)]
     pub context_budget: ContextBudgetSection,
@@ -43,14 +43,10 @@ pub struct AgentSection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct EvalSection {
-    /// Override model for evaluation (None = use agent model).
+pub struct SubAgentSection {
+    /// Override model for sub-agents (None = use agent model).
     #[serde(default)]
-    pub eval_model: Option<String>,
-
-    /// When to run adversarial evaluation: "always", "never", "fuzzy_criteria".
-    #[serde(default = "default_eval_on")]
-    pub eval_on: String,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -108,9 +104,6 @@ fn default_max_depth() -> u32 {
 fn default_max_retries() -> u32 {
     3
 }
-fn default_eval_on() -> String {
-    "fuzzy_criteria".to_string()
-}
 fn default_max_body_tokens() -> usize {
     50_000
 }
@@ -131,7 +124,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             agent: AgentSection::default(),
-            eval: EvalSection::default(),
+            sub_agent: SubAgentSection::default(),
             context_budget: ContextBudgetSection::default(),
             consolidation: ConsolidationSection::default(),
             fitness: FitnessSection::default(),
@@ -151,11 +144,10 @@ impl Default for AgentSection {
     }
 }
 
-impl Default for EvalSection {
+impl Default for SubAgentSection {
     fn default() -> Self {
         Self {
-            eval_model: None,
-            eval_on: default_eval_on(),
+            model: None,
         }
     }
 }
@@ -223,6 +215,6 @@ max_depth = 5
         assert_eq!(config.agent.max_depth, 5);
         assert_eq!(config.agent.max_concurrent, 1); // default
         assert_eq!(config.agent.max_retries, 3); // default
-        assert_eq!(config.eval.eval_on, "fuzzy_criteria"); // default
+        assert!(config.sub_agent.model.is_none()); // default
     }
 }

@@ -333,12 +333,6 @@ fn write_default_prompts(prompts_dir: &Path) -> Result<()> {
             .context("failed to write prompts/agent.md")?;
     }
 
-    let evaluator_path = prompts_dir.join("evaluator.md");
-    if !evaluator_path.exists() {
-        std::fs::write(&evaluator_path, DEFAULT_EVALUATOR_PROMPT)
-            .context("failed to write prompts/evaluator.md")?;
-    }
-
     Ok(())
 }
 
@@ -367,15 +361,22 @@ You have a per-job scratchpad for tracking multi-step task progress. Use it when
 - Use `working_memory_update` to record subtasks, update their status, and add notes about discoveries.
 - The scratchpad persists across retries — if this is a retry, check working memory first.
 
-## Acceptance Criteria & Self-Evaluation
+## Sub-Agents
 
-After you complete a task, the system automatically runs deterministic acceptance criteria checks from the task body. If any check fails, the task is retried with the failure details.
+You can spawn sub-agents with `agent` to get independent perspectives on your work.
 
-- Prefer deterministic checks over vague descriptions
-- Cover the key deliverable of each subtask
-- If retrying after eval failure, check "Previous Attempts" for which criteria failed
-- `### Fuzzy` criteria under `## Acceptance Criteria` define qualitative checks evaluated by an adversarial LLM reviewer after deterministic checks pass
-- Fuzzy criteria trigger a second evaluation pass — ensure your work satisfies both concrete and qualitative requirements
+- Use `agent` with a verifier persona to independently check your work before completing a task
+- Sub-agents have their own tool access (you specify which tools they get)
+- Available sub-agent tools: `shell_exec`, `file_read`, `file_write`
+- Sub-agents cannot spawn their own sub-agents (no recursion)
+
+## Verification
+
+Before completing a task, spawn a verification sub-agent to independently check your work:
+
+1. Call `agent` with a verifier system prompt and your work summary as the task
+2. Give it `["shell_exec", "file_read"]` tools so it can run tests and inspect files
+3. If the verifier finds issues, fix them and verify again
 
 ## Task Decomposition
 
@@ -393,47 +394,6 @@ You can decompose complex goals into independent subtasks that run in parallel.
 - If a command fails, read the error output carefully and diagnose the issue.
 - Try a different approach if the first one fails. Do not repeat the same failing command.
 - If you cannot complete a task after reasonable effort, explain what you tried and what went wrong.
-"#;
-
-const DEFAULT_EVALUATOR_PROMPT: &str = r#"You are an adversarial evaluator. Your job is to find problems with an agent's work product.
-
-## Input
-
-You will receive:
-1. **Original task** — the task the agent was asked to complete
-2. **Agent's result** — what the agent produced
-3. **Fuzzy criteria** — qualitative checks the result must satisfy
-
-## Required Output Format
-
-You MUST structure your response with exactly these sections:
-
-## Blocking Issues
-List genuine problems that make the result unacceptable:
-- [BLOCK] description of the issue with specific evidence
-
-If there are no blocking issues, write: None.
-
-## Warnings
-List minor concerns or improvements that don't block acceptance:
-- [WARN] description of the concern
-
-If there are no warnings, write: None.
-
-## Verdict
-Write exactly one word: PASS or FAIL
-
-PASS means the result is acceptable despite any warnings.
-FAIL means there are blocking issues that must be fixed.
-
-## Instructions
-
-- Be specific. Cite evidence from the result for every finding.
-- Do not invent problems. Only flag issues you can demonstrate.
-- Focus on the fuzzy criteria provided. Evaluate whether each criterion is satisfied.
-- A missing or incomplete criterion is a blocking issue.
-- Minor style or optimization concerns are warnings, not blocks.
-- Only mark FAIL if there are genuine blocking issues.
 "#;
 
 // ── Queue helpers ──────────────────────────────────────────────────
@@ -454,39 +414,28 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
     let persona =
         std::fs::read_to_string(&persona_path).context("failed to read prompts/agent.md")?;
 
-    let evaluator_persona_path = paths.prompts_dir.join("evaluator.md");
-    let evaluator_persona = std::fs::read_to_string(&evaluator_persona_path)
-        .context("failed to read prompts/evaluator.md")?;
-
     let invariants = ConfigLoader::load_invariants(&paths.config_dir)?;
     let agent_config = ConfigLoader::load_agent_config(&paths.config_dir)?;
 
     let max_concurrent = agent_config.agent.max_concurrent;
     let max_depth = agent_config.agent.max_depth;
     let max_retries = agent_config.agent.max_retries;
-
-    let eval_config = apex_eval::EvalConfig {
-        eval_model: agent_config.eval.eval_model.clone(),
-        eval_on: match agent_config.eval.eval_on.as_str() {
-            "always" => apex_eval::EvalOn::Always,
-            "never" => apex_eval::EvalOn::Never,
-            _ => apex_eval::EvalOn::FuzzyCriteria,
-        },
-    };
+    let max_tool_result_bytes = agent_config.context_budget.max_tool_result_tokens * 4;
 
     let llm = Arc::new(
         AnthropicProvider::from_env_with_model(&agent_config.agent.model)
             .context("failed to create LLM provider")?
     );
 
-    let eval_llm: Option<Arc<dyn LlmProvider>> =
-        if let Some(ref eval_model) = eval_config.eval_model {
-            Some(Arc::new(
-                AnthropicProvider::from_env_with_model(eval_model)
-                    .context("failed to create eval LLM provider")?
-            ))
+    // Use sub-agent model if configured, otherwise main LLM
+    let sub_agent_llm: Arc<dyn LlmProvider> =
+        if let Some(ref sub_model) = agent_config.sub_agent.model {
+            Arc::new(
+                AnthropicProvider::from_env_with_model(sub_model)
+                    .context("failed to create sub-agent LLM provider")?
+            )
         } else {
-            None
+            llm.clone()
         };
 
     let memory: Arc<dyn WorkingMemory> =
@@ -508,21 +457,21 @@ async fn process_queue(paths: &ApexPaths, adapter: Arc<RfbmqAdapter>) -> Result<
         memory.clone(),
         long_term.clone(),
         Arc::clone(&invariants),
+        sub_agent_llm,
+        estimator.clone(),
+        max_tool_result_bytes,
     );
 
     let ctx = WorkerContext {
         adapter: adapter.clone(),
         static_tools,
         llm,
-        eval_llm,
         memory,
         long_term,
         persona: Arc::new(persona),
-        evaluator_persona: Arc::new(evaluator_persona),
-        eval_config: Arc::new(eval_config),
         max_depth,
         max_retries,
-        max_tool_result_bytes: agent_config.context_budget.max_tool_result_tokens * 4,
+        max_tool_result_bytes,
         estimator,
     };
 

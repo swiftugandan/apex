@@ -10,7 +10,6 @@ path = "src/main.rs"
 [dependencies]
 apex-core = { path = "../apex-core" }
 apex-infra = { path = "../apex-infra" }
-apex-eval = { path = "../apex-eval" }
 rfbmq-core = { path = "../../vendor/rfbmq-core" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 anyhow.workspace = true

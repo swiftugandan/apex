@@ -69,10 +69,6 @@ impl MessageComposer {
             record.started_at, record.finished_at
         ));
 
-        if let Some(ref eval) = record.eval_summary {
-            out.push_str(&format!("\n## Evaluation\n{eval}\n"));
-        }
-
         // Scan for successful create_tool calls
         let mut new_tools: Vec<String> = Vec::new();
         for turn in &record.turns {
@@ -367,10 +363,6 @@ impl MessageComposer {
             out.push_str(&format!("- Diagnosis: {reason}\n"));
         }
 
-        if let Some(ref eval) = record.eval_summary {
-            out.push_str(&format!("- Evaluation:\n{eval}\n"));
-        }
-
         if record.outcome == AttemptOutcome::Failed {
             if let Some(ref reason) = record.failure_reason {
                 out.push_str(&format!("\n**→ Next attempt should address: {reason}**\n"));
@@ -428,7 +420,6 @@ mod tests {
             } else {
                 None
             },
-            eval_summary: None,
         }
     }
 
@@ -477,7 +468,6 @@ mod tests {
             final_text: Some("Done without tools.".into()),
             outcome: AttemptOutcome::Success,
             failure_reason: None,
-            eval_summary: None,
         };
         let result = MessageComposer::compose_result("Simple task", &record);
         assert!(result.contains("(no tool calls)"));

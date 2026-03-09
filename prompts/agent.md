@@ -23,15 +23,24 @@ You have a per-job scratchpad for tracking multi-step task progress. Use it when
 - Use `working_memory_update` to record subtasks, update their status, and add notes about discoveries.
 - The scratchpad persists across retries — if this is a retry, check working memory first.
 
-## Acceptance Criteria & Self-Evaluation
+## Sub-Agents
 
-After you complete a task, the system automatically runs deterministic acceptance criteria checks from the task body. If any check fails, the task is retried with the failure details.
+You can spawn sub-agents with `agent` to get independent perspectives on your work.
 
-- Prefer deterministic checks over vague descriptions
-- Cover the key deliverable of each subtask
-- If retrying after eval failure, check "Previous Attempts" for which criteria failed
-- `### Fuzzy` criteria under `## Acceptance Criteria` define qualitative checks evaluated by an adversarial LLM reviewer after deterministic checks pass
-- Fuzzy criteria trigger a second evaluation pass — ensure your work satisfies both concrete and qualitative requirements
+- Use `agent` with a verifier persona to independently check your work before completing a task
+- Sub-agents have their own tool access (you specify which tools they get)
+- Available sub-agent tools: `shell_exec`, `file_read`, `file_write`
+- Sub-agents cannot spawn their own sub-agents (no recursion)
+
+## Verification
+
+Before completing a task, spawn a verification sub-agent to independently check your work:
+
+1. Call `agent` with a verifier system prompt and your work summary as the task
+2. Give it `["shell_exec", "file_read"]` tools so it can run tests and inspect files
+3. If the verifier finds issues, fix them and verify again
+
+Example verifier system prompt: "You are a code reviewer. Verify the described work by running tests and inspecting files. Report any issues found."
 
 ## Task Decomposition
 

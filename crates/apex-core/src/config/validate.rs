@@ -136,31 +136,6 @@ pub fn validate_full(
         });
     }
 
-    // Check evaluator persona exists
-    let eval_path = prompts_dir.join("evaluator.md");
-    if !eval_path.exists() {
-        report.issues.push(ValidationIssue {
-            field: "prompts/evaluator.md".to_string(),
-            message: "evaluator persona file not found".to_string(),
-            severity: IssueSeverity::Warning,
-        });
-    }
-
-    // Validate eval_on is a known value
-    match config.eval.eval_on.as_str() {
-        "always" | "never" | "fuzzy_criteria" => {}
-        other => {
-            report.issues.push(ValidationIssue {
-                field: "eval.eval_on".to_string(),
-                message: format!(
-                    "unknown value '{}', expected: always, never, fuzzy_criteria",
-                    other
-                ),
-                severity: IssueSeverity::Warning,
-            });
-        }
-    }
-
     report
 }
 
@@ -220,7 +195,6 @@ mod tests {
         let inv = Invariants::default();
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("agent.md"), "# Agent").unwrap();
-        std::fs::write(dir.path().join("evaluator.md"), "# Eval").unwrap();
 
         let report = validate_full(&config, &inv, dir.path());
         assert!(report.is_ok());

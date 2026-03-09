@@ -10,7 +10,7 @@ use apex_core::config::Invariants;
 use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{
     AttemptOutcome, AttemptRecord, ChatMessage, ClaimedTask, CompletionRequest, ContentBlock,
-    Fact, FactId, MessageRole, MessageType, Skill, SkillId, Strategy, StrategyId,
+    Fact, FactId, LogEntry, MessageRole, MessageType, Skill, SkillId, Strategy, StrategyId,
     ToolCall, ToolCallRecord, ToolDef, ToolResult, TurnRecord,
 };
 use apex_core::error::ToolError;
@@ -18,8 +18,8 @@ use apex_core::ports::{LlmProvider, MemoryStore, Queue, ToolRegistry, WorkingMem
 use apex_infra::{AnthropicProvider, RfbmqAdapter};
 
 use crate::tools::{
-    BuiltinToolRegistry, ConfigToolRegistry, CustomToolRegistry, MemoryToolRegistry,
-    QueueToolRegistry,
+    AgentToolRegistry, BuiltinToolRegistry, ConfigToolRegistry, CustomToolRegistry,
+    MemoryToolRegistry, QueueToolRegistry,
 };
 use crate::tools::spill::SpillManager;
 
@@ -33,13 +33,9 @@ pub struct WorkerContext {
     pub adapter: Arc<RfbmqAdapter>,
     pub static_tools: Arc<StaticToolRegistry>,
     pub llm: Arc<AnthropicProvider>,
-    /// When set, used for adversarial evaluation; otherwise main llm is used.
-    pub eval_llm: Option<Arc<dyn LlmProvider>>,
     pub memory: Arc<dyn WorkingMemory>,
     pub long_term: Arc<dyn MemoryStore>,
     pub persona: Arc<String>,
-    pub evaluator_persona: Arc<String>,
-    pub eval_config: Arc<apex_eval::EvalConfig>,
     pub max_depth: u32,
     pub max_retries: u32,
     pub max_tool_result_bytes: usize,
@@ -121,7 +117,7 @@ impl ToolRegistry for ApexToolRegistry {
     }
 }
 
-/// Build the static tool registries (Builtin, Memory, Custom, Config) once for the process.
+/// Build the static tool registries (Builtin, Memory, Custom, Config, Agent) once for the process.
 pub fn build_static_tools(
     scratch_dir: PathBuf,
     tools_dir: PathBuf,
@@ -129,6 +125,9 @@ pub fn build_static_tools(
     memory: Arc<dyn WorkingMemory>,
     long_term: Arc<dyn MemoryStore>,
     invariants: Arc<Invariants>,
+    llm: Arc<dyn LlmProvider>,
+    estimator: Arc<Mutex<TokenEstimator>>,
+    max_tool_result_bytes: usize,
 ) -> Arc<StaticToolRegistry> {
     let memory_tools = MemoryToolRegistry::new(memory, long_term.clone());
     let custom_spill = SpillManager::new(scratch_dir.clone());
@@ -138,11 +137,18 @@ pub fn build_static_tools(
         Some(long_term.clone()),
     );
     let config_tools = ConfigToolRegistry::new(config_dir, invariants);
+    let agent_tools = AgentToolRegistry::new(
+        llm,
+        long_term.clone(),
+        estimator,
+        max_tool_result_bytes,
+    );
     Arc::new(StaticToolRegistry::new(vec![
         Box::new(BuiltinToolRegistry::new(scratch_dir)),
         Box::new(memory_tools),
         Box::new(custom_tools),
         Box::new(config_tools),
+        Box::new(agent_tools),
     ]))
 }
 
@@ -246,8 +252,8 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
 // ── Shared agentic loop ─────────────────────────────────────────────
 
 /// Runs the multi-turn LLM + tool execution loop. Shared between
-/// execute_task and execute_continuation.
-async fn run_agentic_loop(
+/// execute_task, execute_continuation, and the `agent` tool (sub-agents).
+pub(crate) async fn run_agentic_loop(
     initial_messages: Vec<ChatMessage>,
     persona: &str,
     llm: &dyn LlmProvider,
@@ -255,6 +261,8 @@ async fn run_agentic_loop(
     long_term: &dyn MemoryStore,
     estimator: &Arc<Mutex<TokenEstimator>>,
     max_tool_result_bytes: usize,
+    scratchpad: Option<&Mutex<apex_core::domain::Scratchpad>>,
+    memory: Option<&dyn WorkingMemory>,
 ) -> (Vec<TurnRecord>, Option<String>, Vec<ChatMessage>) {
     let mut messages = initial_messages;
     let mut turns: Vec<TurnRecord> = Vec::new();
@@ -361,6 +369,22 @@ async fn run_agentic_loop(
             });
         }
 
+        // Persist log entries to scratchpad after each turn
+        if let (Some(pad_mutex), Some(mem)) = (scratchpad, memory) {
+            let mut pad = pad_mutex.lock().await;
+            for tc in &call_records {
+                pad.log.push(LogEntry {
+                    turn: (turn_num + 1) as u32,
+                    tool_name: tc.name.clone(),
+                    input_summary: tc.input_summary.clone(),
+                    output_summary: tc.output_summary.clone(),
+                    is_error: tc.is_error,
+                    duration_ms: tc.duration_ms,
+                });
+            }
+            let _ = mem.save(&pad).await;
+        }
+
         turns.push(TurnRecord {
             tool_calls: call_records,
             usage: resp.usage,
@@ -373,91 +397,6 @@ async fn run_agentic_loop(
     }
 
     (turns, final_text, messages)
-}
-
-/// Evaluate the result and build the final AttemptRecord.
-async fn evaluate_and_finalize(
-    claimed: &ClaimedTask,
-    turns: Vec<TurnRecord>,
-    final_text: Option<String>,
-    scratchpad: &apex_core::domain::Scratchpad,
-    started_at: String,
-    eval_llm: &dyn LlmProvider,
-    eval_config: &apex_eval::EvalConfig,
-    evaluator_persona: &str,
-    long_term: &dyn MemoryStore,
-) -> std::result::Result<AttemptRecord, (AttemptRecord, String, apex_core::domain::Scratchpad)> {
-    // Build rich result text: tool call summaries + final agent message
-    let result_text = build_result_text_for_eval(&turns, final_text.as_deref());
-    let evaluation = apex_eval::Evaluator::evaluate(
-        &claimed.body,
-        &result_text,
-        evaluator_persona,
-        eval_llm,
-        eval_config,
-    )
-    .await;
-
-    if !evaluation.passed {
-        let summary = evaluation.failure_summary();
-        let reason = if evaluation
-            .deterministic
-            .as_ref()
-            .map_or(false, |d| !d.all_passed())
-        {
-            "deterministic evaluation failed"
-        } else {
-            "adversarial evaluation failed"
-        };
-        eprintln!("  eval: {reason}");
-        let record = AttemptRecord {
-            attempt_number: claimed.headers.retry_count + 1,
-            started_at,
-            finished_at: now_iso(),
-            turns,
-            final_text,
-            outcome: AttemptOutcome::Failed,
-            failure_reason: Some(reason.into()),
-            eval_summary: Some(summary),
-        };
-        return Err((record, reason.into(), scratchpad.clone()));
-    }
-
-    let eval_summary =
-        if evaluation.deterministic.is_some() || evaluation.adversarial.is_some() {
-            Some(evaluation.full_summary())
-        } else {
-            None
-        };
-
-    if let Some(ref det) = evaluation.deterministic {
-        eprintln!("  eval: {}/{} checks passed", det.passed, det.total);
-    }
-    if evaluation.adversarial.is_some() {
-        eprintln!("  eval: adversarial passed");
-    }
-
-    let record = AttemptRecord {
-        attempt_number: claimed.headers.retry_count + 1,
-        started_at,
-        finished_at: now_iso(),
-        turns,
-        final_text,
-        outcome: AttemptOutcome::Success,
-        failure_reason: None,
-        eval_summary,
-    };
-
-    // Best-effort consolidation
-    consolidate_learnings(
-        long_term,
-        &claimed.headers.correlation_id,
-        &record,
-        scratchpad,
-    )
-    .await;
-
-    Ok(record)
 }
 
 // ── Unified claim execution ──────────────────────────────────────────
@@ -494,6 +433,7 @@ async fn execute_claim(
 
     let messages = vec![ChatMessage::user_text(&initial_body)];
 
+    let scratchpad = Mutex::new(scratchpad);
     let (turns, final_text, _messages) = run_agentic_loop(
         messages,
         &ctx.persona,
@@ -502,8 +442,11 @@ async fn execute_claim(
         ctx.long_term.as_ref(),
         &ctx.estimator,
         ctx.max_tool_result_bytes,
+        Some(&scratchpad),
+        Some(ctx.memory.as_ref()),
     )
     .await;
+    let mut scratchpad = scratchpad.into_inner();
 
     if let Some(ref text) = final_text {
         if text.starts_with("LLM error:") {
@@ -515,64 +458,39 @@ async fn execute_claim(
                 final_text: None,
                 outcome: AttemptOutcome::Failed,
                 failure_reason: Some(text.clone()),
-                eval_summary: None,
             };
             return Err((record, text.clone(), scratchpad));
         }
     }
 
     if let Ok(updated_pad) = ctx.memory.load_or_create(job_id).await {
+        // Preserve the log from our run, merge with any tool-updated fields
+        let log = scratchpad.log.clone();
         scratchpad = updated_pad;
+        scratchpad.log = log;
     }
     let _ = ctx.memory.save(&scratchpad).await;
 
-    evaluate_and_finalize(
-        claimed,
+    let record = AttemptRecord {
+        attempt_number: claimed.headers.retry_count + 1,
+        started_at,
+        finished_at: now_iso(),
         turns,
         final_text,
-        &scratchpad,
-        started_at,
-        ctx.eval_llm.as_deref().unwrap_or(ctx.llm.as_ref()),
-        &ctx.eval_config,
-        &ctx.evaluator_persona,
+        outcome: AttemptOutcome::Success,
+        failure_reason: None,
+    };
+
+    // Best-effort consolidation
+    consolidate_learnings(
         ctx.long_term.as_ref(),
+        &claimed.headers.correlation_id,
+        &record,
+        &scratchpad,
     )
-    .await
-}
+    .await;
 
-// ── Evaluation helpers ──────────────────────────────────────────────
-
-/// Build a result text for the adversarial evaluator that includes
-/// a summary of tool calls (so the evaluator can see what the agent actually did).
-fn build_result_text_for_eval(
-    turns: &[apex_core::domain::TurnRecord],
-    final_text: Option<&str>,
-) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(2048);
-
-    out.push_str("## Agent Actions\n\n");
-    for (i, turn) in turns.iter().enumerate() {
-        for tc in &turn.tool_calls {
-            let status = if tc.is_error { "ERROR" } else { "ok" };
-            let _ = writeln!(
-                out,
-                "- Turn {}: {}({}) → [{}] {}",
-                i + 1,
-                tc.name,
-                apex_core::truncate_str(&tc.input_summary, 80),
-                status,
-                apex_core::truncate_str(&tc.output_summary, 200),
-            );
-        }
-    }
-
-    if let Some(text) = final_text {
-        out.push_str("\n## Agent's Final Response\n\n");
-        out.push_str(apex_core::truncate_str(text, 2000));
-    }
-
-    out
+    Ok(record)
 }
 
 // ── Failure handling ────────────────────────────────────────────────
