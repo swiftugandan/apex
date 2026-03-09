@@ -7,7 +7,7 @@ use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{
     AttemptOutcome, AttemptRecord, ChatMessage, ClaimedTask, MessageType,
 };
-use apex_core::ports::{LlmProvider, MemoryStore, Queue, ToolRegistry, WorkingMemory};
+use apex_core::ports::{LlmProvider, MemoryStore, Queue, WorkingMemory};
 
 use apex_tools::QueueToolRegistry;
 
@@ -95,12 +95,7 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
             composer,
         );
 
-        let tools = ApexToolRegistry {
-            static_tools: Arc::clone(&ctx.tools),
-            queue_tools,
-        };
-
-        let result = execute_claim(&ctx, &claimed, &tools).await;
+        let result = execute_claim(&ctx, &claimed, queue_tools).await;
 
         match result {
             Ok(record) => {
@@ -135,7 +130,7 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
 async fn execute_claim(
     ctx: &WorkerContext,
     claimed: &ClaimedTask,
-    tools: &dyn ToolRegistry,
+    queue_tools: QueueToolRegistry,
 ) -> std::result::Result<AttemptRecord, (AttemptRecord, String, apex_core::domain::Scratchpad)> {
     let started_at = now_unix_ts();
     let job_id = &claimed.headers.correlation_id;
@@ -164,14 +159,21 @@ async fn execute_claim(
 
     let messages = vec![ChatMessage::user_text(&initial_body)];
 
-    let scratchpad = Mutex::new(scratchpad);
+    let scratchpad_arc = Arc::new(Mutex::new(scratchpad));
+    let tools = ApexToolRegistry {
+        static_tools: Arc::clone(&ctx.tools),
+        queue_tools,
+        scratchpad: Some(Arc::clone(&scratchpad_arc)),
+        memory: Some(Arc::clone(&ctx.memory)),
+    };
+
     let loop_config = LoopConfig {
         persona: &ctx.persona,
         llm: ctx.llm.as_ref(),
-        tools,
+        tools: &tools,
         estimator: &ctx.estimator,
         max_tool_result_bytes: ctx.max_tool_result_bytes,
-        scratchpad: Some(&scratchpad),
+        scratchpad: Some(&scratchpad_arc),
         memory: Some(ctx.memory.as_ref()),
         cancel: None,
         timeout: None,
@@ -185,7 +187,10 @@ async fn execute_claim(
         drop(est);
         let _ = ctx.long_term.persist_calibration(&cal).await;
     }
-    let mut scratchpad = scratchpad.into_inner();
+    let scratchpad = match Arc::try_unwrap(scratchpad_arc) {
+        Ok(mutex) => mutex.into_inner(),
+        Err(arc) => arc.lock().await.clone(),
+    };
 
     if let Some(ref text) = final_text {
         if text.starts_with("LLM error:") {
@@ -202,12 +207,8 @@ async fn execute_claim(
         }
     }
 
-    if let Ok(updated_pad) = ctx.memory.load_or_create(job_id).await {
-        // Preserve the log from our run, merge with any tool-updated fields
-        let log = scratchpad.log.clone();
-        scratchpad = updated_pad;
-        scratchpad.log = log;
-    }
+    // Scratchpad is already up-to-date — tool calls went through the mutex.
+    // Just persist the final state.
     let _ = ctx.memory.save(&scratchpad).await;
 
     let record = AttemptRecord {

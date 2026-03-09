@@ -315,7 +315,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
     let max_retries = agent_config.agent.max_retries;
     let max_tool_result_bytes = agent_config.context_budget.max_tool_result_tokens * 4;
     let remaining_delegate_depth = invariants.limits.max_sub_agent_depth;
-    let roles = agent_config.roles.clone();
+    let roles: Arc<[apex_core::config::RoleProfile]> = agent_config.roles.clone().into();
 
     let llm: Arc<dyn apex_core::ports::LlmProvider> = Arc::new(
         AnthropicProvider::from_env_with_model(&agent_config.agent.model)
@@ -358,7 +358,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         estimator: estimator.clone(),
         config: SpawnerConfig {
             invariants: Arc::clone(&invariants),
-            roles: roles.clone(),
+            roles: Arc::clone(&roles),
             max_tool_result_bytes,
             remaining_delegate_depth,
         },

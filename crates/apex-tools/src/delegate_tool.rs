@@ -31,7 +31,7 @@ pub trait SubAgentSpawner: Send + Sync {
 /// Spawns a full sub-agent subprocess with its own queue, working memory,
 /// and scratchpad — just like the main worker process.
 pub struct DelegateToolRegistry {
-    roles: Vec<RoleProfile>,
+    roles: Arc<[RoleProfile]>,
     prompts_dir: PathBuf,
     spawner: Arc<dyn SubAgentSpawner>,
     remaining_depth: u32,
@@ -39,7 +39,7 @@ pub struct DelegateToolRegistry {
 
 impl DelegateToolRegistry {
     pub fn new(
-        roles: Vec<RoleProfile>,
+        roles: Arc<[RoleProfile]>,
         prompts_dir: PathBuf,
         spawner: Arc<dyn SubAgentSpawner>,
         remaining_depth: u32,

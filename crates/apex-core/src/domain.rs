@@ -93,11 +93,11 @@ pub enum SpillStrategy {
     TailOnly,
 }
 
-/// Request to the LLM.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompletionRequest {
-    pub system_prompt: String,
-    pub messages: Vec<ChatMessage>,
+/// Request to the LLM. Borrows system prompt and messages to avoid O(n²) cloning per turn.
+#[derive(Debug)]
+pub struct CompletionRequest<'a> {
+    pub system_prompt: &'a str,
+    pub messages: &'a [ChatMessage],
     pub max_tokens: u32,
     pub temperature: Option<f32>,
 }

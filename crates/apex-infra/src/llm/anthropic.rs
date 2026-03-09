@@ -148,12 +148,12 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
-    async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+    async fn complete(&self, req: CompletionRequest<'_>) -> Result<CompletionResponse, LlmError> {
         let body = serde_json::json!({
             "model": self.model,
             "max_tokens": req.max_tokens,
             "system": req.system_prompt,
-            "messages": Self::build_messages(&req.messages),
+            "messages": Self::build_messages(req.messages),
         });
 
         let response = self.send_request(body).await?;
@@ -172,14 +172,14 @@ impl LlmProvider for AnthropicProvider {
 
     async fn complete_with_tools(
         &self,
-        req: CompletionRequest,
+        req: CompletionRequest<'_>,
         tools: &[ToolSchema],
     ) -> Result<ToolCompletionResponse, LlmError> {
         let body = serde_json::json!({
             "model": self.model,
             "max_tokens": req.max_tokens,
             "system": req.system_prompt,
-            "messages": Self::build_messages(&req.messages),
+            "messages": Self::build_messages(req.messages),
             "tools": Self::build_tools(tools),
             "tool_choice": { "type": "auto" },
         });

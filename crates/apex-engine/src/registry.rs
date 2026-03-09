@@ -2,9 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde_json::Value;
+use tokio::sync::Mutex;
 
 use apex_core::config::{Invariants, RoleProfile};
-use apex_core::domain::{ToolCall, ToolDef, ToolResult};
+use apex_core::domain::{
+    Scratchpad, SubtaskEntry, SubtaskStatus, ToolCall, ToolDef, ToolResult,
+};
 use apex_core::error::ToolError;
 use apex_core::ports::{MemoryStore, ToolRegistry, WorkingMemory};
 
@@ -59,9 +63,14 @@ impl ToolRegistry for CompositeToolRegistry {
 }
 
 /// Single registry that dispatches to static tools first, then per-claim queue tools.
+/// When a scratchpad mutex is provided, `working_memory_read` and `working_memory_update`
+/// are intercepted to operate on the shared in-memory scratchpad instead of going through
+/// the disk-based `MemoryToolRegistry`.
 pub struct ApexToolRegistry {
     pub static_tools: Arc<CompositeToolRegistry>,
     pub queue_tools: QueueToolRegistry,
+    pub scratchpad: Option<Arc<Mutex<Scratchpad>>>,
+    pub memory: Option<Arc<dyn WorkingMemory>>,
 }
 
 #[async_trait]
@@ -73,11 +82,90 @@ impl ToolRegistry for ApexToolRegistry {
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        // Intercept working memory tools to use the shared mutex
+        if let Some(ref pad_arc) = self.scratchpad {
+            match call.name.as_str() {
+                "working_memory_read" => {
+                    let pad = pad_arc.lock().await;
+                    return Ok(ToolResult {
+                        tool_use_id: call.id.clone(),
+                        name: call.name.clone(),
+                        output: serde_json::json!({ "content": pad.to_markdown() }),
+                        is_error: false,
+                        ..Default::default()
+                    });
+                }
+                "working_memory_update" => {
+                    let mut pad = pad_arc.lock().await;
+                    apply_wm_update(&mut pad, call)?;
+                    // Persist to disk for durability
+                    if let Some(ref mem) = self.memory {
+                        let _ = mem.save(&pad).await;
+                    }
+                    return Ok(ToolResult {
+                        tool_use_id: call.id.clone(),
+                        name: call.name.clone(),
+                        output: serde_json::json!({ "content": pad.to_markdown() }),
+                        is_error: false,
+                        ..Default::default()
+                    });
+                }
+                _ => {}
+            }
+        }
+
         if self.static_tools.by_name.contains_key(&call.name) {
             return self.static_tools.execute(call).await;
         }
         self.queue_tools.execute(call).await
     }
+}
+
+/// Apply working_memory_update mutations to a scratchpad (same logic as MemoryToolRegistry).
+fn apply_wm_update(pad: &mut Scratchpad, call: &ToolCall) -> Result<(), ToolError> {
+    if let Some(goal) = call.input.get("goal").and_then(Value::as_str) {
+        pad.goal = goal.to_string();
+    }
+    if let Some(summary) = call.input.get("status_summary").and_then(Value::as_str) {
+        pad.status_summary = summary.to_string();
+    }
+    if let Some(note) = call.input.get("add_note").and_then(Value::as_str) {
+        pad.notes.push(note.to_string());
+    }
+    if let Some(st) = call.input.get("add_subtask") {
+        let desc = st["description"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidInput("add_subtask.description required".into()))?;
+        let next_index = pad.subtasks.last().map_or(1, |s| s.index + 1);
+        pad.subtasks.push(SubtaskEntry {
+            index: next_index,
+            description: desc.to_string(),
+            status: SubtaskStatus::Pending,
+            task_id: st.get("task_id").and_then(Value::as_str).map(String::from),
+            depends_on: st.get("depends_on").and_then(Value::as_str).map(String::from),
+        });
+    }
+    if let Some(upd) = call.input.get("update_subtask") {
+        let index = upd["index"]
+            .as_u64()
+            .ok_or_else(|| ToolError::InvalidInput("update_subtask.index required".into()))?
+            as u32;
+        let status_str = upd["status"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidInput("update_subtask.status required".into()))?;
+        let status = match status_str {
+            "done" => SubtaskStatus::Done,
+            "active" => SubtaskStatus::Active,
+            "pending" => SubtaskStatus::Pending,
+            other => return Err(ToolError::InvalidInput(format!("invalid status: {other}"))),
+        };
+        if let Some(entry) = pad.subtasks.iter_mut().find(|s| s.index == index) {
+            entry.status = status;
+        } else {
+            return Err(ToolError::InvalidInput(format!("subtask index {index} not found")));
+        }
+    }
+    Ok(())
 }
 
 /// Owned filtered view of a ToolRegistry — filters by allowed tool names.
@@ -117,7 +205,7 @@ pub fn build_static_tools(
     long_term: Arc<dyn MemoryStore>,
     invariants: Arc<Invariants>,
     spawner: Arc<dyn SubAgentSpawner>,
-    roles: Vec<RoleProfile>,
+    roles: Arc<[RoleProfile]>,
     remaining_delegate_depth: u32,
 ) -> Arc<CompositeToolRegistry> {
     let memory_tools = MemoryToolRegistry::new(memory, long_term.clone());

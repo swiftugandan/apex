@@ -26,7 +26,7 @@ pub struct InfraFactories {
 /// Static configuration for sub-agent spawning.
 pub struct SpawnerConfig {
     pub invariants: Arc<Invariants>,
-    pub roles: Vec<RoleProfile>,
+    pub roles: Arc<[RoleProfile]>,
     pub max_tool_result_bytes: usize,
     pub remaining_delegate_depth: u32,
 }
@@ -92,7 +92,7 @@ impl SubAgentSpawner for InProcessSpawner {
             estimator: Arc::clone(&self.estimator),
             config: SpawnerConfig {
                 invariants: Arc::clone(&self.config.invariants),
-                roles: self.config.roles.clone(),
+                roles: Arc::clone(&self.config.roles),
                 max_tool_result_bytes: self.config.max_tool_result_bytes,
                 remaining_delegate_depth: sub_depth,
             },
@@ -106,7 +106,7 @@ impl SubAgentSpawner for InProcessSpawner {
             sub_long_term.clone(),
             Arc::clone(&self.config.invariants),
             sub_spawner,
-            self.config.roles.clone(),
+            Arc::clone(&self.config.roles),
             sub_depth,
         );
 

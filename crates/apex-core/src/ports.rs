@@ -9,11 +9,11 @@ use crate::error::{LlmError, MemoryError, QueueError, ToolError};
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
-    async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, LlmError>;
+    async fn complete(&self, req: CompletionRequest<'_>) -> Result<CompletionResponse, LlmError>;
 
     async fn complete_with_tools(
         &self,
-        req: CompletionRequest,
+        req: CompletionRequest<'_>,
         tools: &[ToolSchema],
     ) -> Result<ToolCompletionResponse, LlmError>;
 

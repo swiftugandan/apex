@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use futures::future::join_all;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -22,7 +23,7 @@ pub struct LoopConfig<'a> {
     pub tools: &'a dyn ToolRegistry,
     pub estimator: &'a Arc<Mutex<TokenEstimator>>,
     pub max_tool_result_bytes: usize,
-    pub scratchpad: Option<&'a Mutex<apex_core::domain::Scratchpad>>,
+    pub scratchpad: Option<&'a Arc<Mutex<apex_core::domain::Scratchpad>>>,
     pub memory: Option<&'a dyn WorkingMemory>,
     /// Optional cancellation token — checked before each turn.
     pub cancel: Option<&'a CancellationToken>,
@@ -59,8 +60,8 @@ pub async fn run_agentic_loop(
         }
 
         let req = CompletionRequest {
-            system_prompt: system_prompt.clone(),
-            messages: messages.clone(),
+            system_prompt: &system_prompt,
+            messages: &messages,
             max_tokens: MAX_TOKENS,
             temperature: Some(0.2),
         };
@@ -110,22 +111,29 @@ pub async fn run_agentic_loop(
         let mut call_records = Vec::new();
         let mut result_blocks = Vec::new();
 
-        for call in &resp.tool_calls {
-            eprintln!("  ↳ {}(…)", call.name);
-            let start = Instant::now();
+        // Execute all tool calls concurrently
+        let tool_futures: Vec<_> = resp.tool_calls.iter().map(|call| {
+            async move {
+                eprintln!("  ↳ {}(…)", call.name);
+                let start = Instant::now();
+                let result = match config.tools.execute(call).await {
+                    Ok(r) => r,
+                    Err(err) => apex_core::domain::ToolResult {
+                        tool_use_id: call.id.clone(),
+                        name: call.name.clone(),
+                        output: serde_json::json!({ "error": err.to_string() }),
+                        is_error: true,
+                        ..Default::default()
+                    },
+                };
+                (call, result, start.elapsed())
+            }
+        }).collect();
 
-            let result = match config.tools.execute(call).await {
-                Ok(r) => r,
-                Err(err) => apex_core::domain::ToolResult {
-                    tool_use_id: call.id.clone(),
-                    name: call.name.clone(),
-                    output: serde_json::json!({ "error": err.to_string() }),
-                    is_error: true,
-                    ..Default::default()
-                },
-            };
+        let results = join_all(tool_futures).await;
 
-            let duration_ms = start.elapsed().as_millis() as u64;
+        for (call, result, elapsed) in results {
+            let duration_ms = elapsed.as_millis() as u64;
 
             call_records.push(ToolCallRecord {
                 name: call.name.clone(),
