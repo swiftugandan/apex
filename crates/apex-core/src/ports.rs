@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use crate::domain::{
     CalibrationData, ClaimedTask, CompletionRequest, CompletionResponse, Fact, FactId, QueueDepth,
-    QueueMessage, QueueMessageMeta, ReapResult, Scratchpad, Skill, SkillId, Strategy, StrategyId,
+    QueueMessage, QueueMessageMeta, ReapResult, Scratchpad, Skill, SkillId,
     ToolCall, ToolCompletionResponse, ToolDef, ToolResult, ToolSchema,
 };
 use crate::error::{LlmError, MemoryError, QueueError, ToolError};
@@ -70,19 +70,14 @@ pub trait MemoryStore: Send + Sync {
     async fn store_fact(&self, fact: Fact) -> Result<FactId, MemoryError>;
     async fn query_facts(&self, query: &str, limit: usize) -> Result<Vec<Fact>, MemoryError>;
     async fn verify_fact(&self, id: &FactId) -> Result<(), MemoryError>;
+    async fn persist_calibration(&self, data: &CalibrationData) -> Result<(), MemoryError>;
+    async fn load_calibration(&self) -> Result<CalibrationData, MemoryError>;
+}
+
+#[async_trait]
+pub trait SkillStore: Send + Sync {
     async fn store_skill(&self, skill: Skill) -> Result<SkillId, MemoryError>;
     async fn find_skill(&self, task_pattern: &str) -> Result<Option<Skill>, MemoryError>;
     async fn list_skills(&self, limit: usize) -> Result<Vec<Skill>, MemoryError>;
     async fn update_skill_fitness(&self, id: &SkillId, success: bool) -> Result<(), MemoryError>;
-    async fn store_strategy(&self, strategy: Strategy) -> Result<StrategyId, MemoryError>;
-    async fn find_strategy(&self, goal: &str) -> Result<Option<Strategy>, MemoryError>;
-    async fn list_strategies(&self, limit: usize) -> Result<Vec<Strategy>, MemoryError>;
-    async fn update_strategy_fitness(
-        &self,
-        id: &StrategyId,
-        success: bool,
-    ) -> Result<(), MemoryError>;
-
-    async fn persist_calibration(&self, data: &CalibrationData) -> Result<(), MemoryError>;
-    async fn load_calibration(&self) -> Result<CalibrationData, MemoryError>;
 }

@@ -264,9 +264,6 @@ pub struct FactId(pub String);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillId(pub String);
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StrategyId(pub String);
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fact {
     pub id: FactId,
@@ -278,9 +275,27 @@ pub struct Fact {
     pub tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillStatus {
+    Active,
+    Retired,
+}
+
+impl std::fmt::Display for SkillStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SkillStatus::Active => f.write_str("active"),
+            SkillStatus::Retired => f.write_str("retired"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
     pub id: SkillId,
+    pub name: String,
+    pub description: String,
     pub task_pattern: String,
     pub approach: String,
     pub tools_used: Vec<String>,
@@ -291,19 +306,247 @@ pub struct Skill {
     pub min_samples: u32,
     pub last_used: String,
     pub notes: String,
+    #[serde(default = "default_skill_status")]
+    pub status: SkillStatus,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Strategy {
-    pub id: StrategyId,
-    pub goal_pattern: String,
-    pub decomposition: String,
-    pub avg_subtasks: f64,
-    pub avg_duration_secs: f64,
-    pub success_count: u32,
-    pub failure_count: u32,
-    pub fitness: f64,
-    pub notes: String,
+fn default_skill_status() -> SkillStatus {
+    SkillStatus::Active
+}
+
+/// Convert a task_pattern into a filename-safe slug.
+pub fn slugify(s: &str) -> String {
+    let lower = s.to_lowercase();
+    let slug: String = lower
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    // Collapse consecutive dashes and trim
+    let mut result = String::new();
+    let mut prev_dash = false;
+    for c in slug.chars() {
+        if c == '-' {
+            if !prev_dash && !result.is_empty() {
+                result.push('-');
+            }
+            prev_dash = true;
+        } else {
+            result.push(c);
+            prev_dash = false;
+        }
+    }
+    result.trim_end_matches('-').to_string()
+}
+
+impl Skill {
+    /// Serialize this skill to a markdown file with YAML frontmatter.
+    pub fn to_markdown(&self) -> String {
+        let tools_str = format!("[{}]", self.tools_used.join(", "));
+        let name = if self.name.is_empty() {
+            slugify(&self.task_pattern)
+        } else {
+            self.name.clone()
+        };
+        let description = if self.description.is_empty() {
+            self.task_pattern.clone()
+        } else {
+            self.description.clone()
+        };
+        let mut out = format!(
+            "---\n\
+             name: {}\n\
+             description: \"{}\"\n\
+             id: {}\n\
+             task_pattern: \"{}\"\n\
+             tools_used: {}\n\
+             success_count: {}\n\
+             failure_count: {}\n\
+             fitness: {:.2}\n\
+             min_samples: {}\n\
+             last_used: \"{}\"\n\
+             status: {}\n\
+             ---\n\n",
+            name,
+            description.replace('"', "\\\""),
+            self.id.0,
+            self.task_pattern.replace('"', "\\\""),
+            tools_str,
+            self.success_count,
+            self.failure_count,
+            self.fitness,
+            self.min_samples,
+            self.last_used,
+            self.status,
+        );
+
+        out.push_str("## Approach\n\n");
+        out.push_str(&self.approach);
+        out.push_str("\n\n");
+
+        if let Some(ref criteria) = self.criteria_template {
+            out.push_str("## Acceptance Criteria\n\n");
+            out.push_str(criteria);
+            out.push_str("\n\n");
+        }
+
+        if !self.notes.is_empty() {
+            out.push_str("## Notes\n\n");
+            out.push_str(&self.notes);
+            out.push('\n');
+        }
+
+        out
+    }
+
+    /// Parse a skill from a markdown file with YAML frontmatter.
+    pub fn from_markdown(md: &str) -> Result<Self, String> {
+        // Split frontmatter from body
+        let md = md.trim_start();
+        if !md.starts_with("---") {
+            return Err("missing frontmatter delimiter".to_string());
+        }
+        let after_first = &md[3..];
+        let end = after_first
+            .find("\n---")
+            .ok_or("missing closing frontmatter delimiter")?;
+        let frontmatter = &after_first[..end];
+        let body = &after_first[end + 4..]; // skip "\n---"
+
+        // Parse frontmatter key-value pairs
+        let mut id = String::new();
+        let mut name = String::new();
+        let mut description = String::new();
+        let mut task_pattern = String::new();
+        let mut tools_used: Vec<String> = Vec::new();
+        let mut success_count: u32 = 0;
+        let mut failure_count: u32 = 0;
+        let mut fitness: f64 = 0.0;
+        let mut min_samples: u32 = 3;
+        let mut last_used = String::new();
+        let mut status = SkillStatus::Active;
+
+        for line in frontmatter.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once(':') {
+                let key = key.trim();
+                let value = value.trim().trim_matches('"');
+                match key {
+                    "id" => id = value.to_string(),
+                    "name" => name = value.to_string(),
+                    "description" => description = value.replace("\\\"", "\""),
+                    "task_pattern" => task_pattern = value.replace("\\\"", "\""),
+                    "tools_used" => {
+                        // Parse "[bash, shell_exec]"
+                        let inner = value.trim_start_matches('[').trim_end_matches(']');
+                        if !inner.is_empty() {
+                            tools_used = inner
+                                .split(',')
+                                .map(|s| s.trim().trim_matches('"').to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                        }
+                    }
+                    "success_count" => success_count = value.parse().unwrap_or(0),
+                    "failure_count" => failure_count = value.parse().unwrap_or(0),
+                    "fitness" => fitness = value.parse().unwrap_or(0.0),
+                    "min_samples" => min_samples = value.parse().unwrap_or(3),
+                    "last_used" => last_used = value.to_string(),
+                    "status" => {
+                        status = match value {
+                            "retired" => SkillStatus::Retired,
+                            _ => SkillStatus::Active,
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if id.is_empty() {
+            return Err("missing id in frontmatter".to_string());
+        }
+
+        // Parse body sections
+        let mut approach = String::new();
+        let mut criteria_template: Option<String> = None;
+        let mut notes = String::new();
+
+        #[derive(PartialEq)]
+        enum Section {
+            None,
+            Approach,
+            Criteria,
+            Notes,
+        }
+        let mut section = Section::None;
+
+        for line in body.lines() {
+            if line.starts_with("## Approach") {
+                section = Section::Approach;
+                continue;
+            }
+            if line.starts_with("## Acceptance Criteria") {
+                section = Section::Criteria;
+                criteria_template = Some(String::new());
+                continue;
+            }
+            if line.starts_with("## Notes") {
+                section = Section::Notes;
+                continue;
+            }
+            fn append_line(buf: &mut String, line: &str) {
+                if !buf.is_empty() || !line.is_empty() {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(line);
+                }
+            }
+            match section {
+                Section::Approach => append_line(&mut approach, line),
+                Section::Criteria => {
+                    if let Some(ref mut c) = criteria_template {
+                        append_line(c, line);
+                    }
+                }
+                Section::Notes => append_line(&mut notes, line),
+                Section::None => {}
+            }
+        }
+
+        // Trim trailing whitespace from parsed sections
+        let approach = approach.trim_end().to_string();
+        let criteria_template = criteria_template.map(|c| c.trim_end().to_string()).filter(|c| !c.is_empty());
+        let notes = notes.trim_end().to_string();
+
+        // Derive name/description from task_pattern for backward compat
+        if name.is_empty() {
+            name = slugify(&task_pattern);
+        }
+        if description.is_empty() {
+            description = task_pattern.clone();
+        }
+
+        Ok(Skill {
+            id: SkillId(id),
+            name,
+            description,
+            task_pattern,
+            approach,
+            tools_used,
+            criteria_template,
+            success_count,
+            failure_count,
+            fitness,
+            min_samples,
+            last_used,
+            notes,
+            status,
+        })
+    }
 }
 
 // ── Working Memory types ──────────────────────────────────────────

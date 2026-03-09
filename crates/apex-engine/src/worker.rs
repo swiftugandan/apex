@@ -7,7 +7,7 @@ use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{
     AttemptOutcome, AttemptRecord, ChatMessage, ClaimedTask, MessageType,
 };
-use apex_core::ports::{LlmProvider, MemoryStore, Queue, WorkingMemory};
+use apex_core::ports::{LlmProvider, MemoryStore, Queue, SkillStore, WorkingMemory};
 
 use apex_tools::QueueToolRegistry;
 
@@ -25,6 +25,7 @@ pub struct WorkerContext {
     pub llm: Arc<dyn LlmProvider>,
     pub memory: Arc<dyn WorkingMemory>,
     pub long_term: Arc<dyn MemoryStore>,
+    pub skills: Arc<dyn SkillStore>,
     pub persona: Arc<String>,
     pub max_depth: u32,
     pub max_retries: u32,
@@ -92,6 +93,7 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
             title.clone(),
             claimed.body.clone(),
             Some(Arc::clone(&ctx.long_term)),
+            Some(Arc::clone(&ctx.skills)),
             composer,
         );
 
@@ -224,6 +226,7 @@ async fn execute_claim(
     // Best-effort consolidation
     consolidate_learnings(
         ctx.long_term.as_ref(),
+        ctx.skills.as_ref(),
         &claimed.headers.correlation_id,
         &record,
         &scratchpad,

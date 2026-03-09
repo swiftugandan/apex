@@ -4,28 +4,36 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use apex_core::domain::{
-    Fact, FactId, Skill, SkillId, Strategy, StrategyId, SubtaskEntry, SubtaskStatus, ToolCall,
-    ToolDef, ToolResult, ToolSchema,
+    slugify, Fact, FactId, Skill, SkillId, SkillStatus, SubtaskEntry,
+    SubtaskStatus, ToolCall, ToolDef, ToolResult, ToolSchema,
 };
 use apex_core::error::ToolError;
-use apex_core::ports::{MemoryStore, ToolRegistry, WorkingMemory};
+use apex_core::ports::{MemoryStore, SkillStore, ToolRegistry, WorkingMemory};
 
 /// Unified memory tool registry providing both working memory (scratchpad) and
 /// long-term memory (facts, skills, strategies) tools.
 ///
-/// 7 tools total:
+/// 6 tools total:
 /// - working_memory_read, working_memory_update (working memory / scratchpad)
 /// - memory_store_fact, memory_query_facts (long-term facts)
 /// - memory_store_skill, memory_query_skill (long-term skills)
-/// - memory_store_strategy (long-term strategies)
 pub struct MemoryToolRegistry {
     memory: Arc<dyn WorkingMemory>,
     store: Arc<dyn MemoryStore>,
+    skill_store: Arc<dyn SkillStore>,
 }
 
 impl MemoryToolRegistry {
-    pub fn new(memory: Arc<dyn WorkingMemory>, store: Arc<dyn MemoryStore>) -> Self {
-        Self { memory, store }
+    pub fn new(
+        memory: Arc<dyn WorkingMemory>,
+        store: Arc<dyn MemoryStore>,
+        skill_store: Arc<dyn SkillStore>,
+    ) -> Self {
+        Self {
+            memory,
+            store,
+            skill_store,
+        }
     }
 }
 
@@ -155,6 +163,14 @@ impl ToolRegistry for MemoryToolRegistry {
                                 "type": "string",
                                 "description": "Pattern describing what kind of task this skill applies to"
                             },
+                            "name": {
+                                "type": "string",
+                                "description": "Slug name for the skill (e.g. 'install-package'). Derived from task_pattern if omitted."
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Human-readable one-liner describing the skill. Defaults to task_pattern if omitted."
+                            },
                             "approach": {
                                 "type": "string",
                                 "description": "Description of the approach/strategy used"
@@ -193,35 +209,6 @@ impl ToolRegistry for MemoryToolRegistry {
                     }),
                 },
             },
-            // ── Long-Term Memory: Strategies ────────────────────────
-            ToolDef {
-                schema: ToolSchema {
-                    name: "memory_store_strategy".into(),
-                    description: "Store or update a decomposition strategy for a goal pattern.".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "goal_pattern": {
-                                "type": "string",
-                                "description": "Pattern describing the goal this strategy applies to"
-                            },
-                            "decomposition": {
-                                "type": "string",
-                                "description": "Description of how the goal was decomposed into subtasks"
-                            },
-                            "avg_subtasks": {
-                                "type": "number",
-                                "description": "Average number of subtasks in this decomposition"
-                            },
-                            "notes": {
-                                "type": "string",
-                                "description": "Additional notes"
-                            }
-                        },
-                        "required": ["goal_pattern", "decomposition"]
-                    }),
-                },
-            },
         ]
     }
 
@@ -235,7 +222,6 @@ impl ToolRegistry for MemoryToolRegistry {
             "memory_query_facts" => self.exec_query_facts(call).await,
             "memory_store_skill" => self.exec_store_skill(call).await,
             "memory_query_skill" => self.exec_query_skill(call).await,
-            "memory_store_strategy" => self.exec_store_strategy(call).await,
             _ => Err(ToolError::UnknownTool(call.name.clone())),
         }
     }
@@ -459,8 +445,23 @@ impl MemoryToolRegistry {
             .unwrap_or("")
             .to_string();
 
+        let name = call
+            .input
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| slugify(task_pattern));
+        let description = call
+            .input
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| task_pattern.to_string());
+
         let skill = Skill {
             id: SkillId(String::new()),
+            name,
+            description,
             task_pattern: task_pattern.to_string(),
             approach: approach.to_string(),
             tools_used,
@@ -471,10 +472,11 @@ impl MemoryToolRegistry {
             min_samples: 3,
             last_used: String::new(),
             notes,
+            status: SkillStatus::Active,
         };
 
         let id = self
-            .store
+            .skill_store
             .store_skill(skill)
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
@@ -494,7 +496,7 @@ impl MemoryToolRegistry {
             .ok_or_else(|| ToolError::InvalidInput("missing task_pattern".into()))?;
 
         let skill = self
-            .store
+            .skill_store
             .find_skill(task_pattern)
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
@@ -503,6 +505,8 @@ impl MemoryToolRegistry {
             Some(s) => json!({
                 "found": true,
                 "id": s.id.0,
+                "name": s.name,
+                "description": s.description,
                 "task_pattern": s.task_pattern,
                 "approach": s.approach,
                 "tools_used": s.tools_used,
@@ -523,56 +527,12 @@ impl MemoryToolRegistry {
         })
     }
 
-    async fn exec_store_strategy(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let goal_pattern = call.input["goal_pattern"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidInput("missing goal_pattern".into()))?;
-        let decomposition = call.input["decomposition"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidInput("missing decomposition".into()))?;
-        let avg_subtasks = call
-            .input
-            .get("avg_subtasks")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let notes = call
-            .input
-            .get("notes")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let strategy = Strategy {
-            id: StrategyId(String::new()),
-            goal_pattern: goal_pattern.to_string(),
-            decomposition: decomposition.to_string(),
-            avg_subtasks,
-            avg_duration_secs: 0.0,
-            success_count: 0,
-            failure_count: 0,
-            fitness: 0.5,
-            notes,
-        };
-
-        let id = self
-            .store
-            .store_strategy(strategy)
-            .await
-            .map_err(|e| ToolError::Execution(e.to_string()))?;
-
-        Ok(ToolResult {
-            tool_use_id: call.id.clone(),
-            name: call.name.clone(),
-            output: json!({ "id": id.0, "status": "stored" }),
-            is_error: false,
-            ..Default::default()
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apex_infra::FsSkillStore;
     use apex_infra::FsScratchpadStore;
     use apex_infra::SqliteMemoryStore;
 
@@ -582,15 +542,17 @@ mod tests {
             Arc::new(FsScratchpadStore::new(dir.path().join("working")));
         let lt: Arc<dyn MemoryStore> =
             Arc::new(SqliteMemoryStore::open(&dir.path().join("memory.db")).unwrap());
-        let reg = MemoryToolRegistry::new(wm, lt);
+        let skills: Arc<dyn SkillStore> =
+            Arc::new(FsSkillStore::new(dir.path().join("skills")));
+        let reg = MemoryToolRegistry::new(wm, lt, skills);
         (dir, reg)
     }
 
     #[test]
-    fn definitions_returns_7_tools() {
+    fn definitions_returns_6_tools() {
         let (_dir, reg) = setup();
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 7);
+        assert_eq!(defs.len(), 6);
         let names: Vec<&str> = defs.iter().map(|d| d.schema.name.as_str()).collect();
         assert!(names.contains(&"working_memory_read"));
         assert!(names.contains(&"working_memory_update"));
@@ -598,7 +560,6 @@ mod tests {
         assert!(names.contains(&"memory_query_facts"));
         assert!(names.contains(&"memory_store_skill"));
         assert!(names.contains(&"memory_query_skill"));
-        assert!(names.contains(&"memory_store_strategy"));
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@ pub struct ProjectPaths {
     pub prompts_dir: PathBuf,    // root/prompts
     pub working_memory: PathBuf, // root/memory/working
     pub long_term_dir: PathBuf,  // root/memory/long-term
+    pub skills_dir: PathBuf,     // root/memory/long-term/skills
     pub scratch_dir: PathBuf,    // root/scratch
     pub tools_dir: PathBuf,      // root/tools
     pub config_dir: PathBuf,     // root/config
@@ -27,12 +28,14 @@ impl ProjectPaths {
 
     /// Build paths from a given root directory.
     pub fn from_root(root: PathBuf) -> Self {
+        let long_term_dir = root.join("memory").join("long-term");
         Self {
             work_queue: root.join("queues").join("work"),
             queues_dir: root.join("queues"),
             prompts_dir: root.join("prompts"),
             working_memory: root.join("memory").join("working"),
-            long_term_dir: root.join("memory").join("long-term"),
+            skills_dir: long_term_dir.join("skills"),
+            long_term_dir,
             scratch_dir: root.join("scratch"),
             tools_dir: root.join("tools"),
             config_dir: root.join("config"),
@@ -53,6 +56,8 @@ impl ProjectPaths {
             .context("failed to create memory/working/ directory")?;
         std::fs::create_dir_all(&self.long_term_dir)
             .context("failed to create memory/long-term/ directory")?;
+        std::fs::create_dir_all(&self.skills_dir)
+            .context("failed to create memory/long-term/skills/ directory")?;
         std::fs::create_dir_all(&self.scratch_dir)
             .context("failed to create scratch/ directory")?;
         std::fs::create_dir_all(self.tools_dir.join("custom"))

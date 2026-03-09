@@ -10,7 +10,7 @@ use apex_core::domain::{
     Scratchpad, SubtaskEntry, SubtaskStatus, ToolCall, ToolDef, ToolResult,
 };
 use apex_core::error::ToolError;
-use apex_core::ports::{MemoryStore, ToolRegistry, WorkingMemory};
+use apex_core::ports::{MemoryStore, SkillStore, ToolRegistry, WorkingMemory};
 
 use apex_tools::{
     BuiltinToolRegistry, ConfigToolRegistry, CustomToolRegistry, DelegateToolRegistry,
@@ -203,17 +203,18 @@ pub fn build_static_tools(
     paths: &ProjectPaths,
     memory: Arc<dyn WorkingMemory>,
     long_term: Arc<dyn MemoryStore>,
+    skills: Arc<dyn SkillStore>,
     invariants: Arc<Invariants>,
     spawner: Arc<dyn SubAgentSpawner>,
     roles: Arc<[RoleProfile]>,
     remaining_delegate_depth: u32,
 ) -> Arc<CompositeToolRegistry> {
-    let memory_tools = MemoryToolRegistry::new(memory, long_term.clone());
+    let memory_tools = MemoryToolRegistry::new(memory, long_term.clone(), skills.clone());
     let custom_spill = SpillManager::new(paths.scratch_dir.clone());
     let custom_tools = CustomToolRegistry::new(
         paths.tools_dir.clone(),
         custom_spill,
-        Some(long_term.clone()),
+        Some(skills),
     );
     let config_tools = ConfigToolRegistry::new(paths.config_dir.clone(), Arc::clone(&invariants));
     let delegate_tools = DelegateToolRegistry::new(

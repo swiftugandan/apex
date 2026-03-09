@@ -9,12 +9,12 @@ use serde::Deserialize;
 use apex_core::config::{ConfigLoader, validate_full};
 use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{MessageHeaders, MessageType, QueueMessage};
-use apex_core::ports::{MemoryStore, Queue, WorkingMemory};
+use apex_core::ports::{MemoryStore, Queue, SkillStore, WorkingMemory};
 use apex_engine::{
     InProcessSpawner, InfraFactories, ProjectPaths, SpawnerConfig, WorkerContext,
     build_static_tools, worker_loop,
 };
-use apex_infra::{AnthropicProvider, FsScratchpadStore, RfbmqAdapter, SqliteMemoryStore};
+use apex_infra::{AnthropicProvider, FsSkillStore, FsScratchpadStore, RfbmqAdapter, SqliteMemoryStore};
 use apex_tools::spill::SpillManager;
 
 // ── CLI ────────────────────────────────────────────────────────────
@@ -62,14 +62,12 @@ async fn main() -> Result<()> {
             match subcmd {
                 Some("facts") => cmd_memory_facts().await,
                 Some("skills") => cmd_memory_skills().await,
-                Some("strategies") => cmd_memory_strategies().await,
                 Some("calibration") => cmd_memory_calibration().await,
                 None => {
                     cmd_memory_facts().await?;
-                    cmd_memory_skills().await?;
-                    cmd_memory_strategies().await
+                    cmd_memory_skills().await
                 }
-                Some(sub) => bail!("unknown memory subcommand: {sub}. Available: facts, skills, strategies, calibration"),
+                Some(sub) => bail!("unknown memory subcommand: {sub}. Available: facts, skills, calibration"),
             }
         }
         Some("scratch") => {
@@ -330,6 +328,8 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
             .context("failed to open long-term memory database")?,
     );
 
+    let skills: Arc<dyn SkillStore> = Arc::new(FsSkillStore::new(paths.skills_dir.clone()));
+
     let calibration = long_term.load_calibration().await.unwrap_or_default();
     let estimator = Arc::new(Mutex::new(TokenEstimator::new(calibration)));
 
@@ -350,10 +350,14 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
                 .map(|s| Arc::new(s) as Arc<dyn MemoryStore>)
                 .map_err(|e| e.to_string())
         }),
+        skill_store: Arc::new(|path| {
+            Arc::new(FsSkillStore::new(path.to_path_buf())) as Arc<dyn SkillStore>
+        }),
     });
     let spawner: Arc<dyn apex_tools::SubAgentSpawner> = Arc::new(InProcessSpawner {
         project_paths: paths.clone(),
         parent_long_term: long_term.clone(),
+        parent_skills: skills.clone(),
         llm: llm.clone(),
         estimator: estimator.clone(),
         config: SpawnerConfig {
@@ -369,6 +373,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         paths,
         memory.clone(),
         long_term.clone(),
+        skills.clone(),
         Arc::clone(&invariants),
         spawner,
         roles,
@@ -383,6 +388,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         llm,
         memory,
         long_term,
+        skills,
         persona: Arc::new(persona),
         max_depth,
         max_retries,
@@ -412,6 +418,14 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
 
 fn short_id(id: &str, max: usize) -> &str {
     if id.len() > max { &id[..max] } else { id }
+}
+
+fn truncate_col(s: &str, max: usize) -> String {
+    if s.len() > max {
+        format!("{}…", apex_core::truncate_str(s, max - 1))
+    } else {
+        s.to_string()
+    }
 }
 
 /// Open the long-term memory store and run the given closure.
@@ -444,11 +458,7 @@ async fn cmd_memory_facts() -> Result<()> {
         );
         for f in &facts {
             let short_id = short_id(&f.id.0, 18);
-            let content = if f.content.len() > 48 {
-                format!("{}…", apex_core::truncate_str(&f.content, 47))
-            } else {
-                f.content.clone()
-            };
+            let content = truncate_col(&f.content, 48);
             let tags = f.tags.join(", ");
             println!(
                 "{:<20} {:<50} {:<10.2} {:<20}",
@@ -462,64 +472,30 @@ async fn cmd_memory_facts() -> Result<()> {
 
 async fn cmd_memory_skills() -> Result<()> {
     let paths = ProjectPaths::resolve()?;
-    with_memory_store(&paths, |store| async move {
-        use apex_core::ports::MemoryStore;
-        let skills = store.list_skills(100).await?;
-        if skills.is_empty() {
-            println!("No skills stored.");
-            return Ok(());
-        }
-        println!("── Skills ({}) ──", skills.len());
+    let skill_store = FsSkillStore::new(paths.skills_dir.clone());
+    let skills = skill_store
+        .list_skills(100)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if skills.is_empty() {
+        println!("No skills stored.");
+        return Ok(());
+    }
+    println!("── Skills ({}) ──", skills.len());
+    println!(
+        "{:<20} {:<24} {:<30} {:<10} {:<8} {:<8} {:<8}",
+        "ID", "Name", "Description", "Fitness", "Success", "Failure", "Status"
+    );
+    for s in &skills {
+        let short_id = short_id(&s.id.0, 18);
+        let short_name = truncate_col(&s.name, 22);
+        let short_desc = truncate_col(&s.description, 28);
         println!(
-            "{:<20} {:<40} {:<10} {:<8} {:<8}",
-            "ID", "Pattern", "Fitness", "Success", "Failure"
+            "{:<20} {:<24} {:<30} {:<10.2} {:<8} {:<8} {:<8}",
+            short_id, short_name, short_desc, s.fitness, s.success_count, s.failure_count, s.status
         );
-        for s in &skills {
-            let short_id = short_id(&s.id.0, 18);
-            let short_pattern = if s.task_pattern.len() > 38 {
-                format!("{}…", apex_core::truncate_str(&s.task_pattern, 37))
-            } else {
-                s.task_pattern.clone()
-            };
-            println!(
-                "{:<20} {:<40} {:<10.2} {:<8} {:<8}",
-                short_id, short_pattern, s.fitness, s.success_count, s.failure_count
-            );
-        }
-        Ok(())
-    })
-    .await
-}
-
-async fn cmd_memory_strategies() -> Result<()> {
-    let paths = ProjectPaths::resolve()?;
-    with_memory_store(&paths, |store| async move {
-        use apex_core::ports::MemoryStore;
-        let strategies = store.list_strategies(100).await?;
-        if strategies.is_empty() {
-            println!("No strategies stored.");
-            return Ok(());
-        }
-        println!("── Strategies ({}) ──", strategies.len());
-        println!(
-            "{:<20} {:<40} {:<10} {:<12} {:<8} {:<8}",
-            "ID", "Goal Pattern", "Fitness", "Avg Subtasks", "Success", "Failure"
-        );
-        for s in &strategies {
-            let short_id = short_id(&s.id.0, 18);
-            let short_pattern = if s.goal_pattern.len() > 38 {
-                format!("{}…", apex_core::truncate_str(&s.goal_pattern, 37))
-            } else {
-                s.goal_pattern.clone()
-            };
-            println!(
-                "{:<20} {:<40} {:<10.2} {:<12.1} {:<8} {:<8}",
-                short_id, short_pattern, s.fitness, s.avg_subtasks, s.success_count, s.failure_count
-            );
-        }
-        Ok(())
-    })
-    .await
+    }
+    Ok(())
 }
 
 // ── Scratch and calibration CLI commands ───────────────────────────

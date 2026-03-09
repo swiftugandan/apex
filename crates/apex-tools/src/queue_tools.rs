@@ -8,7 +8,7 @@ use apex_core::domain::{
     MessageHeaders, MessageType, QueueMessage, ToolCall, ToolDef, ToolResult, ToolSchema,
 };
 use apex_core::error::ToolError;
-use apex_core::ports::{MemoryStore, Queue, ToolRegistry};
+use apex_core::ports::{MemoryStore, Queue, SkillStore, ToolRegistry};
 
 pub struct QueueToolRegistry {
     queue: Arc<dyn Queue>,
@@ -18,6 +18,7 @@ pub struct QueueToolRegistry {
     parent_goal: String,
     parent_body: String,
     store: Option<Arc<dyn MemoryStore>>,
+    skill_store: Option<Arc<dyn SkillStore>>,
     composer: MessageComposer,
 }
 
@@ -30,6 +31,7 @@ impl QueueToolRegistry {
         parent_goal: String,
         parent_body: String,
         store: Option<Arc<dyn MemoryStore>>,
+        skill_store: Option<Arc<dyn SkillStore>>,
         composer: MessageComposer,
     ) -> Self {
         Self {
@@ -40,6 +42,7 @@ impl QueueToolRegistry {
             parent_goal,
             parent_body,
             store,
+            skill_store,
             composer,
         }
     }
@@ -123,12 +126,18 @@ impl QueueToolRegistry {
             let title = info.description.lines().next().unwrap_or(&info.description);
             let title = apex_core::truncate_str(title, 80);
 
-            let (facts, skill) = if let Some(ref store) = self.store {
-                let facts = store.query_facts(&info.description, 3).await.ok().unwrap_or_default();
-                let skill = store.find_skill(&info.description).await.ok().flatten();
+            let (facts, skill) = {
+                let facts = if let Some(ref store) = self.store {
+                    store.query_facts(&info.description, 3).await.ok().unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let skill = if let Some(ref skill_store) = self.skill_store {
+                    skill_store.find_skill(&info.description).await.ok().flatten()
+                } else {
+                    None
+                };
                 (facts, skill)
-            } else {
-                (Vec::new(), None)
             };
 
             let body = if !facts.is_empty() || skill.is_some() {

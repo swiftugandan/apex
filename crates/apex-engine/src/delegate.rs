@@ -8,7 +8,7 @@ use apex_core::config::{Invariants, MemoryMode, RoleProfile};
 use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{MessageHeaders, MessageType, QueueMessage};
 use apex_core::error::ToolError;
-use apex_core::ports::{LlmProvider, MemoryStore, Queue, ToolRegistry, WorkingMemory};
+use apex_core::ports::{LlmProvider, MemoryStore, Queue, SkillStore, ToolRegistry, WorkingMemory};
 
 use apex_tools::{SubAgentResult, SubAgentSpawner};
 
@@ -21,6 +21,7 @@ pub struct InfraFactories {
     pub queue: Arc<dyn Fn(&std::path::Path) -> Result<Arc<dyn Queue>, String> + Send + Sync>,
     pub working_memory: Arc<dyn Fn(&std::path::Path) -> Arc<dyn WorkingMemory> + Send + Sync>,
     pub memory_store: Arc<dyn Fn(&std::path::Path) -> Result<Arc<dyn MemoryStore>, String> + Send + Sync>,
+    pub skill_store: Arc<dyn Fn(&std::path::Path) -> Arc<dyn SkillStore> + Send + Sync>,
 }
 
 /// Static configuration for sub-agent spawning.
@@ -36,6 +37,7 @@ pub struct SpawnerConfig {
 pub struct InProcessSpawner {
     pub project_paths: ProjectPaths,
     pub parent_long_term: Arc<dyn MemoryStore>,
+    pub parent_skills: Arc<dyn SkillStore>,
     pub llm: Arc<dyn LlmProvider>,
     pub estimator: Arc<Mutex<TokenEstimator>>,
     pub config: SpawnerConfig,
@@ -74,6 +76,9 @@ impl SubAgentSpawner for InProcessSpawner {
             }
         };
 
+        // 3b. Skills are always shared (they're files on disk)
+        let sub_skills: Arc<dyn SkillStore> = Arc::clone(&self.parent_skills);
+
         // 4. Resolve LLM — use role's model override if different
         // For now, we always use the parent's LLM since creating a new provider
         // requires infra knowledge. The model override would need the factory pattern too.
@@ -88,6 +93,7 @@ impl SubAgentSpawner for InProcessSpawner {
         let sub_spawner: Arc<dyn SubAgentSpawner> = Arc::new(InProcessSpawner {
             project_paths: self.project_paths.clone(),
             parent_long_term: sub_long_term.clone(),
+            parent_skills: sub_skills.clone(),
             llm: sub_llm.clone(),
             estimator: Arc::clone(&self.estimator),
             config: SpawnerConfig {
@@ -104,6 +110,7 @@ impl SubAgentSpawner for InProcessSpawner {
             &self.project_paths,
             sub_memory.clone(),
             sub_long_term.clone(),
+            sub_skills.clone(),
             Arc::clone(&self.config.invariants),
             sub_spawner,
             Arc::clone(&self.config.roles),
@@ -149,6 +156,7 @@ impl SubAgentSpawner for InProcessSpawner {
             llm: sub_llm,
             memory: sub_memory,
             long_term: sub_long_term,
+            skills: sub_skills,
             persona: Arc::new(persona.to_string()),
             max_depth: role.max_depth,
             max_retries: role.max_retries,

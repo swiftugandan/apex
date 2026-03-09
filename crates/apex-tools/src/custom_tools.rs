@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use apex_core::domain::{Skill, SkillId, ToolCall, ToolDef, ToolResult, ToolSchema};
+use apex_core::domain::{Skill, SkillId, SkillStatus, ToolCall, ToolDef, ToolResult, ToolSchema};
 use apex_core::error::ToolError;
-use apex_core::ports::{MemoryStore, ToolRegistry};
+use apex_core::ports::{SkillStore, ToolRegistry};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -65,7 +65,7 @@ pub struct CustomToolRegistry {
     tools_dir: PathBuf,
     entries: RwLock<Vec<ManifestEntry>>,
     spill: SpillManager,
-    store: Option<Arc<dyn MemoryStore>>,
+    skill_store: Option<Arc<dyn SkillStore>>,
 }
 
 impl CustomToolRegistry {
@@ -74,14 +74,14 @@ impl CustomToolRegistry {
     pub fn new(
         tools_dir: PathBuf,
         spill: SpillManager,
-        store: Option<Arc<dyn MemoryStore>>,
+        skill_store: Option<Arc<dyn SkillStore>>,
     ) -> Self {
         let entries = Self::load_manifest(&tools_dir).unwrap_or_default();
         Self {
             tools_dir,
             entries: RwLock::new(entries),
             spill,
-            store,
+            skill_store,
         }
     }
 
@@ -390,9 +390,11 @@ impl CustomToolRegistry {
 
         // Store skill if task_pattern provided
         if let Some(ref pattern) = task_pattern {
-            if let Some(ref store) = self.store {
+            if let Some(ref skill_store) = self.skill_store {
                 let skill = Skill {
                     id: SkillId(format!("skill-tool-{name}")),
+                    name: apex_core::domain::slugify(name),
+                    description: description.to_string(),
                     task_pattern: pattern.clone(),
                     approach: format!("Use the custom tool '{name}': {description}"),
                     tools_used: vec![name.to_string()],
@@ -403,8 +405,9 @@ impl CustomToolRegistry {
                     min_samples: 3,
                     last_used: now_iso(),
                     notes: format!("Auto-created when tool '{name}' was registered"),
+                    status: SkillStatus::Active,
                 };
-                let _ = store.store_skill(skill).await;
+                let _ = skill_store.store_skill(skill).await;
             }
         }
 
