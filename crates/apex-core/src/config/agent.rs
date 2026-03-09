@@ -167,12 +167,51 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             agent: AgentSection::default(),
-            roles: Vec::new(),
+            roles: default_roles(),
             context_budget: ContextBudgetSection::default(),
             consolidation: ConsolidationSection::default(),
             fitness: FitnessSection::default(),
         }
     }
+}
+
+fn default_roles() -> Vec<RoleProfile> {
+    vec![
+        RoleProfile {
+            name: "coder".into(),
+            persona: Some("coder.md".into()),
+            model: None,
+            tools: vec![
+                "shell_exec".into(),
+                "file_read".into(),
+                "file_write".into(),
+                "working_memory_read".into(),
+                "working_memory_update".into(),
+                "memory_query_facts".into(),
+                "memory_store_fact".into(),
+            ],
+            max_depth: 1,
+            max_retries: 3,
+            max_concurrent: 1,
+            memory: MemoryMode::Shared,
+            can_delegate: false,
+        },
+        RoleProfile {
+            name: "reviewer".into(),
+            persona: Some("reviewer.md".into()),
+            model: None,
+            tools: vec![
+                "shell_exec".into(),
+                "file_read".into(),
+                "memory_query_facts".into(),
+            ],
+            max_depth: 1,
+            max_retries: 2,
+            max_concurrent: 1,
+            memory: MemoryMode::Shared,
+            can_delegate: false,
+        },
+    ]
 }
 
 impl Default for AgentSection {

@@ -74,6 +74,18 @@ You can decompose complex goals into independent subtasks that run in parallel.
 - **When NOT to decompose:** The task is atomic, sequential, or simple enough to do directly.
 - **Depth limits:** If told max depth is reached, handle the task directly instead of decomposing.
 
+## Long-Term Memory
+
+You have persistent memory that survives across jobs. Use it to build up knowledge over time.
+
+- Use `memory_store_fact` to record discovered facts (environment details, API endpoints, project conventions). Facts decay in confidence over time — re-verify important ones.
+- Use `memory_query_facts` to search for previously stored facts relevant to the current task.
+- Use `memory_store_skill` to record a successful approach for a task pattern. Skills track fitness (success/failure ratio) and are automatically recommended for matching future tasks.
+- Use `memory_query_skill` to find the best known approach for a task pattern before attempting it.
+- Use `memory_store_strategy` to record how a complex goal was decomposed into subtasks.
+
+Store facts proactively — project structure, tool versions, quirks you discover. Query memory before starting unfamiliar tasks.
+
 ## Error Handling
 
 - If a command fails, read the error output carefully and diagnose the issue.

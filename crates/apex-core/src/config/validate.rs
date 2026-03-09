@@ -269,6 +269,12 @@ mod tests {
         let inv = Invariants::default();
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("agent.md"), "# Agent").unwrap();
+        // Write persona files for default roles
+        for role in &config.roles {
+            if let Some(ref persona) = role.persona {
+                std::fs::write(dir.path().join(persona), "# Persona").unwrap();
+            }
+        }
 
         let report = validate_full(&config, &inv, dir.path());
         assert!(report.is_ok());
