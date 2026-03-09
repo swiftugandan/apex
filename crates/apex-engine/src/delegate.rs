@@ -16,6 +16,21 @@ use crate::paths::ProjectPaths;
 use crate::registry::{build_static_tools, CompositeToolRegistry, OwnedFilteredToolRegistry};
 use crate::worker::{worker_loop, WorkerContext};
 
+/// Factory closures for creating infra components without depending on apex-infra.
+pub struct InfraFactories {
+    pub queue: Arc<dyn Fn(&std::path::Path) -> Result<Arc<dyn Queue>, String> + Send + Sync>,
+    pub working_memory: Arc<dyn Fn(&std::path::Path) -> Arc<dyn WorkingMemory> + Send + Sync>,
+    pub memory_store: Arc<dyn Fn(&std::path::Path) -> Result<Arc<dyn MemoryStore>, String> + Send + Sync>,
+}
+
+/// Static configuration for sub-agent spawning.
+pub struct SpawnerConfig {
+    pub invariants: Arc<Invariants>,
+    pub roles: Vec<RoleProfile>,
+    pub max_tool_result_bytes: usize,
+    pub remaining_delegate_depth: u32,
+}
+
 /// Concrete SubAgentSpawner that runs sub-agents in-process with their own
 /// queue, working memory, and (optionally isolated) long-term memory.
 pub struct InProcessSpawner {
@@ -23,15 +38,8 @@ pub struct InProcessSpawner {
     pub parent_long_term: Arc<dyn MemoryStore>,
     pub llm: Arc<dyn LlmProvider>,
     pub estimator: Arc<Mutex<TokenEstimator>>,
-    pub invariants: Arc<Invariants>,
-    pub roles: Vec<RoleProfile>,
-    pub max_tool_result_bytes: usize,
-    pub remaining_delegate_depth: u32,
-    /// Factory functions for creating infra components.
-    /// These closures let the engine create concrete adapters without depending on apex-infra.
-    pub queue_factory: Arc<dyn Fn(&std::path::Path) -> Result<Arc<dyn Queue>, String> + Send + Sync>,
-    pub working_memory_factory: Arc<dyn Fn(&std::path::Path) -> Arc<dyn WorkingMemory> + Send + Sync>,
-    pub memory_store_factory: Arc<dyn Fn(&std::path::Path) -> Result<Arc<dyn MemoryStore>, String> + Send + Sync>,
+    pub config: SpawnerConfig,
+    pub infra: Arc<InfraFactories>,
 }
 
 #[async_trait]
@@ -54,14 +62,14 @@ impl SubAgentSpawner for InProcessSpawner {
 
         // 1. Create ephemeral queue
         let sub_queue_dir = self.project_paths.queues_dir.join(format!("sub-{}-{}", role.name, short_uuid));
-        let sub_queue = (self.queue_factory)(&sub_queue_dir)
+        let sub_queue = (self.infra.queue)(&sub_queue_dir)
             .map_err(|e| ToolError::Execution(format!("failed to create sub-agent queue: {e}")))?;
 
         // 2. Create ephemeral working memory directory
         let sub_memory_dir = self.project_paths.working_memory.join(format!("sub-{}", short_uuid));
         std::fs::create_dir_all(&sub_memory_dir)
             .map_err(|e| ToolError::Execution(format!("failed to create sub-agent memory dir: {e}")))?;
-        let sub_memory = (self.working_memory_factory)(&sub_memory_dir);
+        let sub_memory = (self.infra.working_memory)(&sub_memory_dir);
 
         // 3. Resolve long-term memory based on role's memory mode
         let sub_long_term: Arc<dyn MemoryStore> = match role.memory {
@@ -69,7 +77,7 @@ impl SubAgentSpawner for InProcessSpawner {
             MemoryMode::Isolated => {
                 let isolated_dir = self.project_paths.long_term_dir.join(format!("sub-{}", short_uuid));
                 let db_path = isolated_dir.join("memory.db");
-                (self.memory_store_factory)(&db_path)
+                (self.infra.memory_store)(&db_path)
                     .map_err(|e| ToolError::Execution(format!("failed to create isolated memory: {e}")))?
             }
         };
@@ -80,22 +88,23 @@ impl SubAgentSpawner for InProcessSpawner {
         let sub_llm = Arc::clone(&self.llm);
 
         // 5. Build a new spawner for sub-sub-agents (with decremented depth)
+        let sub_depth = if role.can_delegate {
+            self.config.remaining_delegate_depth.saturating_sub(1)
+        } else {
+            0
+        };
         let sub_spawner: Arc<dyn SubAgentSpawner> = Arc::new(InProcessSpawner {
             project_paths: self.project_paths.clone(),
             parent_long_term: sub_long_term.clone(),
             llm: sub_llm.clone(),
             estimator: Arc::clone(&self.estimator),
-            invariants: Arc::clone(&self.invariants),
-            roles: self.roles.clone(),
-            max_tool_result_bytes: self.max_tool_result_bytes,
-            remaining_delegate_depth: if role.can_delegate {
-                self.remaining_delegate_depth.saturating_sub(1)
-            } else {
-                0
+            config: SpawnerConfig {
+                invariants: Arc::clone(&self.config.invariants),
+                roles: self.config.roles.clone(),
+                max_tool_result_bytes: self.config.max_tool_result_bytes,
+                remaining_delegate_depth: sub_depth,
             },
-            queue_factory: Arc::clone(&self.queue_factory),
-            working_memory_factory: Arc::clone(&self.working_memory_factory),
-            memory_store_factory: Arc::clone(&self.memory_store_factory),
+            infra: Arc::clone(&self.infra),
         });
 
         // 6. Build static tools for sub-agent
@@ -103,15 +112,15 @@ impl SubAgentSpawner for InProcessSpawner {
             &self.project_paths,
             sub_memory.clone(),
             sub_long_term.clone(),
-            Arc::clone(&self.invariants),
+            Arc::clone(&self.config.invariants),
             sub_spawner,
-            self.max_tool_result_bytes,
-            self.roles.clone(),
-            if role.can_delegate { self.remaining_delegate_depth.saturating_sub(1) } else { 0 },
+            self.config.max_tool_result_bytes,
+            self.config.roles.clone(),
+            sub_depth,
         );
 
         // 7. Apply tool filtering if the role specifies a tools list
-        let filtered_static_tools: Arc<dyn apex_core::ports::ToolRegistry> = if !role.tools.is_empty() {
+        let filtered_static_tools: Arc<CompositeToolRegistry> = if !role.tools.is_empty() {
             let mut allowed: HashSet<String> = role.tools.iter().cloned().collect();
             if !role.can_delegate {
                 allowed.remove("delegate");
@@ -146,7 +155,7 @@ impl SubAgentSpawner for InProcessSpawner {
         };
         sub_queue.push(msg).await.map_err(|e| ToolError::Execution(format!("failed to push goal: {e}")))?;
 
-        // 9. Build WorkerContext and run worker_loop
+        // 9. Build WorkerContext and spawn concurrent workers
         let ctx = WorkerContext {
             queue: sub_queue.clone(),
             tools: filtered_static_tools,
@@ -156,11 +165,24 @@ impl SubAgentSpawner for InProcessSpawner {
             persona: Arc::new(persona.to_string()),
             max_depth: role.max_depth,
             max_retries: role.max_retries,
-            max_tool_result_bytes: self.max_tool_result_bytes,
+            max_tool_result_bytes: self.config.max_tool_result_bytes,
             estimator: Arc::clone(&self.estimator),
         };
 
-        worker_loop(ctx, 0).await.map_err(|e| ToolError::Execution(format!("sub-agent worker failed: {e}")))?;
+        let num_workers = role.max_concurrent.max(1);
+        let mut handles = Vec::with_capacity(num_workers);
+        for worker_id in 0..num_workers {
+            let ctx = ctx.clone();
+            handles.push(tokio::spawn(async move {
+                worker_loop(ctx, worker_id).await
+            }));
+        }
+        for handle in handles {
+            handle
+                .await
+                .map_err(|e| ToolError::Execution(format!("sub-agent worker panicked: {e}")))?
+                .map_err(|e| ToolError::Execution(format!("sub-agent worker failed: {e}")))?;
+        }
 
         // 10. Collect results from done/ and failed/
         let done_metas = sub_queue.list_with_state("done").await

@@ -11,7 +11,8 @@ use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{MessageHeaders, MessageType, QueueMessage};
 use apex_core::ports::{MemoryStore, Queue, WorkingMemory};
 use apex_engine::{
-    InProcessSpawner, ProjectPaths, WorkerContext, build_static_tools, worker_loop,
+    InProcessSpawner, InfraFactories, ProjectPaths, SpawnerConfig, WorkerContext,
+    build_static_tools, worker_loop,
 };
 use apex_infra::{AnthropicProvider, FsScratchpadStore, RfbmqAdapter, SqliteMemoryStore};
 use apex_tools::spill::SpillManager;
@@ -384,28 +385,33 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
     let invariants = Arc::new(invariants);
 
     // Build the SubAgentSpawner with factory closures for infra creation
+    let infra = Arc::new(InfraFactories {
+        queue: Arc::new(|path| {
+            RfbmqAdapter::init(path)
+                .map(|a| Arc::new(a) as Arc<dyn Queue>)
+                .map_err(|e| e.to_string())
+        }),
+        working_memory: Arc::new(|path| {
+            Arc::new(FsScratchpadStore::new(path.to_path_buf())) as Arc<dyn WorkingMemory>
+        }),
+        memory_store: Arc::new(|path| {
+            SqliteMemoryStore::open(path)
+                .map(|s| Arc::new(s) as Arc<dyn MemoryStore>)
+                .map_err(|e| e.to_string())
+        }),
+    });
     let spawner: Arc<dyn apex_tools::SubAgentSpawner> = Arc::new(InProcessSpawner {
         project_paths: paths.clone(),
         parent_long_term: long_term.clone(),
         llm: llm.clone(),
         estimator: estimator.clone(),
-        invariants: Arc::clone(&invariants),
-        roles: roles.clone(),
-        max_tool_result_bytes,
-        remaining_delegate_depth,
-        queue_factory: Arc::new(|path| {
-            RfbmqAdapter::init(path)
-                .map(|a| Arc::new(a) as Arc<dyn Queue>)
-                .map_err(|e| e.to_string())
-        }),
-        working_memory_factory: Arc::new(|path| {
-            Arc::new(FsScratchpadStore::new(path.to_path_buf())) as Arc<dyn WorkingMemory>
-        }),
-        memory_store_factory: Arc::new(|path| {
-            SqliteMemoryStore::open(path)
-                .map(|s| Arc::new(s) as Arc<dyn MemoryStore>)
-                .map_err(|e| e.to_string())
-        }),
+        config: SpawnerConfig {
+            invariants: Arc::clone(&invariants),
+            roles: roles.clone(),
+            max_tool_result_bytes,
+            remaining_delegate_depth,
+        },
+        infra,
     });
 
     let static_tools = build_static_tools(

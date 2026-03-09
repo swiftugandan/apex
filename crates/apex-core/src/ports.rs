@@ -40,6 +40,12 @@ pub trait Queue: Send + Sync {
     async fn update_body(&self, claimed: &ClaimedTask, new_body: &str) -> Result<(), QueueError>;
     async fn ack(&self, claimed: &ClaimedTask) -> Result<(), QueueError>;
     async fn nack(&self, claimed: &ClaimedTask) -> Result<(), QueueError>;
+    /// Nack with a delay: the message won't be redelivered until `delay` has elapsed.
+    async fn nack_with_delay(
+        &self,
+        claimed: &ClaimedTask,
+        delay: std::time::Duration,
+    ) -> Result<(), QueueError>;
     /// Move a claimed message directly to failed/ without retrying.
     async fn reject(&self, claimed: &ClaimedTask) -> Result<(), QueueError>;
     async fn depth(&self) -> Result<QueueDepth, QueueError>;

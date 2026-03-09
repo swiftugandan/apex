@@ -1,47 +1,70 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use apex_core::context::TokenEstimator;
 use apex_core::domain::{
     ChatMessage, CompletionRequest, ContentBlock, LogEntry, MessageRole,
     ToolCallRecord, TurnRecord,
 };
-use apex_core::ports::{LlmProvider, MemoryStore, ToolRegistry, WorkingMemory};
+use apex_core::ports::{LlmProvider, ToolRegistry, WorkingMemory};
 
 use crate::util::summarize_json;
 
 const MAX_TURNS: usize = 32;
 const MAX_TOKENS: u32 = 8192;
 
+/// Configuration bundle for the agentic loop.
+pub struct LoopConfig<'a> {
+    pub persona: &'a str,
+    pub llm: &'a dyn LlmProvider,
+    pub tools: &'a dyn ToolRegistry,
+    pub estimator: &'a Arc<Mutex<TokenEstimator>>,
+    pub max_tool_result_bytes: usize,
+    pub scratchpad: Option<&'a Mutex<apex_core::domain::Scratchpad>>,
+    pub memory: Option<&'a dyn WorkingMemory>,
+    /// Optional cancellation token — checked before each turn.
+    pub cancel: Option<&'a CancellationToken>,
+    /// Optional wall-clock timeout for the entire loop.
+    pub timeout: Option<Duration>,
+}
+
 /// Runs the multi-turn LLM + tool execution loop. Shared between
 /// execute_task, execute_continuation, and the `delegate` tool (sub-agents).
 pub async fn run_agentic_loop(
     initial_messages: Vec<ChatMessage>,
-    persona: &str,
-    llm: &dyn LlmProvider,
-    tools: &dyn ToolRegistry,
-    long_term: &dyn MemoryStore,
-    estimator: &Arc<Mutex<TokenEstimator>>,
-    max_tool_result_bytes: usize,
-    scratchpad: Option<&Mutex<apex_core::domain::Scratchpad>>,
-    memory: Option<&dyn WorkingMemory>,
+    config: &LoopConfig<'_>,
 ) -> (Vec<TurnRecord>, Option<String>, Vec<ChatMessage>) {
     let mut messages = initial_messages;
     let mut turns: Vec<TurnRecord> = Vec::new();
     let mut final_text: Option<String> = None;
+    let deadline = config.timeout.map(|d| Instant::now() + d);
+    let schemas = config.tools.schemas();
 
     for turn_num in 0..MAX_TURNS {
-        let schemas = tools.schemas();
+        // Check cancellation and timeout before each turn
+        if let Some(token) = config.cancel {
+            if token.is_cancelled() {
+                final_text = Some("Cancelled".to_string());
+                break;
+            }
+        }
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                final_text = Some("LLM error: loop timeout exceeded".to_string());
+                break;
+            }
+        }
 
         let req = CompletionRequest {
-            system_prompt: persona.to_string(),
+            system_prompt: config.persona.to_string(),
             messages: messages.clone(),
             max_tokens: MAX_TOKENS,
             temperature: Some(0.2),
         };
 
-        let resp = match llm.complete_with_tools(req, &schemas).await {
+        let resp = match config.llm.complete_with_tools(req, &schemas).await {
             Ok(r) => r,
             Err(err) => {
                 // Signal LLM error via final_text starting with "LLM error:"
@@ -58,20 +81,15 @@ pub async fn run_agentic_loop(
             resp.usage.output_tokens,
         );
 
-        // Calibrate token estimator
+        // Calibrate token estimator (in-memory only; caller persists after loop)
         {
             let prompt_text: String = messages
                 .iter()
                 .map(|m| m.text())
                 .collect::<Vec<_>>()
                 .join("\n");
-            let mut est = estimator.lock().await;
+            let mut est = config.estimator.lock().await;
             est.calibrate(&prompt_text, resp.usage.input_tokens);
-            if est.calibration_data().sample_count % 5 == 0 {
-                let cal = est.calibration_data().clone();
-                drop(est);
-                let _ = long_term.persist_calibration(&cal).await;
-            }
         }
 
         messages.push(resp.message.clone());
@@ -95,7 +113,7 @@ pub async fn run_agentic_loop(
             eprintln!("  ↳ {}(…)", call.name);
             let start = Instant::now();
 
-            let result = match tools.execute(call).await {
+            let result = match config.tools.execute(call).await {
                 Ok(r) => r,
                 Err(err) => apex_core::domain::ToolResult {
                     tool_use_id: call.id.clone(),
@@ -118,8 +136,8 @@ pub async fn run_agentic_loop(
 
             let raw_content = serde_json::to_string(&result.output)
                 .unwrap_or_else(|_| "{}".to_string());
-            let content = if raw_content.len() > max_tool_result_bytes {
-                let truncated = apex_core::truncate_str(&raw_content, max_tool_result_bytes);
+            let content = if raw_content.len() > config.max_tool_result_bytes {
+                let truncated = apex_core::truncate_str(&raw_content, config.max_tool_result_bytes);
                 format!("{truncated}\n\n[truncated: {orig} bytes → {kept} bytes]",
                     orig = raw_content.len(), kept = truncated.len())
             } else {
@@ -133,7 +151,7 @@ pub async fn run_agentic_loop(
         }
 
         // Persist log entries to scratchpad after each turn
-        if let (Some(pad_mutex), Some(mem)) = (scratchpad, memory) {
+        if let (Some(pad_mutex), Some(mem)) = (config.scratchpad, config.memory) {
             let mut pad = pad_mutex.lock().await;
             for tc in &call_records {
                 pad.log.push(LogEntry {

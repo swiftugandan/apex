@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
@@ -74,6 +75,11 @@ impl Queue for RfbmqAdapter {
             return Ok(None);
         }
 
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         // Try to claim the first available ready message
         for ready_id in &ready_ids {
             let claimed = self
@@ -88,6 +94,17 @@ impl Queue for RfbmqAdapter {
 
             let rfbmq_msg = Message::from_file(claimed.path())
                 .map_err(|e| QueueError::Parse(e.to_string()))?;
+
+            // Check Not-Before: if the message has a future delivery time, put it back
+            if let Some(not_before) = parse_not_before(&rfbmq_msg.header.custom) {
+                if now_epoch < not_before {
+                    // Not ready yet — put it back
+                    self.queue
+                        .fail(&claimed)
+                        .map_err(|e| QueueError::Io(e.to_string()))?;
+                    continue;
+                }
+            }
 
             let headers = custom_to_headers(
                 &rfbmq_msg.header.custom,
@@ -150,6 +167,59 @@ impl Queue for RfbmqAdapter {
         let rfbmq_claimed =
             ClaimedMessage::from_path(claim_path).map_err(|e| QueueError::Io(e.to_string()))?;
 
+        self.queue
+            .fail(&rfbmq_claimed)
+            .map_err(|e| QueueError::Io(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn nack_with_delay(
+        &self,
+        claimed: &ClaimedTask,
+        delay: Duration,
+    ) -> Result<(), QueueError> {
+        let claim_path = Path::new(&claimed.claim_path);
+
+        // Stamp a Not-Before header into the message before requeueing
+        let not_before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + delay.as_secs();
+
+        let mut rfbmq_msg =
+            Message::from_file(claim_path).map_err(|e| QueueError::Parse(e.to_string()))?;
+
+        // Remove any existing Not-Before, then add the new one
+        rfbmq_msg
+            .header
+            .custom
+            .retain(|l| !l.starts_with("Not-Before:"));
+        rfbmq_msg
+            .header
+            .custom
+            .push(format!("Not-Before: {not_before}"));
+
+        // Write updated message back before requeueing
+        let buf = rfbmq_msg
+            .serialize()
+            .map_err(|e| QueueError::Io(e.to_string()))?;
+        let tmp_dir = self.queue.root().join(".tmp");
+        let tmp_name = format!("delay-{}.md", claimed.id);
+        rfbmq_core::fs_utils::durable_write_rename(
+            &tmp_dir,
+            &tmp_name,
+            claim_path,
+            buf.as_bytes(),
+            self.queue.file_mode(),
+            self.queue.fsync_mode(),
+        )
+        .map_err(|e| QueueError::Io(e.to_string()))?;
+
+        // Now nack (requeue) it
+        let rfbmq_claimed =
+            ClaimedMessage::from_path(claim_path).map_err(|e| QueueError::Io(e.to_string()))?;
         self.queue
             .fail(&rfbmq_claimed)
             .map_err(|e| QueueError::Io(e.to_string()))?;
@@ -287,6 +357,13 @@ fn message_meta_from_path(path: &Path) -> Option<QueueMessageMeta> {
         correlation_id,
         depends_on,
     })
+}
+
+fn parse_not_before(custom: &[String]) -> Option<u64> {
+    custom
+        .iter()
+        .find(|l| l.starts_with("Not-Before:"))
+        .and_then(|l| l.trim_start_matches("Not-Before:").trim().parse().ok())
 }
 
 fn headers_to_custom(headers: &MessageHeaders) -> Vec<String> {

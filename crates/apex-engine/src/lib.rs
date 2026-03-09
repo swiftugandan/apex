@@ -6,8 +6,8 @@ mod registry;
 pub mod util;
 mod worker;
 
-pub use agentic_loop::run_agentic_loop;
-pub use delegate::InProcessSpawner;
+pub use agentic_loop::{run_agentic_loop, LoopConfig};
+pub use delegate::{InfraFactories, InProcessSpawner, SpawnerConfig};
 pub use paths::ProjectPaths;
 pub use registry::{build_static_tools, ApexToolRegistry, CompositeToolRegistry, OwnedFilteredToolRegistry};
 pub use worker::{worker_loop, WorkerContext};

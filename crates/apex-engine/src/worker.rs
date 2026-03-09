@@ -11,8 +11,9 @@ use apex_core::ports::{LlmProvider, MemoryStore, Queue, ToolRegistry, WorkingMem
 
 use apex_tools::QueueToolRegistry;
 
-use crate::agentic_loop::run_agentic_loop;
+use crate::agentic_loop::{run_agentic_loop, LoopConfig};
 use crate::consolidation::consolidate_learnings;
+use crate::registry::{ApexToolRegistry, CompositeToolRegistry};
 use crate::util::{composer_from_estimator, extract_title, now_iso};
 
 // ── WorkerContext ───────────────────────────────────────────────────
@@ -20,7 +21,7 @@ use crate::util::{composer_from_estimator, extract_title, now_iso};
 #[derive(Clone)]
 pub struct WorkerContext {
     pub queue: Arc<dyn Queue>,
-    pub tools: Arc<dyn ToolRegistry>,
+    pub tools: Arc<CompositeToolRegistry>,
     pub llm: Arc<dyn LlmProvider>,
     pub memory: Arc<dyn WorkingMemory>,
     pub long_term: Arc<dyn MemoryStore>,
@@ -93,10 +94,7 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
             composer,
         );
 
-        // Wrap static tools into ApexToolRegistry with queue tools
-        // We need to downcast Arc<dyn ToolRegistry> to get the composite back.
-        // Instead, we'll use the tools directly since ApexToolRegistry works with any ToolRegistry.
-        let tools = PerClaimToolRegistry {
+        let tools = ApexToolRegistry {
             static_tools: Arc::clone(&ctx.tools),
             queue_tools,
         };
@@ -129,30 +127,6 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
                 .await?;
             }
         }
-    }
-}
-
-/// Per-claim tool registry that combines static tools with queue-specific tools.
-struct PerClaimToolRegistry {
-    static_tools: Arc<dyn ToolRegistry>,
-    queue_tools: QueueToolRegistry,
-}
-
-#[async_trait::async_trait]
-impl ToolRegistry for PerClaimToolRegistry {
-    fn definitions(&self) -> Vec<apex_core::domain::ToolDef> {
-        let mut defs = self.static_tools.definitions();
-        defs.extend(self.queue_tools.definitions());
-        defs
-    }
-
-    async fn execute(&self, call: &apex_core::domain::ToolCall) -> std::result::Result<apex_core::domain::ToolResult, apex_core::error::ToolError> {
-        // Try static tools first by checking definitions
-        let static_names: Vec<String> = self.static_tools.definitions().iter().map(|d| d.schema.name.clone()).collect();
-        if static_names.iter().any(|n| n == &call.name) {
-            return self.static_tools.execute(call).await;
-        }
-        self.queue_tools.execute(call).await
     }
 }
 
@@ -191,18 +165,26 @@ async fn execute_claim(
     let messages = vec![ChatMessage::user_text(&initial_body)];
 
     let scratchpad = Mutex::new(scratchpad);
-    let (turns, final_text, _messages) = run_agentic_loop(
-        messages,
-        &ctx.persona,
-        ctx.llm.as_ref(),
+    let loop_config = LoopConfig {
+        persona: &ctx.persona,
+        llm: ctx.llm.as_ref(),
         tools,
-        ctx.long_term.as_ref(),
-        &ctx.estimator,
-        ctx.max_tool_result_bytes,
-        Some(&scratchpad),
-        Some(ctx.memory.as_ref()),
-    )
-    .await;
+        estimator: &ctx.estimator,
+        max_tool_result_bytes: ctx.max_tool_result_bytes,
+        scratchpad: Some(&scratchpad),
+        memory: Some(ctx.memory.as_ref()),
+        cancel: None,
+        timeout: None,
+    };
+    let (turns, final_text, _messages) = run_agentic_loop(messages, &loop_config).await;
+
+    // Persist calibration data after loop completes
+    {
+        let est = ctx.estimator.lock().await;
+        let cal = est.calibration_data().clone();
+        drop(est);
+        let _ = ctx.long_term.persist_calibration(&cal).await;
+    }
     let mut scratchpad = scratchpad.into_inner();
 
     if let Some(ref text) = final_text {
@@ -304,20 +286,21 @@ async fn handle_failure(
         return Ok(());
     }
 
-    // Rate limit errors: wait before requeueing so the next attempt doesn't
-    // immediately hit the same limit.
     if is_rate_limited(err) {
         let backoff_secs = 30 * (claimed.headers.retry_count + 1) as u64;
         eprintln!(
-            "[worker {worker_id}]   ↳ Rate limited, waiting {backoff_secs}s before retry"
+            "[worker {worker_id}]   ↳ Rate limited, delaying {backoff_secs}s before retry"
         );
-        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+        queue
+            .nack_with_delay(claimed, std::time::Duration::from_secs(backoff_secs))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    } else {
+        queue
+            .nack(claimed)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-
-    queue
-        .nack(claimed)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if claimed.headers.retry_count + 1 >= max_retries {
         eprintln!("[worker {worker_id}]   ↳ Max retries reached, moved to failed/");
