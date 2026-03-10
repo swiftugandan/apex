@@ -3,28 +3,10 @@ use std::sync::Arc;
 use apex_core::config::{MemoryMode, RoleProfile};
 use apex_core::domain::{ToolCall, ToolDef, ToolResult, ToolSchema};
 use apex_core::error::ToolError;
-use apex_core::ports::ToolRegistry;
+use apex_core::ports::{SubAgentSpawner, ToolRegistry};
 use async_trait::async_trait;
 
 use std::path::PathBuf;
-
-/// Result returned after a sub-agent completes.
-pub struct SubAgentResult {
-    pub done_bodies: Vec<String>,
-    pub failed_bodies: Vec<String>,
-}
-
-/// Trait for spawning sub-agent processes. Decouples the delegate tool from
-/// concrete queue/memory/LLM provisioning.
-#[async_trait]
-pub trait SubAgentSpawner: Send + Sync {
-    async fn spawn(
-        &self,
-        task: &str,
-        role: &RoleProfile,
-        persona: &str,
-    ) -> Result<SubAgentResult, ToolError>;
-}
 
 /// Tool registry for the `delegate` tool.
 ///
@@ -237,5 +219,166 @@ impl ToolRegistry for DelegateToolRegistry {
             is_error: false,
             ..Default::default()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apex_core::config::MemoryMode;
+    use apex_core::ports::SubAgentResult;
+
+    struct MockSubAgentSpawner {
+        result: Mutex<Option<Result<SubAgentResult, ToolError>>>,
+    }
+
+    use tokio::sync::Mutex;
+
+    impl MockSubAgentSpawner {
+        fn success(response: &str) -> Self {
+            Self {
+                result: Mutex::new(Some(Ok(SubAgentResult {
+                    done_bodies: vec![response.to_string()],
+                    failed_bodies: vec![],
+                }))),
+            }
+        }
+
+        fn _failure(msg: &str) -> Self {
+            Self {
+                result: Mutex::new(Some(Err(ToolError::Execution(msg.to_string())))),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SubAgentSpawner for MockSubAgentSpawner {
+        async fn spawn(
+            &self,
+            _task: &str,
+            _role: &RoleProfile,
+            _persona: &str,
+        ) -> Result<SubAgentResult, ToolError> {
+            self.result
+                .lock()
+                .await
+                .take()
+                .expect("MockSubAgentSpawner: no result queued")
+        }
+    }
+
+    fn make_roles() -> Arc<[RoleProfile]> {
+        Arc::from(vec![RoleProfile {
+            name: "coder".to_string(),
+            persona: Some("coder.md".to_string()),
+            model: None,
+            tools: vec!["shell_exec".into(), "file_read".into()],
+            max_depth: 2,
+            max_retries: 3,
+            max_concurrent: 1,
+            memory: MemoryMode::Shared,
+            can_delegate: false,
+        }])
+    }
+
+    fn make_call(input: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "call-1".into(),
+            name: "delegate".into(),
+            input,
+        }
+    }
+
+    fn make_registry(
+        remaining_depth: u32,
+        spawner: Arc<dyn SubAgentSpawner>,
+    ) -> DelegateToolRegistry {
+        DelegateToolRegistry::new(
+            make_roles(),
+            PathBuf::from("/tmp/test-prompts"),
+            spawner,
+            remaining_depth,
+        )
+    }
+
+    #[tokio::test]
+    async fn delegate_depth_zero_errors() {
+        let spawner = Arc::new(MockSubAgentSpawner::success("unused"));
+        let registry = make_registry(0, spawner);
+
+        let call = make_call(serde_json::json!({
+            "task": "do something",
+            "system_prompt": "you are helpful"
+        }));
+        let err = registry.execute(&call).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(ref msg) if msg.contains("depth limit")),
+            "expected depth limit error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_requires_task() {
+        let spawner = Arc::new(MockSubAgentSpawner::success("unused"));
+        let registry = make_registry(2, spawner);
+
+        let call = make_call(serde_json::json!({
+            "system_prompt": "you are helpful"
+        }));
+        let err = registry.execute(&call).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref msg) if msg.contains("task")),
+            "expected missing task error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_rejects_both_role_and_system_prompt() {
+        let spawner = Arc::new(MockSubAgentSpawner::success("unused"));
+        let registry = make_registry(2, spawner);
+
+        let call = make_call(serde_json::json!({
+            "task": "do something",
+            "role": "coder",
+            "system_prompt": "you are helpful"
+        }));
+        let err = registry.execute(&call).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref msg) if msg.contains("not both")),
+            "expected 'not both' error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_unknown_role_errors() {
+        let spawner = Arc::new(MockSubAgentSpawner::success("unused"));
+        let registry = make_registry(2, spawner);
+
+        let call = make_call(serde_json::json!({
+            "task": "do something",
+            "role": "nonexistent_role"
+        }));
+        let err = registry.execute(&call).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref msg) if msg.contains("unknown role") && msg.contains("coder")),
+            "expected unknown role error listing available roles, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_success_returns_result() {
+        let spawner = Arc::new(MockSubAgentSpawner::success("task completed successfully"));
+        let registry = make_registry(2, spawner);
+
+        let call = make_call(serde_json::json!({
+            "task": "build the feature",
+            "system_prompt": "you are a coder"
+        }));
+        let result = registry.execute(&call).await.unwrap();
+
+        assert!(!result.is_error);
+        assert_eq!(result.output["role"], "ad-hoc");
+        let response = result.output["response"].as_str().unwrap();
+        assert!(response.contains("task completed successfully"));
     }
 }

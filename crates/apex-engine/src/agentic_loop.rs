@@ -250,3 +250,288 @@ pub async fn run_agentic_loop(
 
     (turns, final_text, messages)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apex_core::domain::ToolCall;
+    use crate::test_mocks::*;
+
+    fn default_estimator() -> Arc<Mutex<TokenEstimator>> {
+        Arc::new(Mutex::new(TokenEstimator::default()))
+    }
+
+    #[tokio::test]
+    async fn loop_returns_on_end_turn() {
+        let llm = MockLlmProvider::text_only("Hello, world!");
+        let tools = MockToolRegistry::echo("test_tool");
+        let estimator = default_estimator();
+
+        let config = LoopConfig {
+            persona: "You are helpful.",
+            llm: &llm,
+            tools: &tools,
+            estimator: &estimator,
+            max_tool_result_bytes: 10_000,
+            max_output_tokens: 4096,
+            scratchpad: None,
+            memory: None,
+            cancel: None,
+            timeout: None,
+            compaction_preserve_turns: 3,
+            compaction_max_summary_tokens: 1024,
+        };
+
+        let messages = vec![ChatMessage::user_text("Hi")];
+        let (turns, final_text, _msgs) = run_agentic_loop(messages, &config).await;
+
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].tool_calls.is_empty());
+        assert_eq!(final_text.as_deref(), Some("Hello, world!"));
+    }
+
+    #[tokio::test]
+    async fn loop_executes_tool_and_continues() {
+        let tool_call = ToolCall {
+            id: "call-1".into(),
+            name: "test_tool".into(),
+            input: serde_json::json!({}),
+        };
+        let llm = MockLlmProvider::tool_then_text(tool_call, "Done!");
+        let tools = MockToolRegistry::echo("test_tool");
+        let estimator = default_estimator();
+
+        let config = LoopConfig {
+            persona: "You are helpful.",
+            llm: &llm,
+            tools: &tools,
+            estimator: &estimator,
+            max_tool_result_bytes: 10_000,
+            max_output_tokens: 4096,
+            scratchpad: None,
+            memory: None,
+            cancel: None,
+            timeout: None,
+            compaction_preserve_turns: 3,
+            compaction_max_summary_tokens: 1024,
+        };
+
+        let messages = vec![ChatMessage::user_text("Do something")];
+        let (turns, final_text, _msgs) = run_agentic_loop(messages, &config).await;
+
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        assert_eq!(turns[0].tool_calls[0].name, "test_tool");
+        assert!(turns[1].tool_calls.is_empty());
+        assert_eq!(final_text.as_deref(), Some("Done!"));
+
+        // Verify the tool was actually called
+        let calls = tools.calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "test_tool");
+    }
+
+    #[tokio::test]
+    async fn loop_handles_llm_error() {
+        let llm = MockLlmProvider::error("API overloaded");
+        let tools = MockToolRegistry::echo("test_tool");
+        let estimator = default_estimator();
+
+        let config = LoopConfig {
+            persona: "You are helpful.",
+            llm: &llm,
+            tools: &tools,
+            estimator: &estimator,
+            max_tool_result_bytes: 10_000,
+            max_output_tokens: 4096,
+            scratchpad: None,
+            memory: None,
+            cancel: None,
+            timeout: None,
+            compaction_preserve_turns: 3,
+            compaction_max_summary_tokens: 1024,
+        };
+
+        let messages = vec![ChatMessage::user_text("Hi")];
+        let (_turns, final_text, _msgs) = run_agentic_loop(messages, &config).await;
+
+        let text = final_text.unwrap();
+        assert!(text.starts_with("LLM error:"), "got: {text}");
+        assert!(text.contains("API overloaded"));
+    }
+
+    #[tokio::test]
+    async fn loop_converts_tool_error() {
+        let tool_call = ToolCall {
+            id: "call-1".into(),
+            name: "bad_tool".into(),
+            input: serde_json::json!({}),
+        };
+        let llm = MockLlmProvider::tool_then_text(tool_call, "Recovered");
+        let tools = MockToolRegistry::failing("bad_tool", "disk full");
+        let estimator = default_estimator();
+
+        let config = LoopConfig {
+            persona: "You are helpful.",
+            llm: &llm,
+            tools: &tools,
+            estimator: &estimator,
+            max_tool_result_bytes: 10_000,
+            max_output_tokens: 4096,
+            scratchpad: None,
+            memory: None,
+            cancel: None,
+            timeout: None,
+            compaction_preserve_turns: 3,
+            compaction_max_summary_tokens: 1024,
+        };
+
+        let messages = vec![ChatMessage::user_text("Do something")];
+        let (turns, final_text, _msgs) = run_agentic_loop(messages, &config).await;
+
+        // Tool error should be converted to ToolResult with is_error:true
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        assert!(turns[0].tool_calls[0].is_error);
+        // Loop should continue and get the final text
+        assert_eq!(final_text.as_deref(), Some("Recovered"));
+    }
+
+    #[tokio::test]
+    async fn loop_respects_cancellation() {
+        let llm = MockLlmProvider::text_only("Should not reach");
+        let tools = MockToolRegistry::echo("test_tool");
+        let estimator = default_estimator();
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // Pre-cancel
+
+        let config = LoopConfig {
+            persona: "You are helpful.",
+            llm: &llm,
+            tools: &tools,
+            estimator: &estimator,
+            max_tool_result_bytes: 10_000,
+            max_output_tokens: 4096,
+            scratchpad: None,
+            memory: None,
+            cancel: Some(&cancel),
+            timeout: None,
+            compaction_preserve_turns: 3,
+            compaction_max_summary_tokens: 1024,
+        };
+
+        let messages = vec![ChatMessage::user_text("Hi")];
+        let (turns, final_text, _msgs) = run_agentic_loop(messages, &config).await;
+
+        assert!(turns.is_empty());
+        assert_eq!(final_text.as_deref(), Some("Cancelled"));
+    }
+
+    #[tokio::test]
+    async fn loop_respects_timeout() {
+        let llm = MockLlmProvider::text_only("Should not reach");
+        let tools = MockToolRegistry::echo("test_tool");
+        let estimator = default_estimator();
+
+        let config = LoopConfig {
+            persona: "You are helpful.",
+            llm: &llm,
+            tools: &tools,
+            estimator: &estimator,
+            max_tool_result_bytes: 10_000,
+            max_output_tokens: 4096,
+            scratchpad: None,
+            memory: None,
+            cancel: None,
+            timeout: Some(Duration::from_secs(0)), // Already expired
+            compaction_preserve_turns: 3,
+            compaction_max_summary_tokens: 1024,
+        };
+
+        let messages = vec![ChatMessage::user_text("Hi")];
+        let (turns, final_text, _msgs) = run_agentic_loop(messages, &config).await;
+
+        assert!(turns.is_empty());
+        let text = final_text.unwrap();
+        assert!(text.contains("loop timeout exceeded"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn loop_stops_at_max_turns() {
+        let tool_call = ToolCall {
+            id: "call-1".into(),
+            name: "test_tool".into(),
+            input: serde_json::json!({}),
+        };
+        // Queue MAX_TURNS worth of tool-call responses
+        let llm = MockLlmProvider::always_tool_call(tool_call, MAX_TURNS + 5);
+        let tools = MockToolRegistry::echo("test_tool");
+        let estimator = default_estimator();
+
+        let config = LoopConfig {
+            persona: "You are helpful.",
+            llm: &llm,
+            tools: &tools,
+            estimator: &estimator,
+            max_tool_result_bytes: 10_000,
+            max_output_tokens: 4096,
+            scratchpad: None,
+            memory: None,
+            cancel: None,
+            timeout: None,
+            compaction_preserve_turns: 3,
+            compaction_max_summary_tokens: 1024,
+        };
+
+        let messages = vec![ChatMessage::user_text("Do something")];
+        let (turns, _final_text, _msgs) = run_agentic_loop(messages, &config).await;
+
+        assert_eq!(turns.len(), MAX_TURNS);
+    }
+
+    #[tokio::test]
+    async fn loop_truncates_large_tool_output() {
+        let tool_call = ToolCall {
+            id: "call-1".into(),
+            name: "big_tool".into(),
+            input: serde_json::json!({}),
+        };
+        let llm = MockLlmProvider::tool_then_text(tool_call, "Done");
+        let tools = MockToolRegistry::large_output("big_tool", 100_000);
+        let estimator = default_estimator();
+
+        let max_result_bytes = 1_000;
+        let config = LoopConfig {
+            persona: "You are helpful.",
+            llm: &llm,
+            tools: &tools,
+            estimator: &estimator,
+            max_tool_result_bytes: max_result_bytes,
+            max_output_tokens: 4096,
+            scratchpad: None,
+            memory: None,
+            cancel: None,
+            timeout: None,
+            compaction_preserve_turns: 3,
+            compaction_max_summary_tokens: 1024,
+        };
+
+        let messages = vec![ChatMessage::user_text("Get data")];
+        let (_turns, _final_text, msgs) = run_agentic_loop(messages, &config).await;
+
+        // Find the tool result message and check it was truncated
+        let tool_result_msg = msgs.iter().find(|m| {
+            m.content.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        });
+        assert!(tool_result_msg.is_some(), "should have a tool result message");
+
+        let tool_result_content = tool_result_msg.unwrap().content.iter().find_map(|b| {
+            if let ContentBlock::ToolResult { content, .. } = b {
+                Some(content.clone())
+            } else {
+                None
+            }
+        }).unwrap();
+
+        assert!(tool_result_content.contains("[truncated:"), "output should contain truncation marker, got len={}", tool_result_content.len());
+    }
+}

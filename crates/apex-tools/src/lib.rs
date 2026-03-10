@@ -16,6 +16,6 @@ pub mod tool_result_helpers;
 pub use builtin::BuiltinToolRegistry;
 pub use config_tool::ConfigToolRegistry;
 pub use custom_tools::CustomToolRegistry;
-pub use delegate_tool::{DelegateToolRegistry, SubAgentResult, SubAgentSpawner};
+pub use delegate_tool::DelegateToolRegistry;
 pub use memory_tools::MemoryToolRegistry;
 pub use queue_tools::QueueToolRegistry;

@@ -76,11 +76,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "apex-core",
+ "apex-infra",
  "apex-tools",
  "async-trait",
  "futures",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]
@@ -107,7 +109,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "apex-core",
- "apex-infra",
  "async-trait",
  "glob",
  "libc",

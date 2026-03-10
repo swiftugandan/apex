@@ -85,7 +85,7 @@ impl TokenEstimator {
         if text.len() <= max_chars {
             text.to_string()
         } else {
-            let truncated = &text[..max_chars.saturating_sub(12)];
+            let truncated = crate::truncate_str(text, max_chars.saturating_sub(12));
             format!("{truncated}\n[truncated]")
         }
     }
@@ -205,5 +205,23 @@ mod tests {
         assert!(est.ratio(ContentType::Prose) > est.ratio(ContentType::Code));
         assert!(est.ratio(ContentType::Mixed) > est.ratio(ContentType::Code));
         assert!(est.ratio(ContentType::Prose) > est.ratio(ContentType::Mixed));
+    }
+
+    #[test]
+    fn budget_multibyte_no_panic() {
+        let est = TokenEstimator::default();
+        // Emoji are 4 bytes each; small budget forces truncation mid-codepoint
+        let text = "😀😁😂🤣😃😄😅😆😇😈".repeat(10);
+        let result = est.budget(&text, 2);
+        assert!(result.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn budget_cjk_no_panic() {
+        let est = TokenEstimator::default();
+        // CJK chars are 3 bytes each
+        let text = "\u{4e00}".repeat(100);
+        let result = est.budget(&text, 2);
+        assert!(result.ends_with("[truncated]"));
     }
 }

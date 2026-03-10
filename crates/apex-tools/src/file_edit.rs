@@ -361,4 +361,94 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[tokio::test]
+    async fn insert_at_zero_prepends() {
+        let dir = temp_dir();
+        let path = dir.join("test.txt");
+        std::fs::write(&path, "line1\nline2").unwrap();
+
+        let call = make_call(json!({
+            "path": path.to_str().unwrap(),
+            "command": "insert",
+            "insert_line": 0,
+            "new_string": "prepended"
+        }));
+        let result = execute(&call).await.unwrap();
+
+        assert!(!result.is_error);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "prepended\nline1\nline2"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_at_one_after_first() {
+        let dir = temp_dir();
+        let path = dir.join("test.txt");
+        std::fs::write(&path, "line1\nline2\nline3").unwrap();
+
+        let call = make_call(json!({
+            "path": path.to_str().unwrap(),
+            "command": "insert",
+            "insert_line": 1,
+            "new_string": "inserted"
+        }));
+        let result = execute(&call).await.unwrap();
+
+        assert!(!result.is_error);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "line1\ninserted\nline2\nline3"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_at_end_appends() {
+        let dir = temp_dir();
+        let path = dir.join("test.txt");
+        std::fs::write(&path, "line1\nline2\nline3").unwrap();
+
+        let call = make_call(json!({
+            "path": path.to_str().unwrap(),
+            "command": "insert",
+            "insert_line": 3,
+            "new_string": "appended"
+        }));
+        let result = execute(&call).await.unwrap();
+
+        assert!(!result.is_error);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "line1\nline2\nline3\nappended"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_beyond_length_errors() {
+        let dir = temp_dir();
+        let path = dir.join("test.txt");
+        std::fs::write(&path, "line1\nline2").unwrap();
+
+        let call = make_call(json!({
+            "path": path.to_str().unwrap(),
+            "command": "insert",
+            "insert_line": 5,
+            "new_string": "nope"
+        }));
+        let result = execute(&call).await.unwrap();
+
+        assert!(result.is_error);
+        let err = result.output["error"].as_str().unwrap();
+        assert!(err.contains("exceeds file length"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

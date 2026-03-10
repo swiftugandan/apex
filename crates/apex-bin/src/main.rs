@@ -370,7 +370,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
             Arc::new(FsSkillStore::new(path.to_path_buf())) as Arc<dyn SkillStore>
         }),
     });
-    let spawner: Arc<dyn apex_tools::SubAgentSpawner> = Arc::new(InProcessSpawner {
+    let spawner: Arc<dyn apex_core::ports::SubAgentSpawner> = Arc::new(InProcessSpawner {
         project_paths: paths.clone(),
         parent_long_term: long_term.clone(),
         parent_skills: skills.clone(),

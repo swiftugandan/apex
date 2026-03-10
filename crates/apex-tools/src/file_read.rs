@@ -47,8 +47,8 @@ pub async fn execute(call: &ToolCall) -> Result<ToolResult, ToolError> {
             };
 
             let truncated_bytes = selected.len() > max_bytes;
-            let bytes_read = selected.len().min(max_bytes);
-            let content = &selected[..bytes_read];
+            let content = apex_core::truncate_str(&selected, max_bytes);
+            let bytes_read = content.len();
 
             let lines_returned = content.lines().count();
             let has_offset_or_limit = offset > 1 || limit.is_some();
@@ -195,5 +195,28 @@ mod tests {
         let call = make_call(json!({}));
         let err = execute(&call).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn read_multibyte_truncation() {
+        let dir = temp_dir();
+        let path = dir.join("emoji.txt");
+        // Each emoji is 4 bytes
+        let content = "😀😁😂🤣😃😄😅😆😇😈";
+        std::fs::write(&path, content).unwrap();
+
+        // max_bytes=5 lands in the middle of the second emoji (byte 5 of 40)
+        let call = make_call(json!({"path": path.to_str().unwrap(), "max_bytes": 5}));
+        let result = execute(&call).await.unwrap();
+
+        // Should not panic and should truncate to valid UTF-8
+        assert!(!result.is_error);
+        assert!(result.output["truncated"].as_bool().unwrap());
+        // Should have truncated to 4 bytes (one complete emoji)
+        assert_eq!(result.output["bytes_read"], 4);
+        let out = result.output["content"].as_str().unwrap();
+        assert_eq!(out, "😀");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

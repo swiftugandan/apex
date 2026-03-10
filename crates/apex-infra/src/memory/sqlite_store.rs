@@ -188,12 +188,13 @@ impl MemoryStore for SqliteMemoryStore {
                 Ok(rows) => Ok(rows),
                 Err(e) => {
                     eprintln!("warning: FTS5 query failed ({e}), falling back to LIKE");
-                    let pattern = format!("%{query}%");
+                    let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+                    let pattern = format!("%{escaped}%");
                     let mut stmt = conn
                         .prepare(
                             "SELECT id, content, source_job, confidence, created_at, last_verified, tags
                              FROM facts
-                             WHERE content LIKE ?1 OR tags LIKE ?1
+                             WHERE content LIKE ?1 ESCAPE '\\' OR tags LIKE ?1 ESCAPE '\\'
                              ORDER BY confidence DESC
                              LIMIT ?2",
                         )
@@ -499,5 +500,43 @@ mod tests {
     fn sanitize_fts_query_escapes_quotes() {
         let result = SqliteMemoryStore::sanitize_fts_query("say \"hello\"");
         assert_eq!(result, "\"say\" \"\"\"hello\"\"\"");
+    }
+
+    #[tokio::test]
+    async fn query_with_percent_literal() {
+        let (_dir, store) = open_temp_store();
+        // Store a fact containing a literal percent
+        store
+            .store_fact(Fact {
+                id: FactId(String::new()),
+                content: "100% complete".to_string(),
+                source_job: "j1".to_string(),
+                confidence: 1.0,
+                created_at: String::new(),
+                last_verified: String::new(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+        store
+            .store_fact(Fact {
+                id: FactId(String::new()),
+                content: "unrelated fact".to_string(),
+                source_job: "j2".to_string(),
+                confidence: 1.0,
+                created_at: String::new(),
+                last_verified: String::new(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Force LIKE fallback by using a query that will fail FTS5
+        // The FTS5 query sanitizer wraps in quotes, so this should work through FTS5.
+        // To test the LIKE fallback specifically, we'd need to break FTS5,
+        // but we can at least test the normal path handles percent correctly.
+        let results = store.query_facts("100%", 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains("100%"));
     }
 }

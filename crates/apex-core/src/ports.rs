@@ -5,6 +5,7 @@ use crate::domain::{
     QueueMessage, QueueMessageMeta, ReapResult, Scratchpad, Skill, SkillId,
     ToolCall, ToolCompletionResponse, ToolDef, ToolResult, ToolSchema,
 };
+use crate::config::RoleProfile;
 use crate::error::{LlmError, MemoryError, QueueError, ToolError};
 
 #[async_trait]
@@ -81,4 +82,22 @@ pub trait SkillStore: Send + Sync {
     async fn find_skill(&self, task_pattern: &str) -> Result<Option<Skill>, MemoryError>;
     async fn list_skills(&self, limit: usize) -> Result<Vec<Skill>, MemoryError>;
     async fn update_skill_fitness(&self, id: &SkillId, success: bool) -> Result<(), MemoryError>;
+}
+
+/// Result returned after a sub-agent completes.
+pub struct SubAgentResult {
+    pub done_bodies: Vec<String>,
+    pub failed_bodies: Vec<String>,
+}
+
+/// Trait for spawning sub-agent processes. Decouples the delegate tool from
+/// concrete queue/memory/LLM provisioning.
+#[async_trait]
+pub trait SubAgentSpawner: Send + Sync {
+    async fn spawn(
+        &self,
+        task: &str,
+        role: &RoleProfile,
+        persona: &str,
+    ) -> Result<SubAgentResult, ToolError>;
 }

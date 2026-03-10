@@ -13,9 +13,10 @@ use apex_core::domain::{
 use apex_core::error::ToolError;
 use apex_core::ports::{MemoryStore, SkillStore, ToolRegistry, WorkingMemory};
 
+use apex_core::ports::SubAgentSpawner;
 use apex_tools::{
     BuiltinToolRegistry, ConfigToolRegistry, CustomToolRegistry, DelegateToolRegistry,
-    MemoryToolRegistry, QueueToolRegistry, SubAgentSpawner,
+    MemoryToolRegistry, QueueToolRegistry,
 };
 use apex_tools::spill::SpillManager;
 

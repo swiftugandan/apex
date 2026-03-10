@@ -324,3 +324,199 @@ async fn handle_failure(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── is_non_retryable ──────────────────────────────────────────
+
+    #[test]
+    fn is_non_retryable_positive() {
+        let patterns = [
+            "credit balance is too low",
+            "invalid x-api-key",
+            "Invalid API Key provided",
+            "authentication_error: bad token",
+            "permission_error: no access",
+            "not_found_error: model gone",
+            "configuration error: missing key",
+        ];
+        for p in patterns {
+            assert!(is_non_retryable(p), "should match: {p}");
+        }
+    }
+
+    #[test]
+    fn is_non_retryable_negative() {
+        assert!(!is_non_retryable("connection timeout"));
+        assert!(!is_non_retryable("internal error"));
+        assert!(!is_non_retryable("rate_limit exceeded"));
+        assert!(!is_non_retryable("something went wrong"));
+    }
+
+    // ── is_rate_limited ───────────────────────────────────────────
+
+    #[test]
+    fn is_rate_limited_positive() {
+        assert!(is_rate_limited("rate_limit exceeded"));
+        assert!(is_rate_limited("Error 429: too many"));
+        assert!(is_rate_limited("too many requests, slow down"));
+    }
+
+    #[test]
+    fn is_rate_limited_negative() {
+        assert!(!is_rate_limited("connection timeout"));
+        assert!(!is_rate_limited("internal error"));
+        assert!(!is_rate_limited("authentication_error"));
+    }
+
+    // ── handle_failure ────────────────────────────────────────────
+
+    use apex_core::domain::QueueDepth;
+    use crate::test_mocks::*;
+
+    fn make_claimed(id: &str, retry_count: u32) -> ClaimedTask {
+        ClaimedTask {
+            id: id.to_string(),
+            claim_path: format!("/tmp/test/{id}"),
+            headers: apex_core::domain::MessageHeaders {
+                message_type: MessageType::Task,
+                correlation_id: "corr-1".to_string(),
+                depth: 0,
+                retry_count,
+                depends_on: vec![],
+            },
+            body: "test body".to_string(),
+        }
+    }
+
+    fn make_record() -> AttemptRecord {
+        AttemptRecord {
+            attempt_number: 1,
+            started_at: "0".into(),
+            finished_at: "1".into(),
+            turns: vec![],
+            final_text: None,
+            outcome: AttemptOutcome::Failed,
+            failure_reason: Some("test error".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_failure_non_retryable_rejects() {
+        let queue = MockQueue::new();
+        let claimed = make_claimed("task-1", 0);
+        let record = make_record();
+        let scratchpad = apex_core::domain::Scratchpad::new("j1", "goal");
+        let composer = MessageComposer::default();
+
+        handle_failure(
+            &queue, &claimed, &record, "authentication_error: bad token", &scratchpad,
+            0, &composer, 3,
+        )
+        .await
+        .unwrap();
+
+        let actions = queue.actions.lock().await;
+        // Should have UpdateBody + Reject
+        assert!(
+            actions.iter().any(|a| matches!(a, QueueAction::Reject(_))),
+            "expected Reject action, got: {:?}",
+            actions
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_failure_rate_limited_delays() {
+        let queue = MockQueue::new();
+        let claimed = make_claimed("task-2", 1); // retry_count=1
+        let record = make_record();
+        let scratchpad = apex_core::domain::Scratchpad::new("j2", "goal");
+        let composer = MessageComposer::default();
+
+        handle_failure(
+            &queue, &claimed, &record, "rate_limit exceeded", &scratchpad,
+            0, &composer, 3,
+        )
+        .await
+        .unwrap();
+
+        let actions = queue.actions.lock().await;
+        let nack_delay = actions.iter().find_map(|a| {
+            if let QueueAction::NackWithDelay(_, d) = a {
+                Some(*d)
+            } else {
+                None
+            }
+        });
+        assert!(nack_delay.is_some(), "expected NackWithDelay");
+        // backoff = RATE_LIMIT_BACKOFF_SECS * (retry_count + 1) = 30 * 2 = 60
+        let expected = std::time::Duration::from_secs(RATE_LIMIT_BACKOFF_SECS * 2);
+        assert_eq!(nack_delay.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn handle_failure_generic_nacks() {
+        let queue = MockQueue::new();
+        let claimed = make_claimed("task-3", 0);
+        let record = make_record();
+        let scratchpad = apex_core::domain::Scratchpad::new("j3", "goal");
+        let composer = MessageComposer::default();
+
+        handle_failure(
+            &queue, &claimed, &record, "connection timeout", &scratchpad,
+            0, &composer, 3,
+        )
+        .await
+        .unwrap();
+
+        let actions = queue.actions.lock().await;
+        assert!(
+            actions.iter().any(|a| matches!(a, QueueAction::Nack(_))),
+            "expected Nack action, got: {:?}",
+            actions
+        );
+        // Should NOT have Reject or NackWithDelay
+        assert!(!actions.iter().any(|a| matches!(a, QueueAction::Reject(_))));
+        assert!(!actions.iter().any(|a| matches!(a, QueueAction::NackWithDelay(_, _))));
+    }
+
+    #[tokio::test]
+    async fn worker_exits_on_empty_queue() {
+        let queue = Arc::new(MockQueue::new());
+        // Set depth to 0/0 so worker exits immediately
+        *queue.depth_override.lock().await = Some(QueueDepth {
+            pending: 0,
+            processing: 0,
+        });
+
+        let tools = Arc::new(crate::registry::CompositeToolRegistry::new(vec![]));
+        let llm: Arc<dyn LlmProvider> = Arc::new(MockLlmProvider::text_only("unused"));
+        let memory: Arc<dyn WorkingMemory> = Arc::new(MockWorkingMemory::new());
+        let long_term: Arc<dyn MemoryStore> = Arc::new(MockMemoryStore::new());
+        let skills: Arc<dyn SkillStore> = Arc::new(MockSkillStore::new());
+
+        let ctx = WorkerContext {
+            queue: queue as Arc<dyn Queue>,
+            tools,
+            llm,
+            memory,
+            long_term,
+            skills,
+            persona: Arc::new("test persona".to_string()),
+            max_depth: 3,
+            max_retries: 3,
+            max_tool_result_bytes: 10_000,
+            max_output_tokens: 4096,
+            estimator: Arc::new(Mutex::new(TokenEstimator::default())),
+            compaction: CompactionSection {
+                preserve_turns: 3,
+                max_summary_tokens: 1024,
+            },
+        };
+
+        let result = worker_loop(ctx, 0).await;
+        assert!(result.is_ok(), "worker should exit cleanly: {:?}", result);
+    }
+}

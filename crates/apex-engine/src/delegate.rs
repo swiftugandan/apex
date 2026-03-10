@@ -10,7 +10,7 @@ use apex_core::domain::{MessageHeaders, MessageType, QueueMessage};
 use apex_core::error::ToolError;
 use apex_core::ports::{LlmProvider, MemoryStore, Queue, SkillStore, ToolRegistry, WorkingMemory};
 
-use apex_tools::{SubAgentResult, SubAgentSpawner};
+use apex_core::ports::{SubAgentResult, SubAgentSpawner};
 
 use crate::paths::ProjectPaths;
 use crate::registry::{build_static_tools, CompositeToolRegistry, OwnedFilteredToolRegistry};

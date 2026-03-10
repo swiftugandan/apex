@@ -120,6 +120,40 @@ impl QueueToolRegistry {
             });
         }
 
+        // Detect transitive cycles via topological sort (Kahn's algorithm)
+        {
+            let n = infos.len();
+            let mut in_degree = vec![0u32; n];
+            let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+            for (i, info) in infos.iter().enumerate() {
+                for &dep in &info.depends_on_indices {
+                    adj[dep].push(i);
+                    in_degree[i] += 1;
+                }
+            }
+            let mut queue: std::collections::VecDeque<usize> = in_degree
+                .iter()
+                .enumerate()
+                .filter(|(_, &d)| d == 0)
+                .map(|(i, _)| i)
+                .collect();
+            let mut visited = 0usize;
+            while let Some(node) = queue.pop_front() {
+                visited += 1;
+                for &next in &adj[node] {
+                    in_degree[next] -= 1;
+                    if in_degree[next] == 0 {
+                        queue.push_back(next);
+                    }
+                }
+            }
+            if visited != n {
+                return Err(ToolError::InvalidInput(
+                    "subtask dependencies contain a cycle".to_string(),
+                ));
+            }
+        }
+
         let mut subtask_ids: Vec<String> = Vec::new();
 
         for info in &infos {
@@ -253,6 +287,38 @@ impl QueueToolRegistry {
             "results": results,
         }))
     }
+
+    /// Check dependency graph for cycles using topological sort.
+    /// Returns Ok(()) if DAG is valid, Err if cycle detected.
+    #[cfg(test)]
+    fn check_cycle(deps: &[Vec<usize>]) -> Result<(), &'static str> {
+        let n = deps.len();
+        let mut in_degree = vec![0u32; n];
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (i, dep_list) in deps.iter().enumerate() {
+            for &dep in dep_list {
+                adj[dep].push(i);
+                in_degree[i] += 1;
+            }
+        }
+        let mut queue: std::collections::VecDeque<usize> = in_degree
+            .iter()
+            .enumerate()
+            .filter(|(_, &d)| d == 0)
+            .map(|(i, _)| i)
+            .collect();
+        let mut visited = 0usize;
+        while let Some(node) = queue.pop_front() {
+            visited += 1;
+            for &next in &adj[node] {
+                in_degree[next] -= 1;
+                if in_degree[next] == 0 {
+                    queue.push_back(next);
+                }
+            }
+        }
+        if visited == n { Ok(()) } else { Err("cycle") }
+    }
 }
 
 #[async_trait]
@@ -326,5 +392,118 @@ impl ToolRegistry for QueueToolRegistry {
             is_error: false,
             ..Default::default()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Unit tests for cycle detection logic (same algorithm used in handle_decompose_goal)
+
+    #[test]
+    fn decompose_rejects_mutual_dependency() {
+        // A depends on B, B depends on A
+        let deps = vec![
+            vec![1], // 0 depends on 1
+            vec![0], // 1 depends on 0
+        ];
+        assert!(QueueToolRegistry::check_cycle(&deps).is_err());
+    }
+
+    #[test]
+    fn decompose_rejects_chain_cycle() {
+        // A→B→C→A
+        let deps = vec![
+            vec![2], // 0 depends on 2
+            vec![0], // 1 depends on 0
+            vec![1], // 2 depends on 1
+        ];
+        assert!(QueueToolRegistry::check_cycle(&deps).is_err());
+    }
+
+    #[test]
+    fn decompose_allows_valid_dag() {
+        // Linear chain: 0 → 1 → 2, plus 3 depends on both 1 and 2 (fan-in)
+        let deps = vec![
+            vec![],     // 0 has no deps
+            vec![0],    // 1 depends on 0
+            vec![1],    // 2 depends on 1
+            vec![1, 2], // 3 depends on 1 and 2
+        ];
+        assert!(QueueToolRegistry::check_cycle(&deps).is_ok());
+    }
+
+    #[test]
+    fn decompose_allows_independent_tasks() {
+        // No dependencies at all
+        let deps = vec![vec![], vec![], vec![]];
+        assert!(QueueToolRegistry::check_cycle(&deps).is_ok());
+    }
+
+    #[test]
+    fn decompose_rejects_longer_cycle_in_subgraph() {
+        // 0 is independent, 1→2→3→1 form a cycle
+        let deps = vec![
+            vec![],  // 0: independent
+            vec![3], // 1 depends on 3
+            vec![1], // 2 depends on 1
+            vec![2], // 3 depends on 2
+        ];
+        assert!(QueueToolRegistry::check_cycle(&deps).is_err());
+    }
+
+    // Integration test via handle_decompose_goal (requires a MockQueue)
+    #[tokio::test]
+    async fn decompose_goal_rejects_mutual_cycle() {
+        use apex_core::context::MessageComposer;
+        use std::sync::Arc;
+
+        // Minimal mock queue
+        struct MinimalQueue;
+        #[async_trait]
+        impl Queue for MinimalQueue {
+            async fn push(&self, _msg: QueueMessage) -> Result<String, apex_core::error::QueueError> {
+                Ok("id".into())
+            }
+            async fn pop(&self) -> Result<Option<apex_core::domain::ClaimedTask>, apex_core::error::QueueError> { Ok(None) }
+            async fn update_body(&self, _c: &apex_core::domain::ClaimedTask, _b: &str) -> Result<(), apex_core::error::QueueError> { Ok(()) }
+            async fn ack(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
+            async fn nack(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
+            async fn nack_with_delay(&self, _c: &apex_core::domain::ClaimedTask, _d: std::time::Duration) -> Result<(), apex_core::error::QueueError> { Ok(()) }
+            async fn reject(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
+            async fn depth(&self) -> Result<apex_core::domain::QueueDepth, apex_core::error::QueueError> { Ok(Default::default()) }
+            async fn reap(&self) -> Result<apex_core::domain::ReapResult, apex_core::error::QueueError> { Ok(Default::default()) }
+            async fn list_done(&self, _cid: &str) -> Result<Vec<String>, apex_core::error::QueueError> { Ok(vec![]) }
+            async fn read_done_body(&self, _id: &str) -> Result<String, apex_core::error::QueueError> { Ok(String::new()) }
+            async fn list_with_state(&self, _s: &str) -> Result<Vec<apex_core::domain::QueueMessageMeta>, apex_core::error::QueueError> { Ok(vec![]) }
+        }
+
+        let registry = QueueToolRegistry::new(
+            Arc::new(MinimalQueue),
+            "corr-1".into(),
+            0,   // current_depth
+            3,   // max_depth
+            "parent goal".into(),
+            "parent body".into(),
+            None,
+            None,
+            MessageComposer::default(),
+        );
+
+        let input = json!({
+            "subtasks": [
+                { "description": "Task A", "depends_on": [1] },
+                { "description": "Task B", "depends_on": [0] }
+            ]
+        });
+
+        let result = registry.handle_decompose_goal(&input).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref msg) if msg.contains("cycle")),
+            "expected cycle error, got: {err:?}"
+        );
     }
 }

@@ -21,4 +21,3 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
-apex-infra = { path = "../apex-infra" }

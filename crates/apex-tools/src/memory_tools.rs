@@ -532,25 +532,119 @@ impl MemoryToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apex_infra::FsSkillStore;
-    use apex_infra::FsScratchpadStore;
-    use apex_infra::SqliteMemoryStore;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+    use apex_core::domain::{CalibrationData, Scratchpad, Skill, SkillId, Fact, FactId};
+    use apex_core::error::MemoryError;
 
-    fn setup() -> (tempfile::TempDir, MemoryToolRegistry) {
-        let dir = tempfile::tempdir().unwrap();
-        let wm: Arc<dyn WorkingMemory> =
-            Arc::new(FsScratchpadStore::new(dir.path().join("working")));
-        let lt: Arc<dyn MemoryStore> =
-            Arc::new(SqliteMemoryStore::open(&dir.path().join("memory.db")).unwrap());
-        let skills: Arc<dyn SkillStore> =
-            Arc::new(FsSkillStore::new(dir.path().join("skills")));
-        let reg = MemoryToolRegistry::new(wm, lt, skills);
-        (dir, reg)
+    // ── Inline mocks (no infra dependency) ──────────────────────────
+
+    struct MockWorkingMemory {
+        pads: Mutex<HashMap<String, Scratchpad>>,
+    }
+
+    impl MockWorkingMemory {
+        fn new() -> Self {
+            Self { pads: Mutex::new(HashMap::new()) }
+        }
+    }
+
+    #[async_trait]
+    impl WorkingMemory for MockWorkingMemory {
+        async fn load_or_create(&self, job_id: &str) -> Result<Scratchpad, MemoryError> {
+            let pads = self.pads.lock().await;
+            Ok(pads.get(job_id).cloned().unwrap_or_else(|| Scratchpad::new(job_id, "")))
+        }
+        async fn save(&self, scratchpad: &Scratchpad) -> Result<(), MemoryError> {
+            self.pads.lock().await.insert(scratchpad.job_id.clone(), scratchpad.clone());
+            Ok(())
+        }
+        async fn exists(&self, job_id: &str) -> Result<bool, MemoryError> {
+            Ok(self.pads.lock().await.contains_key(job_id))
+        }
+        async fn delete(&self, job_id: &str) -> Result<(), MemoryError> {
+            self.pads.lock().await.remove(job_id);
+            Ok(())
+        }
+        async fn list_active(&self) -> Result<Vec<String>, MemoryError> {
+            Ok(self.pads.lock().await.keys().cloned().collect())
+        }
+        async fn reap_stale(&self, _retention_days: u32) -> Result<Vec<String>, MemoryError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct MockMemoryStore {
+        facts: Mutex<Vec<Fact>>,
+    }
+
+    impl MockMemoryStore {
+        fn new() -> Self {
+            Self { facts: Mutex::new(Vec::new()) }
+        }
+    }
+
+    #[async_trait]
+    impl MemoryStore for MockMemoryStore {
+        async fn store_fact(&self, fact: Fact) -> Result<FactId, MemoryError> {
+            let id = if fact.id.0.is_empty() {
+                FactId(format!("fact-{}", self.facts.lock().await.len()))
+            } else {
+                fact.id.clone()
+            };
+            self.facts.lock().await.push(Fact { id: id.clone(), ..fact });
+            Ok(id)
+        }
+        async fn query_facts(&self, query: &str, limit: usize) -> Result<Vec<Fact>, MemoryError> {
+            let facts = self.facts.lock().await;
+            Ok(facts.iter().filter(|f| f.content.contains(query)).take(limit).cloned().collect())
+        }
+        async fn verify_fact(&self, _id: &FactId) -> Result<(), MemoryError> { Ok(()) }
+        async fn persist_calibration(&self, _data: &CalibrationData) -> Result<(), MemoryError> { Ok(()) }
+        async fn load_calibration(&self) -> Result<CalibrationData, MemoryError> { Ok(CalibrationData::default()) }
+    }
+
+    struct MockSkillStore {
+        skills: Mutex<Vec<Skill>>,
+    }
+
+    impl MockSkillStore {
+        fn new() -> Self {
+            Self { skills: Mutex::new(Vec::new()) }
+        }
+    }
+
+    #[async_trait]
+    impl SkillStore for MockSkillStore {
+        async fn store_skill(&self, skill: Skill) -> Result<SkillId, MemoryError> {
+            let id = if skill.id.0.is_empty() {
+                SkillId(format!("skill-{}", self.skills.lock().await.len()))
+            } else {
+                skill.id.clone()
+            };
+            self.skills.lock().await.push(Skill { id: id.clone(), ..skill });
+            Ok(id)
+        }
+        async fn find_skill(&self, task_pattern: &str) -> Result<Option<Skill>, MemoryError> {
+            let skills = self.skills.lock().await;
+            Ok(skills.iter().find(|s| s.task_pattern.contains(task_pattern)).cloned())
+        }
+        async fn list_skills(&self, limit: usize) -> Result<Vec<Skill>, MemoryError> {
+            Ok(self.skills.lock().await.iter().take(limit).cloned().collect())
+        }
+        async fn update_skill_fitness(&self, _id: &SkillId, _success: bool) -> Result<(), MemoryError> { Ok(()) }
+    }
+
+    fn setup() -> MemoryToolRegistry {
+        let wm: Arc<dyn WorkingMemory> = Arc::new(MockWorkingMemory::new());
+        let lt: Arc<dyn MemoryStore> = Arc::new(MockMemoryStore::new());
+        let skills: Arc<dyn SkillStore> = Arc::new(MockSkillStore::new());
+        MemoryToolRegistry::new(wm, lt, skills)
     }
 
     #[test]
     fn definitions_returns_6_tools() {
-        let (_dir, reg) = setup();
+        let reg = setup();
         let defs = reg.definitions();
         assert_eq!(defs.len(), 6);
         let names: Vec<&str> = defs.iter().map(|d| d.schema.name.as_str()).collect();
@@ -564,7 +658,7 @@ mod tests {
 
     #[tokio::test]
     async fn working_memory_read_returns_content() {
-        let (_dir, reg) = setup();
+        let reg = setup();
         let call = ToolCall {
             id: "t1".into(),
             name: "working_memory_read".into(),
@@ -578,7 +672,7 @@ mod tests {
 
     #[tokio::test]
     async fn working_memory_update_applies_changes() {
-        let (_dir, reg) = setup();
+        let reg = setup();
         let call = ToolCall {
             id: "t1".into(),
             name: "working_memory_update".into(),
@@ -600,7 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_and_query_fact() {
-        let (_dir, reg) = setup();
+        let reg = setup();
 
         // Store
         let call = ToolCall {
@@ -625,7 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_tool_returns_error() {
-        let (_dir, reg) = setup();
+        let reg = setup();
         let call = ToolCall {
             id: "t1".into(),
             name: "nonexistent".into(),
