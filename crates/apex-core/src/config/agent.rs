@@ -37,6 +37,10 @@ pub struct AgentSection {
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
 
+    /// Maximum tokens per LLM completion response.
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u32,
+
     /// Enabled tool names (empty = all available).
     #[serde(default)]
     pub tools: Vec<String>,
@@ -147,6 +151,9 @@ fn default_max_depth() -> u32 {
 fn default_max_retries() -> u32 {
     3
 }
+fn default_max_output_tokens() -> u32 {
+    16_384
+}
 fn default_max_body_tokens() -> usize {
     50_000
 }
@@ -221,6 +228,7 @@ impl Default for AgentSection {
             max_concurrent: default_max_concurrent(),
             max_depth: default_max_depth(),
             max_retries: default_max_retries(),
+            max_output_tokens: default_max_output_tokens(),
             tools: vec![],
         }
     }

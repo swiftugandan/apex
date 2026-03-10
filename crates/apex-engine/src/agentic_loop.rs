@@ -13,7 +13,7 @@ use apex_core::ports::{LlmProvider, ToolRegistry, WorkingMemory};
 
 use apex_core::summarize_json;
 
-use crate::constants::{MAX_TOKENS, MAX_TURNS};
+use crate::constants::MAX_TURNS;
 
 /// Configuration bundle for the agentic loop.
 pub struct LoopConfig<'a> {
@@ -22,6 +22,7 @@ pub struct LoopConfig<'a> {
     pub tools: &'a dyn ToolRegistry,
     pub estimator: &'a Arc<Mutex<TokenEstimator>>,
     pub max_tool_result_bytes: usize,
+    pub max_output_tokens: u32,
     pub scratchpad: Option<&'a Arc<Mutex<apex_core::domain::Scratchpad>>>,
     pub memory: Option<&'a dyn WorkingMemory>,
     /// Optional cancellation token — checked before each turn.
@@ -61,7 +62,7 @@ pub async fn run_agentic_loop(
         let req = CompletionRequest {
             system_prompt: &system_prompt,
             messages: &messages,
-            max_tokens: MAX_TOKENS,
+            max_tokens: config.max_output_tokens,
             temperature: Some(0.2),
         };
 

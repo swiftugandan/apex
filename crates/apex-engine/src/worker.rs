@@ -31,6 +31,7 @@ pub struct WorkerContext {
     pub max_depth: u32,
     pub max_retries: u32,
     pub max_tool_result_bytes: usize,
+    pub max_output_tokens: u32,
     pub estimator: Arc<Mutex<TokenEstimator>>,
 }
 
@@ -176,6 +177,7 @@ async fn execute_claim(
         tools: &tools,
         estimator: &ctx.estimator,
         max_tool_result_bytes: ctx.max_tool_result_bytes,
+        max_output_tokens: ctx.max_output_tokens,
         scratchpad: Some(&scratchpad_arc),
         memory: Some(ctx.memory.as_ref()),
         cancel: None,

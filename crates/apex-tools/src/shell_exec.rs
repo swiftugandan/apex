@@ -13,16 +13,16 @@ pub fn definition() -> ToolDef {
     ToolDef {
         schema: ToolSchema {
             name: "shell_exec".into(),
-            description: "Run a shell command via /bin/sh -c".into(),
+            description: "Run a shell command via /bin/sh -c. Output beyond 16KB is automatically spilled to a scratch file — you receive a head/tail summary with the scratch path. Use file_read with offset/limit to read spilled sections.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "Shell command to execute" },
                     "cwd": { "type": "string", "description": "Working directory (optional)" },
-                    "max_output": { "type": "integer", "description": "Max output bytes (default 16384)" },
-                    "grep": { "type": "string", "description": "Filter output lines matching this substring" },
-                    "tail": { "type": "integer", "description": "Only keep last N lines" },
-                    "max_lines": { "type": "integer", "description": "Max lines to return" }
+                    "max_output": { "type": "integer", "description": "Spill threshold in bytes (default 16384). Output above this is spilled to scratch with a head/tail envelope. Rarely needs changing." },
+                    "grep": { "type": "string", "description": "Filter output lines matching this substring (applied before spill)" },
+                    "tail": { "type": "integer", "description": "Only keep last N lines (applied before spill)" },
+                    "max_lines": { "type": "integer", "description": "Max lines to return (applied before spill)" }
                 },
                 "required": ["command"]
             }),

@@ -29,6 +29,7 @@ pub struct SpawnerConfig {
     pub invariants: Arc<Invariants>,
     pub roles: Arc<[RoleProfile]>,
     pub max_tool_result_bytes: usize,
+    pub max_output_tokens: u32,
     pub remaining_delegate_depth: u32,
 }
 
@@ -100,6 +101,7 @@ impl SubAgentSpawner for InProcessSpawner {
                 invariants: Arc::clone(&self.config.invariants),
                 roles: Arc::clone(&self.config.roles),
                 max_tool_result_bytes: self.config.max_tool_result_bytes,
+                max_output_tokens: self.config.max_output_tokens,
                 remaining_delegate_depth: sub_depth,
             },
             infra: Arc::clone(&self.infra),
@@ -161,6 +163,7 @@ impl SubAgentSpawner for InProcessSpawner {
             max_depth: role.max_depth,
             max_retries: role.max_retries,
             max_tool_result_bytes: self.config.max_tool_result_bytes,
+            max_output_tokens: self.config.max_output_tokens,
             estimator: Arc::clone(&self.estimator),
         };
 

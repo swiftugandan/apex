@@ -312,6 +312,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
     let max_depth = agent_config.agent.max_depth;
     let max_retries = agent_config.agent.max_retries;
     let max_tool_result_bytes = agent_config.context_budget.max_tool_result_tokens * 4;
+    let max_output_tokens = agent_config.agent.max_output_tokens;
     let remaining_delegate_depth = invariants.limits.max_sub_agent_depth;
     let roles: Arc<[apex_core::config::RoleProfile]> = agent_config.roles.clone().into();
 
@@ -364,6 +365,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
             invariants: Arc::clone(&invariants),
             roles: Arc::clone(&roles),
             max_tool_result_bytes,
+            max_output_tokens,
             remaining_delegate_depth,
         },
         infra,
@@ -393,6 +395,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         max_depth,
         max_retries,
         max_tool_result_bytes,
+        max_output_tokens,
         estimator,
     };
 
