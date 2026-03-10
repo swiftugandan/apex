@@ -67,7 +67,8 @@ async fn main() -> Result<()> {
                     cmd_memory_facts().await?;
                     cmd_memory_skills().await
                 }
-                Some(sub) => bail!("unknown memory subcommand: {sub}. Available: facts, skills, calibration"),
+                Some("gc") => cmd_memory_gc().await,
+                Some(sub) => bail!("unknown memory subcommand: {sub}. Available: facts, skills, calibration, gc"),
             }
         }
         Some("scratch") => {
@@ -308,6 +309,20 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
     let invariants = ConfigLoader::load_invariants(&paths.config_dir)?;
     let agent_config = ConfigLoader::load_agent_config(&paths.config_dir)?;
 
+    // Best-effort scratchpad GC on startup (non-blocking)
+    {
+        let gc_store = FsScratchpadStore::new(paths.working_memory.clone());
+        let retention = agent_config.agent.scratchpad_retention_days;
+        tokio::spawn(async move {
+            match gc_store.reap_stale(retention).await {
+                Ok(reaped) if !reaped.is_empty() => {
+                    eprintln!("⚠ Reaped {} stale scratchpad(s)", reaped.len());
+                }
+                _ => {}
+            }
+        });
+    }
+
     let max_concurrent = agent_config.agent.max_concurrent;
     let max_depth = agent_config.agent.max_depth;
     let max_retries = agent_config.agent.max_retries;
@@ -367,6 +382,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
             max_tool_result_bytes,
             max_output_tokens,
             remaining_delegate_depth,
+            compaction: agent_config.compaction.clone(),
         },
         infra,
     });
@@ -397,6 +413,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         max_tool_result_bytes,
         max_output_tokens,
         estimator,
+        compaction: agent_config.compaction.clone(),
     };
 
     if max_concurrent <= 1 {
@@ -528,6 +545,25 @@ async fn cmd_memory_skills() -> Result<()> {
         ],
         rows,
     );
+    Ok(())
+}
+
+async fn cmd_memory_gc() -> Result<()> {
+    let paths = ProjectPaths::resolve()?;
+    let config = ConfigLoader::load_agent_config(&paths.config_dir)?;
+    let store = FsScratchpadStore::new(paths.working_memory.clone());
+    let reaped = store
+        .reap_stale(config.agent.scratchpad_retention_days)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if reaped.is_empty() {
+        println!("No stale scratchpads to clean up.");
+    } else {
+        println!("Reaped {} scratchpad(s):", reaped.len());
+        for id in &reaped {
+            println!("  {id}");
+        }
+    }
     Ok(())
 }
 

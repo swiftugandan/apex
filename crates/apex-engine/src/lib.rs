@@ -1,4 +1,5 @@
 mod agentic_loop;
+mod compaction;
 mod consolidation;
 pub mod constants;
 mod delegate;

@@ -6,8 +6,9 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use apex_core::config::{Invariants, RoleProfile};
+use crate::constants::COMPACT_CONVERSATION_TOOL;
 use apex_core::domain::{
-    Scratchpad, SubtaskEntry, SubtaskStatus, ToolCall, ToolDef, ToolResult,
+    Scratchpad, SubtaskEntry, SubtaskStatus, ToolCall, ToolDef, ToolResult, ToolSchema,
 };
 use apex_core::error::ToolError;
 use apex_core::ports::{MemoryStore, SkillStore, ToolRegistry, WorkingMemory};
@@ -78,10 +79,20 @@ impl ToolRegistry for ApexToolRegistry {
     fn definitions(&self) -> Vec<ToolDef> {
         let mut defs = self.static_tools.definitions();
         defs.extend(self.queue_tools.definitions());
+        // compact_conversation is always available — execution is handled
+        // by the agentic loop which has access to messages and the LLM.
+        defs.push(compact_conversation_def());
         defs
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        // compact_conversation should never reach here — the agentic loop intercepts it.
+        if call.name == COMPACT_CONVERSATION_TOOL {
+            return Err(ToolError::Execution(
+                "compact_conversation must be handled by the agentic loop".into(),
+            ));
+        }
+
         // Intercept working memory tools to use the shared mutex
         if let Some(ref pad_arc) = self.scratchpad {
             match call.name.as_str() {
@@ -195,6 +206,23 @@ impl ToolRegistry for OwnedFilteredToolRegistry {
             return Err(ToolError::UnknownTool(call.name.clone()));
         }
         self.inner.execute(call).await
+    }
+}
+
+fn compact_conversation_def() -> ToolDef {
+    ToolDef {
+        schema: ToolSchema {
+            name: COMPACT_CONVERSATION_TOOL.into(),
+            description: "Summarize older conversation messages to free up context window space. \
+                Call this when you notice the conversation is getting long. \
+                Recent turns are preserved intact; older messages are replaced \
+                with a concise LLM-generated summary.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
     }
 }
 

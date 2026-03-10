@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 
 use async_trait::async_trait;
 
-use apex_core::config::{Invariants, MemoryMode, RoleProfile};
+use apex_core::config::{CompactionSection, Invariants, MemoryMode, RoleProfile};
 use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{MessageHeaders, MessageType, QueueMessage};
 use apex_core::error::ToolError;
@@ -31,6 +31,7 @@ pub struct SpawnerConfig {
     pub max_tool_result_bytes: usize,
     pub max_output_tokens: u32,
     pub remaining_delegate_depth: u32,
+    pub compaction: CompactionSection,
 }
 
 /// Concrete SubAgentSpawner that runs sub-agents in-process with their own
@@ -103,6 +104,7 @@ impl SubAgentSpawner for InProcessSpawner {
                 max_tool_result_bytes: self.config.max_tool_result_bytes,
                 max_output_tokens: self.config.max_output_tokens,
                 remaining_delegate_depth: sub_depth,
+                compaction: self.config.compaction.clone(),
             },
             infra: Arc::clone(&self.infra),
         });
@@ -165,6 +167,7 @@ impl SubAgentSpawner for InProcessSpawner {
             max_tool_result_bytes: self.config.max_tool_result_bytes,
             max_output_tokens: self.config.max_output_tokens,
             estimator: Arc::clone(&self.estimator),
+            compaction: self.config.compaction.clone(),
         };
 
         let num_workers = role.max_concurrent.max(1);

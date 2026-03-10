@@ -17,6 +17,9 @@ pub struct AgentConfig {
 
     #[serde(default)]
     pub fitness: FitnessSection,
+
+    #[serde(default)]
+    pub compaction: CompactionSection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -40,6 +43,10 @@ pub struct AgentSection {
     /// Maximum tokens per LLM completion response.
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: u32,
+
+    /// Number of days to retain scratchpad files before garbage collection.
+    #[serde(default = "default_scratchpad_retention_days")]
+    pub scratchpad_retention_days: u32,
 
     /// Enabled tool names (empty = all available).
     #[serde(default)]
@@ -137,6 +144,17 @@ pub struct FitnessSection {
     pub min_uses: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactionSection {
+    /// Number of recent turns to preserve intact (each turn = user + assistant).
+    #[serde(default = "default_compaction_preserve_turns")]
+    pub preserve_turns: usize,
+
+    /// Maximum tokens for the LLM-generated compaction summary.
+    #[serde(default = "default_compaction_max_summary_tokens")]
+    pub max_summary_tokens: u32,
+}
+
 // ── Defaults ─────────────────────────────────────────────────────
 
 fn default_model() -> String {
@@ -154,6 +172,9 @@ fn default_max_retries() -> u32 {
 fn default_max_output_tokens() -> u32 {
     16_384
 }
+fn default_scratchpad_retention_days() -> u32 {
+    7
+}
 fn default_max_body_tokens() -> usize {
     50_000
 }
@@ -169,6 +190,12 @@ fn default_min_pass_rate() -> f64 {
 fn default_min_uses() -> u32 {
     3
 }
+fn default_compaction_preserve_turns() -> usize {
+    6
+}
+fn default_compaction_max_summary_tokens() -> u32 {
+    1024
+}
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -178,6 +205,7 @@ impl Default for AgentConfig {
             context_budget: ContextBudgetSection::default(),
             consolidation: ConsolidationSection::default(),
             fitness: FitnessSection::default(),
+            compaction: CompactionSection::default(),
         }
     }
 }
@@ -229,6 +257,7 @@ impl Default for AgentSection {
             max_depth: default_max_depth(),
             max_retries: default_max_retries(),
             max_output_tokens: default_max_output_tokens(),
+            scratchpad_retention_days: default_scratchpad_retention_days(),
             tools: vec![],
         }
     }
@@ -259,6 +288,15 @@ impl Default for FitnessSection {
         Self {
             min_pass_rate: default_min_pass_rate(),
             min_uses: default_min_uses(),
+        }
+    }
+}
+
+impl Default for CompactionSection {
+    fn default() -> Self {
+        Self {
+            preserve_turns: default_compaction_preserve_turns(),
+            max_summary_tokens: default_compaction_max_summary_tokens(),
         }
     }
 }

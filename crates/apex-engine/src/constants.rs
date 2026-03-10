@@ -9,3 +9,6 @@ pub const MAX_EMPTY_CYCLES: u32 = 300;
 
 /// Base backoff in seconds for rate-limited retries.
 pub const RATE_LIMIT_BACKOFF_SECS: u64 = 30;
+
+/// Tool name for LLM-triggered conversation compaction.
+pub const COMPACT_CONVERSATION_TOOL: &str = "compact_conversation";

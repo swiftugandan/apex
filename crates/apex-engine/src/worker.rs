@@ -3,6 +3,7 @@ use tokio::sync::Mutex;
 
 use anyhow::Result;
 
+use apex_core::config::CompactionSection;
 use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{
     AttemptOutcome, AttemptRecord, ChatMessage, ClaimedTask, MessageType,
@@ -33,6 +34,7 @@ pub struct WorkerContext {
     pub max_tool_result_bytes: usize,
     pub max_output_tokens: u32,
     pub estimator: Arc<Mutex<TokenEstimator>>,
+    pub compaction: CompactionSection,
 }
 
 // ── Worker loop ─────────────────────────────────────────────────────
@@ -182,6 +184,8 @@ async fn execute_claim(
         memory: Some(ctx.memory.as_ref()),
         cancel: None,
         timeout: None,
+        compaction_preserve_turns: ctx.compaction.preserve_turns,
+        compaction_max_summary_tokens: ctx.compaction.max_summary_tokens,
     };
     let (turns, final_text, _messages) = run_agentic_loop(messages, &loop_config).await;
 

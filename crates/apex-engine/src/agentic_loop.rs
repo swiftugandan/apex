@@ -13,7 +13,9 @@ use apex_core::ports::{LlmProvider, ToolRegistry, WorkingMemory};
 
 use apex_core::summarize_json;
 
-use crate::constants::MAX_TURNS;
+use crate::compaction::compact_messages;
+
+use crate::constants::{COMPACT_CONVERSATION_TOOL, MAX_TURNS};
 
 /// Configuration bundle for the agentic loop.
 pub struct LoopConfig<'a> {
@@ -29,6 +31,8 @@ pub struct LoopConfig<'a> {
     pub cancel: Option<&'a CancellationToken>,
     /// Optional wall-clock timeout for the entire loop.
     pub timeout: Option<Duration>,
+    pub compaction_preserve_turns: usize,
+    pub compaction_max_summary_tokens: u32,
 }
 
 /// Runs the multi-turn LLM + tool execution loop. Shared between
@@ -111,8 +115,10 @@ pub async fn run_agentic_loop(
         let mut call_records = Vec::new();
         let mut result_blocks = Vec::new();
 
-        // Execute all tool calls concurrently
-        let tool_futures: Vec<_> = resp.tool_calls.iter().map(|call| {
+        // Execute non-compaction tool calls concurrently
+        let tool_futures: Vec<_> = resp.tool_calls.iter()
+            .filter(|c| c.name != COMPACT_CONVERSATION_TOOL)
+            .map(|call| {
             async move {
                 eprintln!("  ↳ {}(…)", call.name);
                 let start = Instant::now();
@@ -157,6 +163,62 @@ pub async fn run_agentic_loop(
                 content,
                 is_error: result.is_error,
             });
+        }
+
+        // Handle compact_conversation (take first, reject duplicates)
+        {
+            let mut compact_iter = resp.tool_calls.iter()
+                .filter(|c| c.name == COMPACT_CONVERSATION_TOOL);
+            if let Some(compact_call) = compact_iter.next() {
+                eprintln!("  ↳ compact_conversation(…)");
+                let start = Instant::now();
+                match compact_messages(
+                    &messages,
+                    config.llm,
+                    config.compaction_preserve_turns,
+                    config.compaction_max_summary_tokens,
+                ).await {
+                    Ok((compacted, count)) => {
+                        messages = compacted;
+                        let elapsed = start.elapsed();
+                        call_records.push(ToolCallRecord {
+                            name: COMPACT_CONVERSATION_TOOL.into(),
+                            input_summary: "{}".into(),
+                            output_summary: format!("compacted {count} messages"),
+                            is_error: false,
+                            duration_ms: elapsed.as_millis() as u64,
+                        });
+                        result_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: compact_call.id.clone(),
+                            content: format!("Compacted {count} older messages into a summary. Recent turns preserved."),
+                            is_error: false,
+                        });
+                    }
+                    Err(reason) => {
+                        let elapsed = start.elapsed();
+                        call_records.push(ToolCallRecord {
+                            name: COMPACT_CONVERSATION_TOOL.into(),
+                            input_summary: "{}".into(),
+                            output_summary: format!("failed: {reason}"),
+                            is_error: true,
+                            duration_ms: elapsed.as_millis() as u64,
+                        });
+                        result_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: compact_call.id.clone(),
+                            content: format!("Compaction failed: {reason}"),
+                            is_error: true,
+                        });
+                    }
+                }
+                // Error result for duplicate calls
+                for dup in compact_iter {
+                    result_blocks.push(ContentBlock::ToolResult {
+                        tool_use_id: dup.id.clone(),
+                        content: "Already compacted this turn".into(),
+                        is_error: true,
+                    });
+                }
+            }
         }
 
         // Persist log entries to scratchpad after each turn

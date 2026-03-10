@@ -40,9 +40,33 @@ impl SqliteMemoryStore {
                 chars_per_token_mixed REAL NOT NULL,
                 sample_count INTEGER NOT NULL,
                 updated_at TEXT NOT NULL
-            );",
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
+                content, tags, content='facts', content_rowid='rowid'
+            );
+            CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+                INSERT INTO facts_fts(rowid, content, tags) VALUES (new.rowid, new.content, new.tags);
+            END;
+            CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
+                INSERT INTO facts_fts(facts_fts, rowid, content, tags) VALUES('delete', old.rowid, old.content, old.tags);
+            END;
+            CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
+                INSERT INTO facts_fts(facts_fts, rowid, content, tags) VALUES('delete', old.rowid, old.content, old.tags);
+                INSERT INTO facts_fts(rowid, content, tags) VALUES (new.rowid, new.content, new.tags);
+            END;",
         )
         .map_err(|e| MemoryError::Database(format!("failed to create tables: {e}")))?;
+
+        // Populate FTS index for pre-existing databases upgraded to FTS5.
+        // Only rebuilds when facts exist but FTS index is empty.
+        let needs_rebuild: bool = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM facts) > 0 AND (SELECT COUNT(*) FROM facts_fts) = 0",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+        if needs_rebuild {
+            let _ = conn.execute_batch("INSERT INTO facts_fts(facts_fts) VALUES('rebuild');");
+        }
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -68,6 +92,21 @@ impl SqliteMemoryStore {
         let verified_secs: u64 = last_verified.parse().unwrap_or(now_secs);
         let days_elapsed = (now_secs.saturating_sub(verified_secs)) as f64 / 86400.0;
         confidence * (2.0_f64).powf(-(days_elapsed / half_life_days))
+    }
+
+    /// Sanitize a query string for FTS5 MATCH by escaping special operators.
+    /// Wraps each token in double quotes to treat them as literals.
+    fn sanitize_fts_query(query: &str) -> String {
+        let tokens: Vec<String> = query
+            .split_whitespace()
+            .filter(|t| !t.is_empty())
+            .map(|t| {
+                // Escape double quotes within the token, then wrap in quotes
+                let escaped = t.replace('"', "\"\"");
+                format!("\"{escaped}\"")
+            })
+            .collect();
+        tokens.join(" ")
     }
 }
 
@@ -104,38 +143,76 @@ impl MemoryStore for SqliteMemoryStore {
 
     async fn query_facts(&self, query: &str, limit: usize) -> Result<Vec<Fact>, MemoryError> {
         let conn = self.conn.lock().await;
-        let pattern = format!("%{query}%");
         let half_life = self.confidence_half_life_days;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, content, source_job, confidence, created_at, last_verified, tags
-                 FROM facts
-                 WHERE content LIKE ?1 OR tags LIKE ?1
-                 ORDER BY confidence DESC
-                 LIMIT ?2",
-            )
-            .map_err(|e| MemoryError::Database(e.to_string()))?;
 
-        let rows = stmt
-            .query_map(rusqlite::params![pattern, limit as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, f64>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                ))
-            })
-            .map_err(|e| MemoryError::Database(e.to_string()))?;
+        type FactRow = (String, String, String, f64, String, String, String);
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<FactRow> {
+            Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?,
+                row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?,
+            ))
+        };
 
+        let rows_result = if query.is_empty() {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, content, source_job, confidence, created_at, last_verified, tags
+                     FROM facts
+                     ORDER BY confidence DESC
+                     LIMIT ?1",
+                )
+                .map_err(|e| MemoryError::Database(e.to_string()))?;
+
+            let result = stmt.query_map(rusqlite::params![limit as i64], &map_row)
+                .map_err(|e| MemoryError::Database(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| MemoryError::Database(e.to_string()));
+            result
+        } else {
+            let fts_query = Self::sanitize_fts_query(query);
+            let fts_result = conn
+                .prepare(
+                    "SELECT f.id, f.content, f.source_job, f.confidence, f.created_at, f.last_verified, f.tags
+                     FROM facts f
+                     JOIN facts_fts fts ON f.rowid = fts.rowid
+                     WHERE facts_fts MATCH ?1
+                     ORDER BY bm25(facts_fts), f.confidence DESC
+                     LIMIT ?2",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map(rusqlite::params![fts_query, limit as i64], &map_row)?
+                        .collect::<Result<Vec<_>, _>>()
+                });
+
+            match fts_result {
+                Ok(rows) => Ok(rows),
+                Err(e) => {
+                    eprintln!("warning: FTS5 query failed ({e}), falling back to LIKE");
+                    let pattern = format!("%{query}%");
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id, content, source_job, confidence, created_at, last_verified, tags
+                             FROM facts
+                             WHERE content LIKE ?1 OR tags LIKE ?1
+                             ORDER BY confidence DESC
+                             LIMIT ?2",
+                        )
+                        .map_err(|e| MemoryError::Database(e.to_string()))?;
+
+                    let result = stmt.query_map(rusqlite::params![pattern, limit as i64], &map_row)
+                        .map_err(|e| MemoryError::Database(e.to_string()))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| MemoryError::Database(e.to_string()));
+                    result
+                }
+            }
+        };
+
+        let raw_rows = rows_result?;
         let mut facts = Vec::new();
-        for row in rows {
-            let (id, content, source_job, confidence, created_at, last_verified, tags_json) =
-                row.map_err(|e| MemoryError::Database(e.to_string()))?;
-            let tags: Vec<String> =
-                serde_json::from_str(&tags_json).unwrap_or_default();
+        for (id, content, source_job, confidence, created_at, last_verified, tags_json) in raw_rows
+        {
+            let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
             let decayed = Self::decay_confidence(confidence, &last_verified, half_life);
             facts.push(Fact {
                 id: FactId(id),
@@ -288,5 +365,139 @@ mod tests {
 
         let decayed = SqliteMemoryStore::decay_confidence(1.0, &thirty_days_ago, 30.0);
         assert!((decayed - 0.5).abs() < 0.05, "expected ~0.5, got {decayed}");
+    }
+
+    #[tokio::test]
+    async fn fts_basic_search() {
+        let (_dir, store) = open_temp_store();
+        let fact1 = Fact {
+            id: FactId(String::new()),
+            content: "Rust async runtime uses tokio".to_string(),
+            source_job: "job-010".to_string(),
+            confidence: 0.9,
+            created_at: String::new(),
+            last_verified: String::new(),
+            tags: vec!["rust".to_string()],
+        };
+        let fact2 = Fact {
+            id: FactId(String::new()),
+            content: "Python uses asyncio for concurrency".to_string(),
+            source_job: "job-011".to_string(),
+            confidence: 0.8,
+            created_at: String::new(),
+            last_verified: String::new(),
+            tags: vec!["python".to_string()],
+        };
+        store.store_fact(fact1).await.unwrap();
+        store.store_fact(fact2).await.unwrap();
+
+        let results = store.query_facts("tokio", 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains("tokio"));
+    }
+
+    #[tokio::test]
+    async fn fts_empty_query_returns_all() {
+        let (_dir, store) = open_temp_store();
+        store
+            .store_fact(Fact {
+                id: FactId(String::new()),
+                content: "fact one".to_string(),
+                source_job: "j1".to_string(),
+                confidence: 0.9,
+                created_at: String::new(),
+                last_verified: String::new(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+        store
+            .store_fact(Fact {
+                id: FactId(String::new()),
+                content: "fact two".to_string(),
+                source_job: "j2".to_string(),
+                confidence: 0.8,
+                created_at: String::new(),
+                last_verified: String::new(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+
+        let results = store.query_facts("", 10).await.unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fts_special_characters_handled() {
+        let (_dir, store) = open_temp_store();
+        store
+            .store_fact(Fact {
+                id: FactId(String::new()),
+                content: "config uses key=value pairs".to_string(),
+                source_job: "j1".to_string(),
+                confidence: 1.0,
+                created_at: String::new(),
+                last_verified: String::new(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Query with special chars should not crash
+        let results = store.query_facts("key=value", 10).await.unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fts_update_sync() {
+        let (_dir, store) = open_temp_store();
+        // Store a fact
+        let id = store
+            .store_fact(Fact {
+                id: FactId("f-update".to_string()),
+                content: "original content about dogs".to_string(),
+                source_job: "j1".to_string(),
+                confidence: 1.0,
+                created_at: String::new(),
+                last_verified: String::new(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Update it (INSERT OR REPLACE)
+        store
+            .store_fact(Fact {
+                id: id.clone(),
+                content: "updated content about cats".to_string(),
+                source_job: "j1".to_string(),
+                confidence: 1.0,
+                created_at: String::new(),
+                last_verified: String::new(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Old content should not be findable via FTS
+        let results = store.query_facts("dogs", 10).await.unwrap();
+        assert!(results.is_empty(), "old content should not be in FTS index");
+
+        // New content should be findable
+        let results = store.query_facts("cats", 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn sanitize_fts_query_wraps_tokens() {
+        let result = SqliteMemoryStore::sanitize_fts_query("hello world");
+        assert_eq!(result, "\"hello\" \"world\"");
+    }
+
+    #[test]
+    fn sanitize_fts_query_escapes_quotes() {
+        let result = SqliteMemoryStore::sanitize_fts_query("say \"hello\"");
+        assert_eq!(result, "\"say\" \"\"\"hello\"\"\"");
     }
 }

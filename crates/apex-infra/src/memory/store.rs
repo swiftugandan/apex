@@ -58,6 +58,49 @@ impl WorkingMemory for FsScratchpadStore {
         Ok(())
     }
 
+    async fn reap_stale(&self, retention_days: u32) -> Result<Vec<String>, MemoryError> {
+        let mut reaped = Vec::new();
+        if !self.base_dir.exists() {
+            return Ok(reaped);
+        }
+        let cutoff = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(retention_days as u64 * 86400);
+        let mut entries = tokio::fs::read_dir(&self.base_dir)
+            .await
+            .map_err(|e| MemoryError::Io(e.to_string()))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| MemoryError::Io(e.to_string()))?
+        {
+            let path = entry.path();
+            if !path.extension().is_some_and(|ext| ext == "md") {
+                continue;
+            }
+            let metadata = entry
+                .metadata()
+                .await
+                .map_err(|e| MemoryError::Io(e.to_string()))?;
+            let modified = metadata
+                .modified()
+                .map_err(|e| MemoryError::Io(e.to_string()))?;
+            if modified < cutoff {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    let id = stem.to_string();
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => reaped.push(id),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            // File was already deleted (race condition) — skip
+                        }
+                        Err(e) => return Err(MemoryError::Io(e.to_string())),
+                    }
+                }
+            }
+        }
+        reaped.sort();
+        Ok(reaped)
+    }
+
     async fn list_active(&self) -> Result<Vec<String>, MemoryError> {
         let mut ids = Vec::new();
         if !self.base_dir.exists() {
@@ -142,6 +185,51 @@ mod tests {
         let store = FsScratchpadStore::new(dir.path().join("nonexistent"));
         let ids = store.list_active().await.unwrap();
         assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reap_stale_deletes_old_scratchpads() {
+        use std::fs;
+        use std::time::{Duration, SystemTime};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsScratchpadStore::new(dir.path().to_path_buf());
+
+        // Create scratchpads
+        store.save(&Scratchpad::new("old-job", "old")).await.unwrap();
+        store.save(&Scratchpad::new("new-job", "new")).await.unwrap();
+
+        // Backdate the old one to 10 days ago
+        let old_path = dir.path().join("old-job.md");
+        let ten_days_ago = SystemTime::now() - Duration::from_secs(10 * 86400);
+        let times = fs::FileTimes::new()
+            .set_modified(ten_days_ago);
+        let file = fs::File::options().write(true).open(&old_path).unwrap();
+        file.set_times(times).unwrap();
+
+        // Reap with 7-day retention
+        let reaped = store.reap_stale(7).await.unwrap();
+        assert_eq!(reaped, vec!["old-job"]);
+
+        // Verify old is gone, new remains
+        assert!(!store.exists("old-job").await.unwrap());
+        assert!(store.exists("new-job").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn reap_stale_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsScratchpadStore::new(dir.path().to_path_buf());
+        let reaped = store.reap_stale(7).await.unwrap();
+        assert!(reaped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reap_stale_nonexistent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsScratchpadStore::new(dir.path().join("nonexistent"));
+        let reaped = store.reap_stale(7).await.unwrap();
+        assert!(reaped.is_empty());
     }
 
     #[tokio::test]

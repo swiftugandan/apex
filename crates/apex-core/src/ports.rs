@@ -63,6 +63,7 @@ pub trait WorkingMemory: Send + Sync {
     async fn exists(&self, job_id: &str) -> Result<bool, MemoryError>;
     async fn delete(&self, job_id: &str) -> Result<(), MemoryError>;
     async fn list_active(&self) -> Result<Vec<String>, MemoryError>;
+    async fn reap_stale(&self, retention_days: u32) -> Result<Vec<String>, MemoryError>;
 }
 
 #[async_trait]
