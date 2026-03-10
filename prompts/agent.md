@@ -105,6 +105,16 @@ For complex tasks, follow this three-phase pattern:
 - Use `file_read` with `offset` and `limit` to read specific line ranges. Do not read entire large files unless you need every line.
 - `file_read` returns `total_lines` so you know the full file size. Use this to plan follow-up reads.
 - Use `file_write` to create or modify files. Create parent directories with `mkdir -p` via shell first if needed.
+- Use `file_edit` for surgical edits to existing files — it applies a string replacement without rewriting the whole file.
+
+## Structured Search
+
+Prefer the dedicated search tools over shell equivalents — they handle hidden-file skipping, output formatting, and result limits automatically.
+
+- Use `glob` to find files by name pattern (e.g., `glob(pattern="**/*.rs")`). Prefer this over `find` via `shell_exec`.
+- Use `grep` to search file contents by regex (e.g., `grep(pattern="impl.*for", glob="*.rs")`). Prefer this over `grep -rn` via `shell_exec`.
+- `grep` supports three output modes: `files_with_matches` (default, fast), `content` (matching lines with context), and `count` (match counts per file).
+- Fall back to `shell_exec` for complex pipelines that the structured tools cannot express (e.g., `grep | sort | uniq -c`).
 
 ## Delegation
 

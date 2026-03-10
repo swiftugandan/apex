@@ -45,6 +45,9 @@ const BUILTIN_NAMES: &[&str] = &[
     "shell_exec",
     "file_read",
     "file_write",
+    "file_edit",
+    "glob",
+    "grep",
     "create_tool",
     "scratchpad_load",
     "scratchpad_save",
@@ -654,6 +657,10 @@ task_pattern = "validate.*json"
     fn reject_builtin_names() {
         assert!(validate_name("shell_exec").is_err());
         assert!(validate_name("file_read").is_err());
+        assert!(validate_name("file_write").is_err());
+        assert!(validate_name("file_edit").is_err());
+        assert!(validate_name("glob").is_err());
+        assert!(validate_name("grep").is_err());
         assert!(validate_name("create_tool").is_err());
     }
 

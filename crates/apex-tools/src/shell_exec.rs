@@ -9,6 +9,9 @@ use crate::spill::{
     DEFAULT_SPILL_TAIL_LINES,
 };
 
+/// Default command timeout in seconds.
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
+
 pub fn definition() -> ToolDef {
     ToolDef {
         schema: ToolSchema {
@@ -22,7 +25,8 @@ pub fn definition() -> ToolDef {
                     "max_output": { "type": "integer", "description": "Spill threshold in bytes (default 16384). Output above this is spilled to scratch with a head/tail envelope. Rarely needs changing." },
                     "grep": { "type": "string", "description": "Filter output lines matching this substring (applied before spill)" },
                     "tail": { "type": "integer", "description": "Only keep last N lines (applied before spill)" },
-                    "max_lines": { "type": "integer", "description": "Max lines to return (applied before spill)" }
+                    "max_lines": { "type": "integer", "description": "Max lines to return (applied before spill)" },
+                    "timeout": { "type": "integer", "description": "Max execution time in seconds (default 120). Command is killed on timeout." }
                 },
                 "required": ["command"]
             }),
@@ -40,6 +44,11 @@ pub async fn execute(call: &ToolCall, spill: &SpillManager) -> Result<ToolResult
     let tail_n = call.input["tail"].as_u64().map(|n| n as usize);
     let max_lines = call.input["max_lines"].as_u64().map(|n| n as usize);
 
+    let timeout_secs = call.input["timeout"]
+        .as_u64()
+        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let timeout_duration = std::time::Duration::from_secs(timeout_secs);
+
     let start = Instant::now();
 
     let mut cmd = Command::new("sh");
@@ -49,11 +58,38 @@ pub async fn execute(call: &ToolCall, spill: &SpillManager) -> Result<ToolResult
         cmd.current_dir(cwd);
     }
 
-    let result = cmd.output().await;
+    // Use piped I/O and process groups so we can kill the entire tree on timeout.
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let child = cmd.spawn();
+    let child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            return Ok(ToolResult {
+                tool_use_id: call.id.clone(),
+                name: call.name.clone(),
+                output: json!({ "error": e.to_string() }),
+                is_error: true,
+                duration_ms,
+                ..Default::default()
+            });
+        }
+    };
+
+    // Grab pid before wait_with_output consumes child.
+    #[cfg(unix)]
+    let child_pid = child.id();
+
+    let result = tokio::time::timeout(timeout_duration, child.wait_with_output()).await;
     let duration_ms = start.elapsed().as_millis() as u64;
 
     match result {
-        Ok(output) => {
+        // Completed within timeout
+        Ok(Ok(output)) => {
             let exit_code = output.status.code().unwrap_or(-1);
 
             let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -135,7 +171,8 @@ pub async fn execute(call: &ToolCall, spill: &SpillManager) -> Result<ToolResult
                 duration_ms,
             })
         }
-        Err(e) => Ok(ToolResult {
+        // Process I/O error
+        Ok(Err(e)) => Ok(ToolResult {
             tool_use_id: call.id.clone(),
             name: call.name.clone(),
             output: json!({ "error": e.to_string() }),
@@ -143,6 +180,33 @@ pub async fn execute(call: &ToolCall, spill: &SpillManager) -> Result<ToolResult
             duration_ms,
             ..Default::default()
         }),
+        // Timeout elapsed — kill the process group and return error
+        Err(_elapsed) => {
+            #[cfg(unix)]
+            {
+                if let Some(pid) = child_pid {
+                    // SAFETY: killpg sends SIGKILL to the process group we created.
+                    unsafe {
+                        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                }
+            }
+
+            Ok(ToolResult {
+                tool_use_id: call.id.clone(),
+                name: call.name.clone(),
+                output: json!({
+                    "error": format!("command timed out after {timeout_secs}s"),
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": true,
+                }),
+                is_error: true,
+                duration_ms,
+                ..Default::default()
+            })
+        }
     }
 }
 
@@ -254,5 +318,39 @@ mod tests {
         assert!(stdout.contains("3"));
         let line_count = stdout.lines().count();
         assert_eq!(line_count, 3);
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_slow_command() {
+        let (_dir, spill) = temp_spill();
+        let call = make_call(json!({"command": "sleep 30", "timeout": 1}));
+        let start = Instant::now();
+        let result = execute(&call, &spill).await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(result.is_error);
+        assert_eq!(result.output["timed_out"], true);
+        assert!(result.output["error"].as_str().unwrap().contains("timed out"));
+        // Should complete in well under 10s (we gave 1s timeout)
+        assert!(elapsed.as_secs() < 10);
+    }
+
+    #[tokio::test]
+    async fn timeout_default_allows_fast_commands() {
+        let (_dir, spill) = temp_spill();
+        // No explicit timeout — uses the 120s default, which is plenty for echo.
+        let call = make_call(json!({"command": "echo hello"}));
+        let result = execute(&call, &spill).await.unwrap();
+        assert!(!result.is_error);
+        assert_eq!(result.output["exit_code"], 0);
+        assert!(result.output["stdout"].as_str().unwrap().contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn timeout_zero_means_instant() {
+        let (_dir, spill) = temp_spill();
+        let call = make_call(json!({"command": "sleep 1", "timeout": 0}));
+        let result = execute(&call, &spill).await.unwrap();
+        assert!(result.is_error);
+        assert_eq!(result.output["timed_out"], true);
     }
 }
