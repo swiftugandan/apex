@@ -13,6 +13,7 @@ use apex_tools::QueueToolRegistry;
 
 use crate::agentic_loop::{run_agentic_loop, LoopConfig};
 use crate::consolidation::consolidate_learnings;
+use crate::constants::{MAX_EMPTY_CYCLES, RATE_LIMIT_BACKOFF_SECS};
 use crate::registry::{ApexToolRegistry, CompositeToolRegistry};
 use crate::util::{composer_from_estimator, extract_title, now_unix_ts};
 
@@ -62,7 +63,7 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
                 }
 
                 empty_cycles += 1;
-                if empty_cycles > 300 {
+                if empty_cycles > MAX_EMPTY_CYCLES {
                     eprintln!("[worker {worker_id}] giving up after {empty_cycles} empty cycles");
                     return Ok(());
                 }
@@ -291,7 +292,7 @@ async fn handle_failure(
     }
 
     if is_rate_limited(err) {
-        let backoff_secs = 30 * (claimed.headers.retry_count + 1) as u64;
+        let backoff_secs = RATE_LIMIT_BACKOFF_SECS * (claimed.headers.retry_count + 1) as u64;
         eprintln!(
             "[worker {worker_id}]   ↳ Rate limited, delaying {backoff_secs}s before retry"
         );

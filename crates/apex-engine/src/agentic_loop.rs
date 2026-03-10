@@ -13,8 +13,7 @@ use apex_core::ports::{LlmProvider, ToolRegistry, WorkingMemory};
 
 use apex_core::summarize_json;
 
-const MAX_TURNS: usize = 32;
-const MAX_TOKENS: u32 = 8192;
+use crate::constants::{MAX_TOKENS, MAX_TURNS};
 
 /// Configuration bundle for the agentic loop.
 pub struct LoopConfig<'a> {

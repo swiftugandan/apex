@@ -1,10 +1,13 @@
-use apex_core::domain::{SpillStrategy, ToolCall, ToolDef, ToolResult, ToolSchema};
+use apex_core::domain::{ToolCall, ToolDef, ToolResult, ToolSchema};
 use apex_core::error::ToolError;
 use serde_json::json;
 use std::time::Instant;
 use tokio::process::Command;
 
-use crate::spill::SpillManager;
+use crate::spill::{
+    SpillManager, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_SPILL_HEAD_LINES, DEFAULT_SPILL_STRATEGY,
+    DEFAULT_SPILL_TAIL_LINES,
+};
 
 pub fn definition() -> ToolDef {
     ToolDef {
@@ -32,7 +35,7 @@ pub async fn execute(call: &ToolCall, spill: &SpillManager) -> Result<ToolResult
         .as_str()
         .ok_or_else(|| ToolError::InvalidInput("missing 'command' field".into()))?;
 
-    let max_output = call.input["max_output"].as_u64().unwrap_or(16384) as usize;
+    let max_output = call.input["max_output"].as_u64().unwrap_or(DEFAULT_MAX_OUTPUT_BYTES as u64) as usize;
     let grep_pattern = call.input["grep"].as_str();
     let tail_n = call.input["tail"].as_u64().map(|n| n as usize);
     let max_lines = call.input["max_lines"].as_u64().map(|n| n as usize);
@@ -95,9 +98,9 @@ pub async fn execute(call: &ToolCall, spill: &SpillManager) -> Result<ToolResult
                     if let Some(spill_result) = spill.spill_if_needed(
                         &stdout,
                         max_output,
-                        SpillStrategy::HeadTail,
-                        20,
-                        20,
+                        DEFAULT_SPILL_STRATEGY,
+                        DEFAULT_SPILL_HEAD_LINES,
+                        DEFAULT_SPILL_TAIL_LINES,
                     ) {
                         (
                             spill_result.envelope,

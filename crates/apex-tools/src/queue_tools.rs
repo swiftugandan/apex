@@ -127,17 +127,21 @@ impl QueueToolRegistry {
             let title = apex_core::truncate_str(title, 80);
 
             let (facts, skill) = {
-                let facts = if let Some(ref store) = self.store {
-                    store.query_facts(&info.description, 3).await.ok().unwrap_or_default()
-                } else {
-                    Vec::new()
+                let facts_fut = async {
+                    if let Some(ref store) = self.store {
+                        store.query_facts(&info.description, 3).await.ok().unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
                 };
-                let skill = if let Some(ref skill_store) = self.skill_store {
-                    skill_store.find_skill(&info.description).await.ok().flatten()
-                } else {
-                    None
+                let skill_fut = async {
+                    if let Some(ref skill_store) = self.skill_store {
+                        skill_store.find_skill(&info.description).await.ok().flatten()
+                    } else {
+                        None
+                    }
                 };
-                (facts, skill)
+                tokio::join!(facts_fut, skill_fut)
             };
 
             let body = if !facts.is_empty() || skill.is_some() {

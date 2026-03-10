@@ -1,5 +1,6 @@
 mod agentic_loop;
 mod consolidation;
+pub mod constants;
 mod delegate;
 mod paths;
 mod registry;

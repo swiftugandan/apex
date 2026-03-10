@@ -26,7 +26,7 @@ use crate::ProjectPaths;
 pub struct CompositeToolRegistry {
     by_name: HashMap<String, usize>,
     registries: Vec<Box<dyn ToolRegistry>>,
-    cached_defs: Vec<ToolDef>,
+    cached_defs: Arc<Vec<ToolDef>>,
 }
 
 impl CompositeToolRegistry {
@@ -42,7 +42,7 @@ impl CompositeToolRegistry {
         Self {
             by_name,
             registries,
-            cached_defs,
+            cached_defs: Arc::new(cached_defs),
         }
     }
 }
@@ -50,7 +50,7 @@ impl CompositeToolRegistry {
 #[async_trait]
 impl ToolRegistry for CompositeToolRegistry {
     fn definitions(&self) -> Vec<ToolDef> {
-        self.cached_defs.clone()
+        self.cached_defs.as_ref().clone()
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {

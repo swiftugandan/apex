@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
@@ -9,7 +9,7 @@ use apex_core::ports::SkillStore;
 
 pub struct FsSkillStore {
     dir: PathBuf,
-    cache: Mutex<Option<Vec<Skill>>>,
+    cache: Mutex<Option<Arc<Vec<Skill>>>>,
     auto_retire_below: f64,
 }
 
@@ -34,11 +34,11 @@ impl FsSkillStore {
         }
     }
 
-    fn load_all(&self) -> Result<Vec<Skill>, MemoryError> {
+    fn load_all(&self) -> Result<Arc<Vec<Skill>>, MemoryError> {
         // Check cache first
         if let Ok(cache) = self.cache.lock() {
             if let Some(ref cached) = *cache {
-                return Ok(cached.clone());
+                return Ok(Arc::clone(cached));
             }
         }
 
@@ -64,9 +64,10 @@ impl FsSkillStore {
             }
         }
 
+        let results = Arc::new(results);
         // Populate cache
         if let Ok(mut cache) = self.cache.lock() {
-            *cache = Some(results.clone());
+            *cache = Some(Arc::clone(&results));
         }
 
         Ok(results)
@@ -98,6 +99,7 @@ impl SkillStore for FsSkillStore {
 
         // Check for existing skill with same task_pattern
         if let Some(existing) = all.iter().find(|s| s.task_pattern == skill.task_pattern) {
+
             // Upsert: keep the existing ID and counters, update approach/tools/notes
             skill.id = existing.id.clone();
             skill.success_count = existing.success_count;
@@ -121,7 +123,7 @@ impl SkillStore for FsSkillStore {
         let pattern_lower = task_pattern.to_lowercase();
 
         let mut best: Option<&Skill> = None;
-        for skill in &all {
+        for skill in all.iter() {
             if skill.status == SkillStatus::Retired {
                 continue;
             }
@@ -142,19 +144,21 @@ impl SkillStore for FsSkillStore {
     }
 
     async fn list_skills(&self, limit: usize) -> Result<Vec<Skill>, MemoryError> {
-        let mut all = self.load_all()?;
+        let all = self.load_all()?;
+        let mut sorted: Vec<Skill> = all.as_ref().clone();
         // Sort by fitness descending
-        all.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap_or(std::cmp::Ordering::Equal));
-        let skills: Vec<Skill> = all.into_iter().take(limit).collect();
-        Ok(skills)
+        sorted.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.truncate(limit);
+        Ok(sorted)
     }
 
     async fn update_skill_fitness(&self, id: &SkillId, success: bool) -> Result<(), MemoryError> {
         let all = self.load_all()?;
 
         let mut skill = all
-            .into_iter()
+            .iter()
             .find(|s| s.id == *id)
+            .cloned()
             .ok_or_else(|| MemoryError::NotFound(format!("skill {}", id.0)))?;
 
         if success {

@@ -4,6 +4,10 @@ use apex_core::domain::{
 };
 use apex_core::ports::{MemoryStore, SkillStore};
 
+fn log_consolidation_err(context: &str, e: &dyn std::fmt::Display) {
+    eprintln!("  consolidation: {context}: {e}");
+}
+
 /// Best-effort post-execution learning extraction.
 pub async fn consolidate_learnings(
     store: &dyn MemoryStore,
@@ -37,7 +41,7 @@ pub async fn consolidate_learnings(
                             tags: vec![],
                         };
                         if let Err(e) = store.store_fact(fact).await {
-                            eprintln!("  consolidation: failed to store fact: {e}");
+                            log_consolidation_err("failed to store fact", &e);
                         }
                     }
                 }
@@ -54,7 +58,7 @@ pub async fn consolidate_learnings(
                     .update_skill_fitness(&skill.id, record.outcome == AttemptOutcome::Success)
                     .await
                 {
-                    eprintln!("  consolidation: failed to update skill fitness: {e}");
+                    log_consolidation_err("failed to update skill fitness", &e);
                 }
             }
             Ok(None) => {
@@ -93,12 +97,12 @@ pub async fn consolidate_learnings(
                         status: SkillStatus::Active,
                     };
                     if let Err(e) = skill_store.store_skill(skill).await {
-                        eprintln!("  consolidation: failed to store skill: {e}");
+                        log_consolidation_err("failed to store skill", &e);
                     }
                 }
             }
             Err(e) => {
-                eprintln!("  consolidation: failed to find skill: {e}");
+                log_consolidation_err("failed to find skill", &e);
             }
         }
     }
@@ -120,7 +124,7 @@ pub async fn consolidate_learnings(
                     .iter()
                     .all(|st| st.status == SubtaskStatus::Done);
                 if let Err(e) = skill_store.update_skill_fitness(&skill.id, success).await {
-                    eprintln!("  consolidation: failed to update decomposition skill fitness: {e}");
+                    log_consolidation_err("failed to update decomposition skill fitness", &e);
                 }
             }
             Ok(None) => {
@@ -141,11 +145,11 @@ pub async fn consolidate_learnings(
                     status: SkillStatus::Active,
                 };
                 if let Err(e) = skill_store.store_skill(skill).await {
-                    eprintln!("  consolidation: failed to store decomposition skill: {e}");
+                    log_consolidation_err("failed to store decomposition skill", &e);
                 }
             }
             Err(e) => {
-                eprintln!("  consolidation: failed to find decomposition skill: {e}");
+                log_consolidation_err("failed to find decomposition skill", &e);
             }
         }
     }

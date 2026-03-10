@@ -31,9 +31,15 @@ use crate::fs_utils::{
 use crate::message::{parse_file, parse_headers};
 use crate::types::{ClaimedMessage, FsyncMode, Message, MessageId, Priority, Queue, SCAN_RETRIES};
 
+const DIR_PENDING: &str = "pending";
+const DIR_PROCESSING: &str = "processing";
+const DIR_DONE: &str = "done";
+const DIR_FAILED: &str = "failed";
+const DIR_TMP: &str = ".tmp";
+
 impl Queue {
     pub fn init(root: &Path, use_priority: bool, max_pending: i64) -> Result<Self> {
-        if root.join("pending").exists() || root.join("processing").exists() {
+        if root.join(DIR_PENDING).exists() || root.join(DIR_PROCESSING).exists() {
             return Err(Error::QueueExists(root.to_path_buf()));
         }
 
@@ -44,18 +50,18 @@ impl Queue {
         if use_priority {
             for p in &Priority::ALL {
                 crate::fs_utils::create_dir_with_mode(
-                    &root.join("pending").join(p.dir_prefix()),
+                    &root.join(DIR_PENDING).join(p.dir_prefix()),
                     q.dir_mode(),
                 )?;
             }
         } else {
-            crate::fs_utils::create_dir_with_mode(&root.join("pending"), q.dir_mode())?;
+            crate::fs_utils::create_dir_with_mode(&root.join(DIR_PENDING), q.dir_mode())?;
         }
 
-        crate::fs_utils::create_dir_with_mode(&root.join("processing"), q.dir_mode())?;
-        crate::fs_utils::create_dir_with_mode(&root.join("done"), q.dir_mode())?;
-        crate::fs_utils::create_dir_with_mode(&root.join("failed"), q.dir_mode())?;
-        crate::fs_utils::create_dir_with_mode(&root.join(".tmp"), q.dir_mode())?;
+        crate::fs_utils::create_dir_with_mode(&root.join(DIR_PROCESSING), q.dir_mode())?;
+        crate::fs_utils::create_dir_with_mode(&root.join(DIR_DONE), q.dir_mode())?;
+        crate::fs_utils::create_dir_with_mode(&root.join(DIR_FAILED), q.dir_mode())?;
+        crate::fs_utils::create_dir_with_mode(&root.join(DIR_TMP), q.dir_mode())?;
 
         let meta_dir = root.join(".meta");
         crate::fs_utils::create_dir_with_mode(&meta_dir, q.dir_mode())?;
@@ -65,11 +71,11 @@ impl Queue {
     }
 
     pub fn open(root: &Path) -> Result<Self> {
-        if !root.join("pending").exists() || !root.join("processing").exists() {
+        if !root.join(DIR_PENDING).exists() || !root.join(DIR_PROCESSING).exists() {
             return Err(Error::QueueNotFound(root.to_path_buf()));
         }
 
-        let use_priority = root.join("pending").join("0-critical").exists();
+        let use_priority = root.join(DIR_PENDING).join("0-critical").exists();
 
         let max_pending = {
             let meta_path = root.join(".meta").join("max_pending");
@@ -116,7 +122,7 @@ impl Queue {
         let pending_path = pending_dir.join(&pending_name);
 
         durable_write_rename(
-            &self.root().join(".tmp"),
+            &self.root().join(DIR_TMP),
             &format!("{}.md", id),
             &pending_path,
             buf.as_bytes(),
@@ -130,13 +136,13 @@ impl Queue {
     pub fn dequeue(&self) -> Result<Option<ClaimedMessage>> {
         if self.use_priority_dirs() {
             for p in &Priority::ALL {
-                let dir = self.root().join("pending").join(p.dir_prefix());
+                let dir = self.root().join(DIR_PENDING).join(p.dir_prefix());
                 if let Some(claimed) = self.scan_and_claim(&dir)? {
                     return Ok(Some(claimed));
                 }
             }
         } else {
-            let dir = self.root().join("pending");
+            let dir = self.root().join(DIR_PENDING);
             if let Some(claimed) = self.scan_and_claim(&dir)? {
                 return Ok(Some(claimed));
             }
@@ -145,7 +151,7 @@ impl Queue {
     }
 
     fn scan_and_claim(&self, pending_dir: &Path) -> Result<Option<ClaimedMessage>> {
-        let processing_dir = self.root().join("processing");
+        let processing_dir = self.root().join(DIR_PROCESSING);
 
         for _retry in 0..SCAN_RETRIES {
             let mut names = collect_md_files(pending_dir)?;
@@ -186,7 +192,7 @@ impl Queue {
     }
 
     pub fn complete(&self, claimed: &ClaimedMessage) -> Result<()> {
-        let done_path = self.root().join("done").join(format!("{}.md", claimed.id()));
+        let done_path = self.root().join(DIR_DONE).join(format!("{}.md", claimed.id()));
         durable_rename(claimed.path(), &done_path, self.fsync_mode())?;
         Ok(())
     }
@@ -199,9 +205,9 @@ impl Queue {
         let buf = msg.serialize()?;
 
         if msg.header.retry_count > self.max_retries() {
-            let failed_path = self.root().join("failed").join(format!("{}.md", id));
+            let failed_path = self.root().join(DIR_FAILED).join(format!("{}.md", id));
             durable_write_rename(
-                &self.root().join(".tmp"),
+                &self.root().join(DIR_TMP),
                 &format!("nack-{}.md", id),
                 &failed_path,
                 buf.as_bytes(),
@@ -214,7 +220,7 @@ impl Queue {
             let pending_dir = self.pending_dir_for(msg.header.priority);
             let pending_path = pending_dir.join(&pending_name);
             durable_write_rename(
-                &self.root().join(".tmp"),
+                &self.root().join(DIR_TMP),
                 &format!("nack-{}.md", id),
                 &pending_path,
                 buf.as_bytes(),
@@ -236,7 +242,7 @@ impl Queue {
     pub fn reap(&self) -> Result<u32> {
         let mut count = 0u32;
         let now = Utc::now().timestamp();
-        let processing_dir = self.root().join("processing");
+        let processing_dir = self.root().join(DIR_PROCESSING);
 
         let names = collect_md_files(&processing_dir)?;
 
@@ -260,7 +266,7 @@ impl Queue {
 
             // Check if orphan: ID already exists in pending/ or failed/
             let is_orphan =
-                pending_ids.contains(&id) || self.id_exists_in_dir("failed", &id)?;
+                pending_ids.contains(&id) || self.id_exists_in_dir(DIR_FAILED, &id)?;
 
             let claimed_path = processing_dir.join(name);
             if is_orphan {
@@ -276,7 +282,7 @@ impl Queue {
         }
 
         // Clean .tmp orphans older than lease_timeout
-        let tmp_dir = self.root().join(".tmp");
+        let tmp_dir = self.root().join(DIR_TMP);
         if tmp_dir.exists() {
             for entry in fs::read_dir(&tmp_dir)? {
                 let entry = entry?;
@@ -320,7 +326,7 @@ impl Queue {
                 let elapsed = (now - created).num_seconds();
                 if elapsed > msg.header.ttl as i64 {
                     let id = msg.header.id.expect("parsed message must have ID");
-                    let failed_path = self.root().join("failed").join(format!("{}.md", id));
+                    let failed_path = self.root().join(DIR_FAILED).join(format!("{}.md", id));
                     match durable_rename(&path, &failed_path, self.fsync_mode()) {
                         Ok(()) => count += 1,
                         Err(_) => continue,
@@ -334,7 +340,7 @@ impl Queue {
 
     pub fn purge(&self, max_age_seconds: u32) -> Result<u32> {
         let mut count = 0u32;
-        let done_dir = self.root().join("done");
+        let done_dir = self.root().join(DIR_DONE);
 
         if !done_dir.exists() {
             return Ok(0);
@@ -370,7 +376,7 @@ impl Queue {
             }
         }
 
-        let dirs = ["processing", "done", "failed", ".tmp"];
+        let dirs = [DIR_PROCESSING, DIR_DONE, DIR_FAILED, DIR_TMP];
         for d in &dirs {
             let p = self.root().join(d);
             if p.exists() {
@@ -383,7 +389,7 @@ impl Queue {
 
     pub fn depth(&self) -> Result<i64> {
         let mut total = self.count_pending()? as i64;
-        total += count_md_files(&self.root().join("processing"))? as i64;
+        total += count_md_files(&self.root().join(DIR_PROCESSING))? as i64;
         Ok(total)
     }
 
@@ -392,7 +398,7 @@ impl Queue {
         let pending_dirs = self.all_pending_dirs();
 
         // Build set of done IDs once to avoid O(n×d) filesystem syscalls
-        let done_ids: HashSet<String> = collect_md_files(&self.root().join("done"))?
+        let done_ids: HashSet<String> = collect_md_files(&self.root().join(DIR_DONE))?
             .into_iter()
             .filter_map(|name| name.strip_suffix(".md").map(|s| s.to_string()))
             .collect();
@@ -433,7 +439,7 @@ impl Queue {
     /// Dequeue a specific message by its ID. Scans pending directories for a
     /// filename containing the target ID and atomically renames it to processing/.
     pub fn dequeue_id(&self, target: &MessageId) -> Result<Option<ClaimedMessage>> {
-        let processing_dir = self.root().join("processing");
+        let processing_dir = self.root().join(DIR_PROCESSING);
 
         for dir in &self.all_pending_dirs() {
             let names = collect_md_files(dir)?;
@@ -470,9 +476,9 @@ impl Queue {
 
     fn pending_dir_for(&self, priority: Priority) -> PathBuf {
         if self.use_priority_dirs() {
-            self.root().join("pending").join(priority.dir_prefix())
+            self.root().join(DIR_PENDING).join(priority.dir_prefix())
         } else {
-            self.root().join("pending")
+            self.root().join(DIR_PENDING)
         }
     }
 
@@ -480,10 +486,10 @@ impl Queue {
         if self.use_priority_dirs() {
             Priority::ALL
                 .iter()
-                .map(|p| self.root().join("pending").join(p.dir_prefix()))
+                .map(|p| self.root().join(DIR_PENDING).join(p.dir_prefix()))
                 .collect()
         } else {
-            vec![self.root().join("pending")]
+            vec![self.root().join(DIR_PENDING)]
         }
     }
 

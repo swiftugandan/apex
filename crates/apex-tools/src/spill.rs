@@ -3,6 +3,12 @@ use std::path::PathBuf;
 
 use apex_core::domain::{OutputStats, SpillStrategy};
 
+/// Default spill configuration used by shell_exec and custom_tools.
+pub const DEFAULT_SPILL_STRATEGY: SpillStrategy = SpillStrategy::HeadTail;
+pub const DEFAULT_SPILL_HEAD_LINES: usize = 20;
+pub const DEFAULT_SPILL_TAIL_LINES: usize = 20;
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 16384;
+
 /// Result of spilling output to disk.
 pub struct SpillResult {
     pub path: String,

@@ -11,7 +11,10 @@ use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
-use crate::spill::SpillManager;
+use crate::spill::{
+    SpillManager, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_SPILL_HEAD_LINES, DEFAULT_SPILL_STRATEGY,
+    DEFAULT_SPILL_TAIL_LINES,
+};
 
 // ── Manifest types ────────────────────────────────────────────────
 
@@ -491,15 +494,15 @@ impl CustomToolRegistry {
 
                 // Apply spill if output is large
                 let output_str = serde_json::to_string(&parsed_output).unwrap_or_default();
-                let max_output: usize = 16384;
+                let max_output: usize = DEFAULT_MAX_OUTPUT_BYTES;
                 let (final_output, spill_path, stats, truncated) = if output_str.len() > max_output
                 {
                     if let Some(spill_result) = self.spill.spill_if_needed(
                         &output_str,
                         max_output,
-                        apex_core::domain::SpillStrategy::HeadTail,
-                        20,
-                        20,
+                        DEFAULT_SPILL_STRATEGY,
+                        DEFAULT_SPILL_HEAD_LINES,
+                        DEFAULT_SPILL_TAIL_LINES,
                     ) {
                         (
                             json!({ "output": spill_result.envelope }),
@@ -535,16 +538,7 @@ impl CustomToolRegistry {
     }
 }
 
-fn error_result(call: &ToolCall, msg: &str, start: Instant) -> ToolResult {
-    ToolResult {
-        tool_use_id: call.id.clone(),
-        name: call.name.clone(),
-        output: json!({ "error": msg }),
-        is_error: true,
-        duration_ms: start.elapsed().as_millis() as u64,
-        ..Default::default()
-    }
-}
+use crate::tool_result_helpers::error_result;
 
 fn now_iso() -> String {
     apex_core::now_unix_ts()

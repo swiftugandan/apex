@@ -442,29 +442,50 @@ where
     f(store).await
 }
 
+fn print_table(title: &str, headers: &[(&str, usize)], rows: Vec<Vec<String>>) {
+    if rows.is_empty() {
+        println!("No {title} stored.");
+        return;
+    }
+    println!("── {title} ({}) ──", rows.len());
+    let header_line: String = headers
+        .iter()
+        .map(|(name, width)| format!("{:<width$}", name, width = width))
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!("{header_line}");
+    for row in &rows {
+        let line: String = row
+            .iter()
+            .zip(headers.iter())
+            .map(|(val, (_, width))| format!("{:<width$}", val, width = width))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("{line}");
+    }
+}
+
 async fn cmd_memory_facts() -> Result<()> {
     let paths = ProjectPaths::resolve()?;
     with_memory_store(&paths, |store| async move {
         use apex_core::ports::MemoryStore;
         let facts = store.query_facts("", 100).await?;
-        if facts.is_empty() {
-            println!("No facts stored.");
-            return Ok(());
-        }
-        println!("── Facts ({}) ──", facts.len());
-        println!(
-            "{:<20} {:<50} {:<10} {:<20}",
-            "ID", "Content", "Confidence", "Tags"
+        let rows: Vec<Vec<String>> = facts
+            .iter()
+            .map(|f| {
+                vec![
+                    short_id(&f.id.0, 18).to_string(),
+                    truncate_col(&f.content, 48),
+                    format!("{:.2}", f.confidence),
+                    f.tags.join(", "),
+                ]
+            })
+            .collect();
+        print_table(
+            "Facts",
+            &[("ID", 20), ("Content", 50), ("Confidence", 10), ("Tags", 20)],
+            rows,
         );
-        for f in &facts {
-            let short_id = short_id(&f.id.0, 18);
-            let content = truncate_col(&f.content, 48);
-            let tags = f.tags.join(", ");
-            println!(
-                "{:<20} {:<50} {:<10.2} {:<20}",
-                short_id, content, f.confidence, tags
-            );
-        }
         Ok(())
     })
     .await
@@ -477,24 +498,33 @@ async fn cmd_memory_skills() -> Result<()> {
         .list_skills(100)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    if skills.is_empty() {
-        println!("No skills stored.");
-        return Ok(());
-    }
-    println!("── Skills ({}) ──", skills.len());
-    println!(
-        "{:<20} {:<24} {:<30} {:<10} {:<8} {:<8} {:<8}",
-        "ID", "Name", "Description", "Fitness", "Success", "Failure", "Status"
+    let rows: Vec<Vec<String>> = skills
+        .iter()
+        .map(|s| {
+            vec![
+                short_id(&s.id.0, 18).to_string(),
+                truncate_col(&s.name, 22),
+                truncate_col(&s.description, 28),
+                format!("{:.2}", s.fitness),
+                s.success_count.to_string(),
+                s.failure_count.to_string(),
+                s.status.to_string(),
+            ]
+        })
+        .collect();
+    print_table(
+        "Skills",
+        &[
+            ("ID", 20),
+            ("Name", 24),
+            ("Description", 30),
+            ("Fitness", 10),
+            ("Success", 8),
+            ("Failure", 8),
+            ("Status", 8),
+        ],
+        rows,
     );
-    for s in &skills {
-        let short_id = short_id(&s.id.0, 18);
-        let short_name = truncate_col(&s.name, 22);
-        let short_desc = truncate_col(&s.description, 28);
-        println!(
-            "{:<20} {:<24} {:<30} {:<10.2} {:<8} {:<8} {:<8}",
-            short_id, short_name, short_desc, s.fitness, s.success_count, s.failure_count, s.status
-        );
-    }
     Ok(())
 }
 

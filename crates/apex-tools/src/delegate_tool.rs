@@ -54,17 +54,16 @@ impl DelegateToolRegistry {
 
     /// Resolve a role profile from a named role or inline ad-hoc parameters.
     async fn resolve_role(&self, call: &ToolCall) -> Result<(RoleProfile, String), ToolError> {
-        let has_role = call.input.get("role").and_then(|v| v.as_str()).is_some();
-        let has_system_prompt = call.input.get("system_prompt").and_then(|v| v.as_str()).is_some();
+        let role_name = call.input.get("role").and_then(|v| v.as_str());
+        let system_prompt_val = call.input.get("system_prompt").and_then(|v| v.as_str());
 
-        if has_role && has_system_prompt {
+        if role_name.is_some() && system_prompt_val.is_some() {
             return Err(ToolError::InvalidInput(
                 "provide either 'role' or 'system_prompt', not both".into(),
             ));
         }
 
-        if has_role {
-            let role_name = call.input["role"].as_str().unwrap();
+        if let Some(role_name) = role_name {
             let role = self
                 .roles
                 .iter()
@@ -89,8 +88,8 @@ impl DelegateToolRegistry {
             })?;
 
             Ok((role, persona))
-        } else if has_system_prompt {
-            let system_prompt = call.input["system_prompt"].as_str().unwrap().to_string();
+        } else if let Some(system_prompt_str) = system_prompt_val {
+            let system_prompt = system_prompt_str.to_string();
 
             let tools: Vec<String> = call
                 .input

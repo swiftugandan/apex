@@ -8,6 +8,7 @@ mod memory_tools;
 mod queue_tools;
 mod shell_exec;
 pub mod spill;
+pub mod tool_result_helpers;
 
 pub use builtin::BuiltinToolRegistry;
 pub use config_tool::ConfigToolRegistry;

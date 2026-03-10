@@ -21,10 +21,6 @@ pub fn create_dir_with_mode(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
-pub fn fsync_file_handle(f: &fs::File) -> std::io::Result<()> {
-    f.sync_all()
-}
-
 pub fn fsync_dir(path: &Path, mode: FsyncMode) -> Result<()> {
     match mode {
         FsyncMode::Full => {
@@ -110,17 +106,5 @@ pub fn collect_md_files(dir: &Path) -> Result<Vec<String>> {
 }
 
 pub fn count_md_files(dir: &Path) -> Result<usize> {
-    let mut count: usize = 0;
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e.into()),
-    };
-    for entry in entries {
-        let entry = entry?;
-        if entry.file_name().to_string_lossy().ends_with(".md") {
-            count += 1;
-        }
-    }
-    Ok(count)
+    Ok(collect_md_files(dir)?.len())
 }

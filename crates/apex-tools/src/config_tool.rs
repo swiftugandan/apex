@@ -71,25 +71,7 @@ impl ToolRegistry for ConfigToolRegistry {
     }
 }
 
-fn ok_result(call: &ToolCall, output: Value) -> Result<ToolResult, ToolError> {
-    Ok(ToolResult {
-        tool_use_id: call.id.clone(),
-        name: call.name.clone(),
-        output,
-        is_error: false,
-        ..Default::default()
-    })
-}
-
-fn err_result(call: &ToolCall, message: &str) -> Result<ToolResult, ToolError> {
-    Ok(ToolResult {
-        tool_use_id: call.id.clone(),
-        name: call.name.clone(),
-        output: json!({ "error": message }),
-        is_error: true,
-        ..Default::default()
-    })
-}
+use crate::tool_result_helpers::{ok_result, err_result};
 
 impl ConfigToolRegistry {
     fn handle_read(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
