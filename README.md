@@ -32,13 +32,18 @@ Tasks flow through a filesystem-based message queue. Each message is a self-cont
 ```
 .apex/
 ├── config/          # TOML configuration (agent, invariants)
-├── hooks/           # Lifecycle hooks (*.toml per event)
-├── long_term.db     # SQLite fact & calibration store
+├── hooks/           # Lifecycle hooks (<event>.d/*.toml)
+├── memory/
+│   ├── long-term/
+│   │   ├── memory.db    # SQLite fact & calibration store
+│   │   └── skills/      # Learned skill files
+│   └── working/         # Per-job scratchpads
 ├── prompts/         # Agent personas (agent.md, coder.md, ...)
-├── queue/           # Message queue (pending/, processing/, done/, failed/)
+├── queues/
+│   ├── work/        # Main message queue (pending/, processing/, done/, failed/)
+│   └── sub-<id>/    # Ephemeral per-sub-agent queues
 ├── scratch/         # Spilled tool outputs
-├── tools/           # Custom tools (manifest + implementations)
-└── working_memory/  # Per-job scratchpads
+└── tools/           # Custom tools (manifest + implementations)
 ```
 
 ## CLI Commands
@@ -77,6 +82,7 @@ All config lives in `.apex/config/` as TOML. Partial files work — missing fiel
 model = "claude-sonnet-4-20250514"   # LLM model
 max_concurrent = 1                    # Parallel workers
 max_turns = 32                        # LLM turns per task
+max_depth = 5                         # Task decomposition depth
 max_retries = 3                       # Retries before moving to failed/
 max_output_tokens = 16384             # Max response tokens
 
