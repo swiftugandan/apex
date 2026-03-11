@@ -519,7 +519,9 @@ impl Skill {
 
         // Trim trailing whitespace from parsed sections
         let approach = approach.trim_end().to_string();
-        let criteria_template = criteria_template.map(|c| c.trim_end().to_string()).filter(|c| !c.is_empty());
+        let criteria_template = criteria_template
+            .map(|c| c.trim_end().to_string())
+            .filter(|c| !c.is_empty());
         let notes = notes.trim_end().to_string();
 
         // Derive name/description from task_pattern for backward compat
@@ -603,7 +605,10 @@ impl Scratchpad {
     }
 
     pub fn to_markdown(&self) -> String {
-        let mut out = format!("# Working Memory: {}\n\n## Goal\n{}\n\n## Decomposition\n", self.job_id, self.goal);
+        let mut out = format!(
+            "# Working Memory: {}\n\n## Goal\n{}\n\n## Decomposition\n",
+            self.job_id, self.goal
+        );
 
         if self.subtasks.is_empty() {
             out.push_str("(none)\n");
@@ -644,8 +649,7 @@ impl Scratchpad {
                 let status = if entry.is_error { "ERR" } else { "ok" };
                 out.push_str(&format!(
                     "- [turn {}] `{}` — {} ({}ms, {})\n",
-                    entry.turn, entry.tool_name, entry.input_summary,
-                    entry.duration_ms, status,
+                    entry.turn, entry.tool_name, entry.input_summary, entry.duration_ms, status,
                 ));
             }
         }
@@ -662,7 +666,14 @@ impl Scratchpad {
         let mut log = Vec::new();
 
         #[derive(PartialEq)]
-        enum Section { None, Goal, Decomposition, Status, Notes, Log }
+        enum Section {
+            None,
+            Goal,
+            Decomposition,
+            Status,
+            Notes,
+            Log,
+        }
         let mut section = Section::None;
 
         for line in md.lines() {
@@ -741,7 +752,14 @@ impl Scratchpad {
             return Err("missing job_id header".to_string());
         }
 
-        Ok(Scratchpad { job_id, goal, subtasks, status_summary, notes, log })
+        Ok(Scratchpad {
+            job_id,
+            goal,
+            subtasks,
+            status_summary,
+            notes,
+            log,
+        })
     }
 }
 
@@ -765,7 +783,9 @@ fn parse_subtask_line(line: &str) -> Option<SubtaskEntry> {
     // Extract depends_on from end
     let (rest, depends_on) = if let Some(dep_start) = rest.rfind(" (depends on ") {
         let dep_end = rest.len();
-        let dep = rest[dep_start + 13..dep_end].trim_end_matches(')').to_string();
+        let dep = rest[dep_start + 13..dep_end]
+            .trim_end_matches(')')
+            .to_string();
         (&rest[..dep_start], Some(dep))
     } else {
         (rest, None)
@@ -773,12 +793,21 @@ fn parse_subtask_line(line: &str) -> Option<SubtaskEntry> {
 
     // Extract task_id from " → task-id"
     let (description, task_id) = if let Some(arrow_pos) = rest.find(" → ") {
-        (rest[..arrow_pos].to_string(), Some(rest[arrow_pos + 5..].to_string()))
+        (
+            rest[..arrow_pos].to_string(),
+            Some(rest[arrow_pos + 5..].to_string()),
+        )
     } else {
         (rest.to_string(), None)
     };
 
-    Some(SubtaskEntry { index, description, status, task_id, depends_on })
+    Some(SubtaskEntry {
+        index,
+        description,
+        status,
+        task_id,
+        depends_on,
+    })
 }
 
 /// Parse a log line: "- [turn 1] `shell_exec` — ls -la (250ms, ok)"
@@ -877,18 +906,13 @@ pub enum HookActionType {
 }
 
 /// What happens when a hook script fails (non-zero exit).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnFailureBehavior {
     Block,
+    #[default]
     Warn,
     Continue,
-}
-
-impl Default for OnFailureBehavior {
-    fn default() -> Self {
-        OnFailureBehavior::Warn
-    }
 }
 
 /// Optional filter for when a hook should trigger.
@@ -1410,7 +1434,10 @@ mod tests {
         assert_eq!(parsed.subtasks[1].depends_on.as_deref(), Some("001"));
         assert_eq!(parsed.subtasks[2].task_id, None);
         assert_eq!(parsed.status_summary, "Step 1 done, step 2 running");
-        assert_eq!(parsed.notes, vec!["Found a config issue", "Retrying with fix"]);
+        assert_eq!(
+            parsed.notes,
+            vec!["Found a config issue", "Retrying with fix"]
+        );
 
         // Verify log roundtrip
         assert_eq!(parsed.log.len(), 2);

@@ -1,7 +1,7 @@
 use apex_core::config::ConsolidationSection;
 use apex_core::domain::{
-    slugify, AttemptOutcome, AttemptRecord, Fact, FactId, Scratchpad, Skill, SkillId,
-    SkillStatus, SubtaskStatus,
+    slugify, AttemptOutcome, AttemptRecord, Fact, FactId, Scratchpad, Skill, SkillId, SkillStatus,
+    SubtaskStatus,
 };
 use apex_core::ports::{HookRegistry, MemoryStore, SkillStore};
 
@@ -11,12 +11,14 @@ async fn log_consolidation_err(hooks: Option<&dyn HookRegistry>, context: &str, 
     let fallback = format!("  consolidation: {context}: {error}");
     dispatch_log(
         hooks,
-        || serde_json::json!({
-            "level": "warn",
-            "event": "consolidation_error",
-            "context": context,
-            "error": error,
-        }),
+        || {
+            serde_json::json!({
+                "level": "warn",
+                "event": "consolidation_error",
+                "context": context,
+                "error": error,
+            })
+        },
         &fallback,
     )
     .await;
@@ -58,7 +60,12 @@ pub async fn consolidate_learnings(
                                 tags: vec![],
                             };
                             if let Err(e) = store.store_fact(fact).await {
-                                log_consolidation_err(hooks, "failed to store fact", &e.to_string()).await;
+                                log_consolidation_err(
+                                    hooks,
+                                    "failed to store fact",
+                                    &e.to_string(),
+                                )
+                                .await;
                             }
                         }
                     }
@@ -77,7 +84,12 @@ pub async fn consolidate_learnings(
                         .update_skill_fitness(&skill.id, record.outcome == AttemptOutcome::Success)
                         .await
                     {
-                        log_consolidation_err(hooks, "failed to update skill fitness", &e.to_string()).await;
+                        log_consolidation_err(
+                            hooks,
+                            "failed to update skill fitness",
+                            &e.to_string(),
+                        )
+                        .await;
                     }
                 }
                 Ok(None) => {
@@ -116,7 +128,8 @@ pub async fn consolidate_learnings(
                             status: SkillStatus::Active,
                         };
                         if let Err(e) = skill_store.store_skill(skill).await {
-                            log_consolidation_err(hooks, "failed to store skill", &e.to_string()).await;
+                            log_consolidation_err(hooks, "failed to store skill", &e.to_string())
+                                .await;
                         }
                     }
                 }
@@ -144,7 +157,12 @@ pub async fn consolidate_learnings(
                     .iter()
                     .all(|st| st.status == SubtaskStatus::Done);
                 if let Err(e) = skill_store.update_skill_fitness(&skill.id, success).await {
-                    log_consolidation_err(hooks, "failed to update decomposition skill fitness", &e.to_string()).await;
+                    log_consolidation_err(
+                        hooks,
+                        "failed to update decomposition skill fitness",
+                        &e.to_string(),
+                    )
+                    .await;
                 }
             }
             Ok(None) => {
@@ -156,8 +174,16 @@ pub async fn consolidate_learnings(
                     approach: decomposition,
                     tools_used: vec![],
                     criteria_template: None,
-                    success_count: if record.outcome == AttemptOutcome::Success { 1 } else { 0 },
-                    failure_count: if record.outcome == AttemptOutcome::Failed { 1 } else { 0 },
+                    success_count: if record.outcome == AttemptOutcome::Success {
+                        1
+                    } else {
+                        0
+                    },
+                    failure_count: if record.outcome == AttemptOutcome::Failed {
+                        1
+                    } else {
+                        0
+                    },
                     fitness: 0.5,
                     min_samples: 3,
                     last_used: String::new(),
@@ -165,11 +191,17 @@ pub async fn consolidate_learnings(
                     status: SkillStatus::Active,
                 };
                 if let Err(e) = skill_store.store_skill(skill).await {
-                    log_consolidation_err(hooks, "failed to store decomposition skill", &e.to_string()).await;
+                    log_consolidation_err(
+                        hooks,
+                        "failed to store decomposition skill",
+                        &e.to_string(),
+                    )
+                    .await;
                 }
             }
             Err(e) => {
-                log_consolidation_err(hooks, "failed to find decomposition skill", &e.to_string()).await;
+                log_consolidation_err(hooks, "failed to find decomposition skill", &e.to_string())
+                    .await;
             }
         }
     }

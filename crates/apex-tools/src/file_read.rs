@@ -126,7 +126,10 @@ mod tests {
     async fn read_with_offset_and_limit() {
         let dir = temp_dir();
         let path = dir.join("lines.txt");
-        let content = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let content = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(&path, &content).unwrap();
 
         // Read lines 5-9 (offset=5, limit=5)
@@ -151,7 +154,10 @@ mod tests {
     async fn read_with_offset_only() {
         let dir = temp_dir();
         let path = dir.join("lines.txt");
-        let content = (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let content = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(&path, &content).unwrap();
 
         // Read from line 8 onward

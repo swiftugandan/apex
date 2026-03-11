@@ -15,8 +15,7 @@ impl ConfigLoader {
         if !path.exists() {
             return Ok(Invariants::default());
         }
-        let contents =
-            std::fs::read_to_string(&path).context("failed to read invariants.toml")?;
+        let contents = std::fs::read_to_string(&path).context("failed to read invariants.toml")?;
         Invariants::from_toml(&contents).context("failed to parse invariants.toml")
     }
 
@@ -25,8 +24,7 @@ impl ConfigLoader {
     pub fn load_agent_config(config_dir: &Path) -> Result<AgentConfig> {
         let path = config_dir.join("agent.toml");
         let mut config = if path.exists() {
-            let contents =
-                std::fs::read_to_string(&path).context("failed to read agent.toml")?;
+            let contents = std::fs::read_to_string(&path).context("failed to read agent.toml")?;
             AgentConfig::from_toml(&contents).context("failed to parse agent.toml")?
         } else {
             AgentConfig::default()
@@ -52,7 +50,9 @@ impl ConfigLoader {
     /// Save agent config to `config_dir/agent.toml`.
     pub fn save_agent_config(config_dir: &Path, config: &AgentConfig) -> Result<()> {
         let path = config_dir.join("agent.toml");
-        let contents = config.to_toml().context("failed to serialize agent config")?;
+        let contents = config
+            .to_toml()
+            .context("failed to serialize agent config")?;
         std::fs::write(&path, &contents).context("failed to write agent.toml")?;
         Ok(())
     }

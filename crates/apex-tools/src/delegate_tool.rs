@@ -185,21 +185,23 @@ impl ToolRegistry for DelegateToolRegistry {
 
         let (role, persona) = self.resolve_role(call).await?;
 
-        eprintln!(
-            "  [delegate:{}] spawning subprocess",
-            role.name,
-        );
+        eprintln!("  [delegate:{}] spawning subprocess", role.name,);
 
         let result = self.spawner.spawn(&task, &role, &persona).await?;
 
-        eprintln!("  [delegate:{}] finished ({} done, {} failed)",
-            role.name, result.done_bodies.len(), result.failed_bodies.len());
+        eprintln!(
+            "  [delegate:{}] finished ({} done, {} failed)",
+            role.name,
+            result.done_bodies.len(),
+            result.failed_bodies.len()
+        );
 
         // Convert SubAgentResult to ToolResult
         if !result.failed_bodies.is_empty() {
             let failure_summary = result.failed_bodies.join("\n---\n");
             return Err(ToolError::Execution(format!(
-                "sub-agent '{}' failed:\n{}", role.name, failure_summary
+                "sub-agent '{}' failed:\n{}",
+                role.name, failure_summary
             )));
         }
 

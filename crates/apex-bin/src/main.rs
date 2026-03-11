@@ -6,18 +6,19 @@ use tokio::sync::Mutex;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use apex_core::config::{ConfigLoader, validate_full};
+use apex_core::config::{validate_full, ConfigLoader};
 use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{MessageHeaders, MessageType, QueueMessage};
-use apex_core::ports::{MemoryStore, Queue, SkillStore, WorkingMemory};
-use apex_engine::{
-    InProcessSpawner, InfraFactories, ProjectPaths, SpawnerConfig, WorkerContext, WorkerLimits,
-    build_static_tools, worker_loop,
-};
 use apex_core::ports::HookRegistry;
-use apex_tools::FsHookRegistry;
-use apex_infra::{AnthropicProvider, FsSkillStore, FsScratchpadStore, RfbmqAdapter, SqliteMemoryStore};
+use apex_core::ports::{MemoryStore, Queue, SkillStore, WorkingMemory};
+use apex_engine::{worker_loop, ClaimToolFactory, ProjectPaths, WorkerContext, WorkerLimits};
+use apex_infra::{
+    AnthropicProvider, FsScratchpadStore, FsSkillStore, RfbmqAdapter, SqliteMemoryStore,
+};
 use apex_tools::spill::SpillManager;
+use apex_tools::FsHookRegistry;
+
+mod runtime;
 
 // ── CLI ────────────────────────────────────────────────────────────
 
@@ -123,8 +124,7 @@ async fn cmd_init() -> Result<()> {
 
     let manifest_path = paths.tools_dir.join("manifest.toml");
     if !manifest_path.exists() {
-        std::fs::write(&manifest_path, "")
-            .context("failed to write tools/manifest.toml")?;
+        std::fs::write(&manifest_path, "").context("failed to write tools/manifest.toml")?;
     }
 
     ConfigLoader::write_default_invariants(&paths.config_dir)?;
@@ -170,7 +170,10 @@ async fn cmd_run(task: String) -> Result<()> {
         body,
     };
 
-    let id = adapter.push(msg).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let id = adapter
+        .push(msg)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     eprintln!("▶ Queued goal {id} (correlation: {correlation_id})");
 
     process_queue(&paths, Arc::new(adapter)).await
@@ -180,10 +183,7 @@ async fn cmd_run(task: String) -> Result<()> {
 async fn drain_pending(adapter: &RfbmqAdapter) -> Result<u32> {
     let mut count = 0u32;
     loop {
-        let claimed = adapter
-            .pop()
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let claimed = adapter.pop().await.map_err(|e| anyhow::anyhow!("{e}"))?;
         match claimed {
             Some(task) => {
                 adapter
@@ -208,10 +208,7 @@ async fn cmd_queue_depth() -> Result<()> {
     let paths = ProjectPaths::resolve()?;
     let adapter = open_queue(&paths)?;
 
-    let d = adapter
-        .depth()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let d = adapter.depth().await.map_err(|e| anyhow::anyhow!("{e}"))?;
 
     println!("{}", d.pending + d.processing);
     Ok(())
@@ -221,10 +218,7 @@ async fn cmd_queue_reap() -> Result<()> {
     let paths = ProjectPaths::resolve()?;
     let adapter = open_queue(&paths)?;
 
-    let result = adapter
-        .reap()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let result = adapter.reap().await.map_err(|e| anyhow::anyhow!("{e}"))?;
 
     eprintln!("reaped {} lease(s)", result.lease_reaped);
 
@@ -348,7 +342,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
 
     let llm: Arc<dyn apex_core::ports::LlmProvider> = Arc::new(
         AnthropicProvider::from_env_with_model(&agent_config.agent.model)
-            .context("failed to create LLM provider")?
+            .context("failed to create LLM provider")?,
     );
 
     let memory: Arc<dyn WorkingMemory> =
@@ -366,35 +360,18 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
 
     let invariants = Arc::new(invariants);
 
-    // Build the SubAgentSpawner with factory closures for infra creation
-    let infra = Arc::new(InfraFactories {
-        queue: Arc::new(|path| {
-            RfbmqAdapter::init(path)
-                .map(|a| Arc::new(a) as Arc<dyn Queue>)
-                .map_err(|e| e.to_string())
-        }),
-        working_memory: Arc::new(|path| {
-            Arc::new(FsScratchpadStore::new(path.to_path_buf())) as Arc<dyn WorkingMemory>
-        }),
-        memory_store: Arc::new(|path| {
-            SqliteMemoryStore::open(path)
-                .map(|s| Arc::new(s) as Arc<dyn MemoryStore>)
-                .map_err(|e| e.to_string())
-        }),
-        skill_store: Arc::new(|path| {
-            Arc::new(FsSkillStore::new(path.to_path_buf())) as Arc<dyn SkillStore>
-        }),
-    });
     let hooks: Arc<dyn apex_core::ports::HookRegistry> =
         Arc::new(FsHookRegistry::new(paths.hooks_dir.clone()));
 
-    let spawner: Arc<dyn apex_core::ports::SubAgentSpawner> = Arc::new(InProcessSpawner {
+    // Build the SubAgentSpawner with typed runtime builder (replaces closure bag)
+    let sub_runtime = Arc::new(runtime::SubAgentRuntimeBuilder);
+    let spawner: Arc<dyn apex_core::ports::SubAgentSpawner> = Arc::new(runtime::InProcessSpawner {
         project_paths: paths.clone(),
         parent_long_term: long_term.clone(),
         parent_skills: skills.clone(),
         llm: llm.clone(),
         estimator: estimator.clone(),
-        config: SpawnerConfig {
+        config: runtime::SpawnerConfig {
             invariants: Arc::clone(&invariants),
             roles: Arc::clone(&roles),
             max_tool_result_bytes,
@@ -405,11 +382,11 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
             compaction: agent_config.compaction.clone(),
             consolidation: agent_config.consolidation.clone(),
         },
-        infra,
+        runtime: sub_runtime,
         hooks: Some(Arc::clone(&hooks)),
     });
 
-    let static_tools = build_static_tools(
+    let static_tools = runtime::build_static_tools(
         paths,
         memory.clone(),
         long_term.clone(),
@@ -420,11 +397,16 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         remaining_delegate_depth,
     );
 
+    let claim_factory: Arc<dyn ClaimToolFactory> = Arc::new(runtime::CliClaimToolFactory {
+        static_tools,
+        estimator: estimator.clone(),
+    });
+
     let queue: Arc<dyn Queue> = adapter.clone();
 
     let ctx = WorkerContext {
         queue,
-        tools: static_tools,
+        claim_tool_factory: claim_factory,
         llm,
         memory,
         long_term,
@@ -451,7 +433,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         for worker_id in 0..max_concurrent {
             let worker_ctx = ctx.clone();
             handles.push(tokio::spawn(async move {
-                worker_loop(worker_ctx, worker_id as usize).await
+                worker_loop(worker_ctx, worker_id).await
             }));
         }
 
@@ -465,7 +447,11 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
 // ── CLI memory commands ───────────────────────────────────────────
 
 fn short_id(id: &str, max: usize) -> &str {
-    if id.len() > max { &id[..max] } else { id }
+    if id.len() > max {
+        &id[..max]
+    } else {
+        id
+    }
 }
 
 fn truncate_col(s: &str, max: usize) -> String {
@@ -531,7 +517,12 @@ async fn cmd_memory_facts() -> Result<()> {
             .collect();
         print_table(
             "Facts",
-            &[("ID", 20), ("Content", 50), ("Confidence", 10), ("Tags", 20)],
+            &[
+                ("ID", 20),
+                ("Content", 50),
+                ("Confidence", 10),
+                ("Tags", 20),
+            ],
             rows,
         );
         Ok(())
@@ -600,7 +591,9 @@ async fn cmd_memory_gc() -> Result<()> {
 async fn cmd_scratch_ls() -> Result<()> {
     let paths = ProjectPaths::resolve()?;
     let spill = SpillManager::new(paths.scratch_dir);
-    let entries = spill.list().map_err(|e| anyhow::anyhow!("failed to list scratch: {e}"))?;
+    let entries = spill
+        .list()
+        .map_err(|e| anyhow::anyhow!("failed to list scratch: {e}"))?;
 
     if entries.is_empty() {
         println!("No scratch files.");
@@ -628,8 +621,8 @@ async fn cmd_tools_list() -> Result<()> {
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&manifest_path)
-        .context("failed to read tools/manifest.toml")?;
+    let content =
+        std::fs::read_to_string(&manifest_path).context("failed to read tools/manifest.toml")?;
 
     if content.trim().is_empty() {
         println!("No custom tools registered.");
@@ -648,8 +641,8 @@ async fn cmd_tools_list() -> Result<()> {
         created_at: String,
     }
 
-    let manifest: Manifest = toml::de::from_str(&content)
-        .context("failed to parse manifest.toml")?;
+    let manifest: Manifest =
+        toml::de::from_str(&content).context("failed to parse manifest.toml")?;
 
     if manifest.tool.is_empty() {
         println!("No custom tools registered.");
@@ -658,7 +651,10 @@ async fn cmd_tools_list() -> Result<()> {
 
     println!("── Custom tools ({}) ──", manifest.tool.len());
     for entry in &manifest.tool {
-        println!("  {:<24} {} (created: {})", entry.name, entry.description, entry.created_at);
+        println!(
+            "  {:<24} {} (created: {})",
+            entry.name, entry.description, entry.created_at
+        );
     }
     Ok(())
 }
@@ -669,9 +665,18 @@ async fn cmd_memory_calibration() -> Result<()> {
         use apex_core::ports::MemoryStore;
         let cal = store.load_calibration().await?;
         println!("── Token Calibration ──");
-        println!("  Prose ratio:  {:.3} chars/token", cal.chars_per_token_prose);
-        println!("  Code ratio:   {:.3} chars/token", cal.chars_per_token_code);
-        println!("  Mixed ratio:  {:.3} chars/token", cal.chars_per_token_mixed);
+        println!(
+            "  Prose ratio:  {:.3} chars/token",
+            cal.chars_per_token_prose
+        );
+        println!(
+            "  Code ratio:   {:.3} chars/token",
+            cal.chars_per_token_code
+        );
+        println!(
+            "  Mixed ratio:  {:.3} chars/token",
+            cal.chars_per_token_mixed
+        );
         println!("  Sample count: {}", cal.sample_count);
         Ok(())
     })
@@ -717,7 +722,11 @@ async fn cmd_hooks_list() -> Result<()> {
                 h.hook.priority.to_string(),
                 format!("{:?}", h.action.action_type).to_lowercase(),
                 h.hook.filter.tool.as_deref().unwrap_or("*").to_string(),
-                if h.hook.invariant { "yes".to_string() } else { "no".to_string() },
+                if h.hook.invariant {
+                    "yes".to_string()
+                } else {
+                    "no".to_string()
+                },
             ]
         })
         .collect();
@@ -834,4 +843,3 @@ async fn cmd_validate() -> Result<()> {
     }
     Ok(())
 }
-

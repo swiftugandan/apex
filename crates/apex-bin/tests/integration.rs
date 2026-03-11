@@ -7,15 +7,19 @@ use tokio::sync::Mutex;
 use apex_core::config::{CompactionSection, ConsolidationSection};
 use apex_core::context::TokenEstimator;
 use apex_core::domain::{
-    CalibrationData, ChatMessage, CompletionRequest, CompletionResponse, ContentBlock,
-    Fact, FactId, MessageRole, QueueMessage, Scratchpad, Skill, SkillId,
-    StopReason, ToolCompletionResponse, ToolSchema, TokenUsage,
+    CalibrationData, ChatMessage, CompletionRequest, CompletionResponse, ContentBlock, Fact,
+    FactId, MessageRole, QueueMessage, Scratchpad, Skill, SkillId, StopReason, TokenUsage,
+    ToolCompletionResponse, ToolSchema,
 };
 use apex_core::error::{LlmError, MemoryError};
-use apex_core::ports::{LlmProvider, MemoryStore, Queue, SkillStore, WorkingMemory};
+use apex_core::ports::{LlmProvider, MemoryStore, Queue, SkillStore, ToolRegistry, WorkingMemory};
 
-use apex_engine::{worker_loop, CompositeToolRegistry, WorkerContext, WorkerLimits};
+use apex_engine::util::composer_from_estimator;
+use apex_engine::{
+    worker_loop, ClaimContext, ClaimToolFactory, CompositeToolRegistry, WorkerContext, WorkerLimits,
+};
 use apex_infra::RfbmqAdapter;
+use apex_tools::QueueToolRegistry;
 
 // ── Shared mock implementations for integration tests ─────────────
 
@@ -137,7 +141,10 @@ impl InMemoryStore {
 impl MemoryStore for InMemoryStore {
     async fn store_fact(&self, fact: Fact) -> Result<FactId, MemoryError> {
         let id = FactId(apex_core::generate_id("fact"));
-        self.facts.lock().await.push(Fact { id: id.clone(), ..fact });
+        self.facts.lock().await.push(Fact {
+            id: id.clone(),
+            ..fact
+        });
         Ok(id)
     }
     async fn query_facts(&self, _q: &str, _limit: usize) -> Result<Vec<Fact>, MemoryError> {
@@ -170,6 +177,36 @@ impl SkillStore for InMemorySkillStore {
     }
     async fn update_skill_fitness(&self, _id: &SkillId, _success: bool) -> Result<(), MemoryError> {
         Ok(())
+    }
+}
+
+// ── IntegrationClaimToolFactory ───────────────────────────────────
+//
+// Lightweight factory for integration tests.  Builds a per-claim
+// CompositeToolRegistry containing only queue tools (no static tools).
+
+struct IntegrationClaimToolFactory {
+    estimator: Arc<Mutex<TokenEstimator>>,
+}
+
+#[async_trait]
+impl ClaimToolFactory for IntegrationClaimToolFactory {
+    async fn build(&self, ctx: &ClaimContext) -> Box<dyn ToolRegistry> {
+        let composer = composer_from_estimator(&self.estimator).await;
+        let queue_tools = QueueToolRegistry::new(
+            Arc::clone(&ctx.queue),
+            ctx.correlation_id.clone(),
+            ctx.current_depth,
+            ctx.max_depth,
+            ctx.parent_goal.clone(),
+            ctx.parent_body.clone(),
+            Some(Arc::clone(&ctx.long_term)),
+            Some(Arc::clone(&ctx.skills)),
+            composer,
+        )
+        .with_hooks(ctx.hooks.clone());
+
+        Box::new(CompositeToolRegistry::new(vec![Box::new(queue_tools)]))
     }
 }
 
@@ -207,11 +244,14 @@ async fn single_task_roundtrip() {
     let memory: Arc<dyn WorkingMemory> = Arc::new(InMemoryWorkingMemory::new());
     let long_term: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
     let skills: Arc<dyn SkillStore> = Arc::new(InMemorySkillStore);
-    let tools = Arc::new(CompositeToolRegistry::new(vec![]));
+    let estimator = Arc::new(Mutex::new(TokenEstimator::default()));
+    let claim_factory: Arc<dyn ClaimToolFactory> = Arc::new(IntegrationClaimToolFactory {
+        estimator: estimator.clone(),
+    });
 
     let ctx = WorkerContext {
         queue: Arc::clone(&queue),
-        tools,
+        claim_tool_factory: claim_factory,
         llm,
         memory,
         long_term,
@@ -225,7 +265,7 @@ async fn single_task_roundtrip() {
             max_turns: 32,
             max_empty_cycles: 300,
         },
-        estimator: Arc::new(Mutex::new(TokenEstimator::default())),
+        estimator,
         compaction: CompactionSection {
             preserve_turns: 3,
             max_summary_tokens: 1024,

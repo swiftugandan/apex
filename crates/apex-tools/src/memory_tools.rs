@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use apex_core::domain::{
-    slugify, Fact, FactId, Skill, SkillId, SkillStatus, SubtaskEntry,
-    SubtaskStatus, ToolCall, ToolDef, ToolResult, ToolSchema,
+    slugify, Fact, FactId, Skill, SkillId, SkillStatus, SubtaskEntry, SubtaskStatus, ToolCall,
+    ToolDef, ToolResult, ToolSchema,
 };
 use apex_core::error::ToolError;
 use apex_core::ports::{MemoryStore, SkillStore, ToolRegistry, WorkingMemory};
@@ -274,16 +274,19 @@ impl MemoryToolRegistry {
         }
 
         if let Some(st) = call.input.get("add_subtask") {
-            let desc = st["description"]
-                .as_str()
-                .ok_or_else(|| ToolError::InvalidInput("add_subtask.description required".into()))?;
+            let desc = st["description"].as_str().ok_or_else(|| {
+                ToolError::InvalidInput("add_subtask.description required".into())
+            })?;
             let next_index = pad.subtasks.last().map_or(1, |s| s.index + 1);
             pad.subtasks.push(SubtaskEntry {
                 index: next_index,
                 description: desc.to_string(),
                 status: SubtaskStatus::Pending,
                 task_id: st.get("task_id").and_then(Value::as_str).map(String::from),
-                depends_on: st.get("depends_on").and_then(Value::as_str).map(String::from),
+                depends_on: st
+                    .get("depends_on")
+                    .and_then(Value::as_str)
+                    .map(String::from),
             });
         }
 
@@ -299,11 +302,7 @@ impl MemoryToolRegistry {
                 "done" => SubtaskStatus::Done,
                 "active" => SubtaskStatus::Active,
                 "pending" => SubtaskStatus::Pending,
-                other => {
-                    return Err(ToolError::InvalidInput(format!(
-                        "invalid status: {other}"
-                    )))
-                }
+                other => return Err(ToolError::InvalidInput(format!("invalid status: {other}"))),
             };
             if let Some(entry) = pad.subtasks.iter_mut().find(|s| s.index == index) {
                 entry.status = status;
@@ -526,16 +525,15 @@ impl MemoryToolRegistry {
             ..Default::default()
         })
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apex_core::domain::{CalibrationData, Fact, FactId, Scratchpad, Skill, SkillId};
+    use apex_core::error::MemoryError;
     use std::collections::HashMap;
     use tokio::sync::Mutex;
-    use apex_core::domain::{CalibrationData, Scratchpad, Skill, SkillId, Fact, FactId};
-    use apex_core::error::MemoryError;
 
     // ── Inline mocks (no infra dependency) ──────────────────────────
 
@@ -545,7 +543,9 @@ mod tests {
 
     impl MockWorkingMemory {
         fn new() -> Self {
-            Self { pads: Mutex::new(HashMap::new()) }
+            Self {
+                pads: Mutex::new(HashMap::new()),
+            }
         }
     }
 
@@ -553,10 +553,16 @@ mod tests {
     impl WorkingMemory for MockWorkingMemory {
         async fn load_or_create(&self, job_id: &str) -> Result<Scratchpad, MemoryError> {
             let pads = self.pads.lock().await;
-            Ok(pads.get(job_id).cloned().unwrap_or_else(|| Scratchpad::new(job_id, "")))
+            Ok(pads
+                .get(job_id)
+                .cloned()
+                .unwrap_or_else(|| Scratchpad::new(job_id, "")))
         }
         async fn save(&self, scratchpad: &Scratchpad) -> Result<(), MemoryError> {
-            self.pads.lock().await.insert(scratchpad.job_id.clone(), scratchpad.clone());
+            self.pads
+                .lock()
+                .await
+                .insert(scratchpad.job_id.clone(), scratchpad.clone());
             Ok(())
         }
         async fn exists(&self, job_id: &str) -> Result<bool, MemoryError> {
@@ -580,7 +586,9 @@ mod tests {
 
     impl MockMemoryStore {
         fn new() -> Self {
-            Self { facts: Mutex::new(Vec::new()) }
+            Self {
+                facts: Mutex::new(Vec::new()),
+            }
         }
     }
 
@@ -592,16 +600,30 @@ mod tests {
             } else {
                 fact.id.clone()
             };
-            self.facts.lock().await.push(Fact { id: id.clone(), ..fact });
+            self.facts.lock().await.push(Fact {
+                id: id.clone(),
+                ..fact
+            });
             Ok(id)
         }
         async fn query_facts(&self, query: &str, limit: usize) -> Result<Vec<Fact>, MemoryError> {
             let facts = self.facts.lock().await;
-            Ok(facts.iter().filter(|f| f.content.contains(query)).take(limit).cloned().collect())
+            Ok(facts
+                .iter()
+                .filter(|f| f.content.contains(query))
+                .take(limit)
+                .cloned()
+                .collect())
         }
-        async fn verify_fact(&self, _id: &FactId) -> Result<(), MemoryError> { Ok(()) }
-        async fn persist_calibration(&self, _data: &CalibrationData) -> Result<(), MemoryError> { Ok(()) }
-        async fn load_calibration(&self) -> Result<CalibrationData, MemoryError> { Ok(CalibrationData::default()) }
+        async fn verify_fact(&self, _id: &FactId) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn persist_calibration(&self, _data: &CalibrationData) -> Result<(), MemoryError> {
+            Ok(())
+        }
+        async fn load_calibration(&self) -> Result<CalibrationData, MemoryError> {
+            Ok(CalibrationData::default())
+        }
     }
 
     struct MockSkillStore {
@@ -610,7 +632,9 @@ mod tests {
 
     impl MockSkillStore {
         fn new() -> Self {
-            Self { skills: Mutex::new(Vec::new()) }
+            Self {
+                skills: Mutex::new(Vec::new()),
+            }
         }
     }
 
@@ -622,17 +646,36 @@ mod tests {
             } else {
                 skill.id.clone()
             };
-            self.skills.lock().await.push(Skill { id: id.clone(), ..skill });
+            self.skills.lock().await.push(Skill {
+                id: id.clone(),
+                ..skill
+            });
             Ok(id)
         }
         async fn find_skill(&self, task_pattern: &str) -> Result<Option<Skill>, MemoryError> {
             let skills = self.skills.lock().await;
-            Ok(skills.iter().find(|s| s.task_pattern.contains(task_pattern)).cloned())
+            Ok(skills
+                .iter()
+                .find(|s| s.task_pattern.contains(task_pattern))
+                .cloned())
         }
         async fn list_skills(&self, limit: usize) -> Result<Vec<Skill>, MemoryError> {
-            Ok(self.skills.lock().await.iter().take(limit).cloned().collect())
+            Ok(self
+                .skills
+                .lock()
+                .await
+                .iter()
+                .take(limit)
+                .cloned()
+                .collect())
         }
-        async fn update_skill_fitness(&self, _id: &SkillId, _success: bool) -> Result<(), MemoryError> { Ok(()) }
+        async fn update_skill_fitness(
+            &self,
+            _id: &SkillId,
+            _success: bool,
+        ) -> Result<(), MemoryError> {
+            Ok(())
+        }
     }
 
     fn setup() -> MemoryToolRegistry {

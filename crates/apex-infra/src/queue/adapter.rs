@@ -92,8 +92,8 @@ impl Queue for RfbmqAdapter {
                 None => continue, // Another worker claimed it
             };
 
-            let rfbmq_msg = Message::from_file(claimed.path())
-                .map_err(|e| QueueError::Parse(e.to_string()))?;
+            let rfbmq_msg =
+                Message::from_file(claimed.path()).map_err(|e| QueueError::Parse(e.to_string()))?;
 
             // Check Not-Before: if the message has a future delivery time, put it back
             if let Some(not_before) = parse_not_before(&rfbmq_msg.header.custom) {
@@ -271,8 +271,7 @@ impl Queue for RfbmqAdapter {
         }
 
         let mut result = Vec::new();
-        let entries =
-            std::fs::read_dir(&done_dir).map_err(|e| QueueError::Io(e.to_string()))?;
+        let entries = std::fs::read_dir(&done_dir).map_err(|e| QueueError::Io(e.to_string()))?;
 
         for entry in entries {
             let entry = entry.map_err(|e| QueueError::Io(e.to_string()))?;
@@ -294,8 +293,8 @@ impl Queue for RfbmqAdapter {
 
     async fn read_done_body(&self, id: &str) -> Result<String, QueueError> {
         let done_path = self.queue.root().join("done").join(format!("{id}.md"));
-        let msg = Message::from_file(&done_path)
-            .map_err(|e| QueueError::NotFound(e.to_string()))?;
+        let msg =
+            Message::from_file(&done_path).map_err(|e| QueueError::NotFound(e.to_string()))?;
         Ok(msg.body)
     }
 
@@ -493,7 +492,11 @@ mod tests {
         adapter.nack(&claimed).await.unwrap();
 
         // Message should be back in pending
-        let reclaimed = adapter.pop().await.unwrap().expect("expected requeued message");
+        let reclaimed = adapter
+            .pop()
+            .await
+            .unwrap()
+            .expect("expected requeued message");
         assert_eq!(reclaimed.body, "retry me");
         adapter.ack(&reclaimed).await.unwrap();
     }

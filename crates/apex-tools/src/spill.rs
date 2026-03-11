@@ -189,11 +189,7 @@ fn compute_stats(output: &str) -> OutputStats {
     let total_lines = output.lines().count() as u64;
     let total_bytes = output.len() as u64;
 
-    let patterns_to_check = [
-        ("ERROR", "error"),
-        ("WARNING", "warning"),
-        ("FAIL", "fail"),
-    ];
+    let patterns_to_check = [("ERROR", "error"), ("WARNING", "warning"), ("FAIL", "fail")];
 
     let mut patterns = Vec::new();
     for (label, needle) in &patterns_to_check {
@@ -253,7 +249,10 @@ mod tests {
     #[test]
     fn tail_only_strategy() {
         let (_dir, mgr) = temp_dir();
-        let big = (1..=100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let big = (1..=100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let result = mgr
             .spill_if_needed(&big, 100, SpillStrategy::TailOnly, 5, 5)
             .unwrap();

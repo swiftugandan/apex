@@ -5,8 +5,8 @@ use std::thread;
 
 use filetime::{set_file_mtime, FileTime};
 use rfbmq_core::{
-    parse_file, parse_headers, Error, FsyncMode, Message, MessageId, Priority, Queue,
-    ID_LEN, VERSION,
+    parse_file, parse_headers, Error, FsyncMode, Message, MessageId, Priority, Queue, ID_LEN,
+    VERSION,
 };
 use tempfile::TempDir;
 
@@ -471,7 +471,9 @@ fn test_reap_ignores_malformed() {
     q.set_lease_timeout(1);
 
     // Malformed file (non-numeric prefix)
-    let malformed = q.root().join("processing/abc.deadbeef01234567890abcdef01234567.md");
+    let malformed = q
+        .root()
+        .join("processing/abc.deadbeef01234567890abcdef01234567.md");
     fs::write(&malformed, "malformed").unwrap();
 
     // Valid expired file — write a proper message so parse_file works in fail()
@@ -594,7 +596,10 @@ fn test_timestamp_stripping_lifecycle() {
     // So we need 4 nacks: retry goes 1,2,3,4 → 4 > 3 → dead-lettered.
     let id3 = push_msg(&q, "DeadLetter");
     for _ in 0..(q.max_retries() + 1) {
-        let c = q.dequeue().unwrap().expect("should have message to dequeue");
+        let c = q
+            .dequeue()
+            .unwrap()
+            .expect("should have message to dequeue");
         q.fail(&c).unwrap();
     }
     let fname = format!("{}.md", id3);
@@ -738,7 +743,11 @@ fn test_claim_timestamp_precision() {
     let name = claimed.path().file_name().unwrap().to_string_lossy();
     let stem = name.strip_suffix(".md").unwrap();
     let ts_part = &stem[..stem.find('.').unwrap()];
-    assert!(ts_part.len() >= 18, "timestamp '{}' should be >= 18 digits", ts_part);
+    assert!(
+        ts_part.len() >= 18,
+        "timestamp '{}' should be >= 18 digits",
+        ts_part
+    );
 }
 
 // ── 28. depth 100 ───────────────────────────────────────────────────────
@@ -899,8 +908,16 @@ fn test_reap_orphan_detection() {
     thread::sleep(std::time::Duration::from_secs(2));
     q.reap().unwrap();
 
-    assert_eq!(count_files(&q.root().join("processing")), 0, "orphan in processing removed");
-    assert_eq!(count_files(&q.root().join("pending")), 1, "pending copy preserved");
+    assert_eq!(
+        count_files(&q.root().join("processing")),
+        0,
+        "orphan in processing removed"
+    );
+    assert_eq!(
+        count_files(&q.root().join("pending")),
+        1,
+        "pending copy preserved"
+    );
 }
 
 // ── 35. concurrent pop heavy ────────────────────────────────────────────
@@ -1020,7 +1037,10 @@ fn test_serialize_roundtrip() {
         m.header.tags = vec!["a".into(), "b".into()];
         m.header.correlation_id = Some("corr-1".into());
         m.header.reply_to = Some("/reply/path".into());
-        m.header.depends_on = vec!["de01de01de01de01de01de01de01de01".parse().unwrap(), "de02de02de02de02de02de02de02de02".parse().unwrap()];
+        m.header.depends_on = vec![
+            "de01de01de01de01de01de01de01de01".parse().unwrap(),
+            "de02de02de02de02de02de02de02de02".parse().unwrap(),
+        ];
         m.header.custom = vec!["key1: val1".into(), "key2: val2".into()];
     });
 
@@ -1034,8 +1054,14 @@ fn test_serialize_roundtrip() {
     assert_eq!(msg.header.correlation_id.as_deref(), Some("corr-1"));
     assert_eq!(msg.header.reply_to.as_deref(), Some("/reply/path"));
     assert_eq!(msg.header.depends_on.len(), 2);
-    assert_eq!(msg.header.depends_on[0].as_str(), "de01de01de01de01de01de01de01de01");
-    assert_eq!(msg.header.depends_on[1].as_str(), "de02de02de02de02de02de02de02de02");
+    assert_eq!(
+        msg.header.depends_on[0].as_str(),
+        "de01de01de01de01de01de01de01de01"
+    );
+    assert_eq!(
+        msg.header.depends_on[1].as_str(),
+        "de02de02de02de02de02de02de02de02"
+    );
     assert!(msg.header.custom.contains(&"key1: val1".to_string()));
     assert!(msg.header.custom.contains(&"key2: val2".to_string()));
     assert_eq!(msg.body, "Body text\nLine 2");
@@ -1111,9 +1137,13 @@ fn test_message_id_from_str() {
     // Too short
     assert!("aabb".parse::<MessageId>().is_err());
     // Non-hex
-    assert!("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".parse::<MessageId>().is_err());
+    assert!("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        .parse::<MessageId>()
+        .is_err());
     // Too long
-    assert!("aabbccdd11223344aabbccdd11223344aa".parse::<MessageId>().is_err());
+    assert!("aabbccdd11223344aabbccdd11223344aa"
+        .parse::<MessageId>()
+        .is_err());
 }
 
 // ── 45. Message FromStr ─────────────────────────────────────────────────
@@ -1122,7 +1152,10 @@ fn test_message_id_from_str() {
 fn test_message_from_str() {
     let content = "Id: aabbccdd11223344aabbccdd11223344\nCreated-At: 2024-01-01T00:00:00.000000000Z\nCreated-By: test\nPriority: normal\nRetry-Count: 0\nTTL: 0\n\nHello body";
     let msg: Message = content.parse().unwrap();
-    assert_eq!(msg.header.id.as_ref().unwrap().as_str(), "aabbccdd11223344aabbccdd11223344");
+    assert_eq!(
+        msg.header.id.as_ref().unwrap().as_str(),
+        "aabbccdd11223344aabbccdd11223344"
+    );
     assert_eq!(msg.body, "Hello body");
 }
 
@@ -1132,9 +1165,15 @@ fn test_message_from_str() {
 fn test_claimed_message_from_path() {
     use rfbmq_core::ClaimedMessage;
 
-    let claimed = ClaimedMessage::from_path("/some/path/0000000001000000000.aabbccdd11223344aabbccdd11223344.md").unwrap();
+    let claimed = ClaimedMessage::from_path(
+        "/some/path/0000000001000000000.aabbccdd11223344aabbccdd11223344.md",
+    )
+    .unwrap();
     assert_eq!(claimed.id().as_str(), "aabbccdd11223344aabbccdd11223344");
-    assert_eq!(claimed.to_string(), "/some/path/0000000001000000000.aabbccdd11223344aabbccdd11223344.md");
+    assert_eq!(
+        claimed.to_string(),
+        "/some/path/0000000001000000000.aabbccdd11223344aabbccdd11223344.md"
+    );
 
     // Invalid path
     assert!(ClaimedMessage::from_path("/bad/path.txt").is_err());

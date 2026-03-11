@@ -39,7 +39,9 @@ pub async fn execute(call: &ToolCall, spill: &SpillManager) -> Result<ToolResult
         .as_str()
         .ok_or_else(|| ToolError::InvalidInput("missing 'command' field".into()))?;
 
-    let max_output = call.input["max_output"].as_u64().unwrap_or(DEFAULT_MAX_OUTPUT_BYTES as u64) as usize;
+    let max_output = call.input["max_output"]
+        .as_u64()
+        .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES as u64) as usize;
     let grep_pattern = call.input["grep"].as_str();
     let tail_n = call.input["tail"].as_u64().map(|n| n as usize);
     let max_lines = call.input["max_lines"].as_u64().map(|n| n as usize);
@@ -129,29 +131,28 @@ pub async fn execute(call: &ToolCall, spill: &SpillManager) -> Result<ToolResult
             }
 
             // Check if we need to spill
-            let (final_stdout, spill_path, stats, truncated) =
-                if stdout.len() > max_output {
-                    if let Some(spill_result) = spill.spill_if_needed(
-                        &stdout,
-                        max_output,
-                        DEFAULT_SPILL_STRATEGY,
-                        DEFAULT_SPILL_HEAD_LINES,
-                        DEFAULT_SPILL_TAIL_LINES,
-                    ) {
-                        (
-                            spill_result.envelope,
-                            Some(spill_result.path),
-                            Some(spill_result.stats),
-                            true,
-                        )
-                    } else {
-                        // Spill failed, fall back to truncation
-                        let t = apex_core::truncate_str(&stdout, max_output);
-                        (t.to_string(), None, None, true)
-                    }
+            let (final_stdout, spill_path, stats, truncated) = if stdout.len() > max_output {
+                if let Some(spill_result) = spill.spill_if_needed(
+                    &stdout,
+                    max_output,
+                    DEFAULT_SPILL_STRATEGY,
+                    DEFAULT_SPILL_HEAD_LINES,
+                    DEFAULT_SPILL_TAIL_LINES,
+                ) {
+                    (
+                        spill_result.envelope,
+                        Some(spill_result.path),
+                        Some(spill_result.stats),
+                        true,
+                    )
                 } else {
-                    (stdout, None, None, false)
-                };
+                    // Spill failed, fall back to truncation
+                    let t = apex_core::truncate_str(&stdout, max_output);
+                    (t.to_string(), None, None, true)
+                }
+            } else {
+                (stdout, None, None, false)
+            };
 
             let overall_truncated = truncated || stderr_truncated;
 
@@ -287,7 +288,8 @@ mod tests {
     #[tokio::test]
     async fn grep_filter() {
         let (_dir, spill) = temp_spill();
-        let call = make_call(json!({"command": "printf 'apple\\nbanana\\napricot\\n'", "grep": "ap"}));
+        let call =
+            make_call(json!({"command": "printf 'apple\\nbanana\\napricot\\n'", "grep": "ap"}));
         let result = execute(&call, &spill).await.unwrap();
         let stdout = result.output["stdout"].as_str().unwrap();
         assert!(stdout.contains("apple"));
@@ -329,7 +331,10 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(result.is_error);
         assert_eq!(result.output["timed_out"], true);
-        assert!(result.output["error"].as_str().unwrap().contains("timed out"));
+        assert!(result.output["error"]
+            .as_str()
+            .unwrap()
+            .contains("timed out"));
         // Should complete in well under 10s (we gave 1s timeout)
         assert!(elapsed.as_secs() < 10);
     }

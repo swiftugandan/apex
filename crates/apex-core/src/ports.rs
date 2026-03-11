@@ -1,12 +1,11 @@
 use async_trait::async_trait;
 
-use crate::domain::{
-    CalibrationData, ClaimedTask, CompletionRequest, CompletionResponse, Fact, FactId,
-    HookDef, HookEvent, HookOutcome,
-    QueueDepth, QueueMessage, QueueMessageMeta, ReapResult, Scratchpad, Skill, SkillId,
-    ToolCall, ToolCompletionResponse, ToolDef, ToolResult, ToolSchema,
-};
 use crate::config::RoleProfile;
+use crate::domain::{
+    CalibrationData, ClaimedTask, CompletionRequest, CompletionResponse, Fact, FactId, HookDef,
+    HookEvent, HookOutcome, QueueDepth, QueueMessage, QueueMessageMeta, ReapResult, Scratchpad,
+    Skill, SkillId, ToolCall, ToolCompletionResponse, ToolDef, ToolResult, ToolSchema,
+};
 use crate::error::{LlmError, MemoryError, QueueError, ToolError};
 
 #[async_trait]
@@ -98,11 +97,7 @@ pub trait HookRegistry: Send + Sync {
     /// Execute all hooks for a given event with the provided context data.
     /// Returns a list of outcomes. If any outcome is Block, the caller should
     /// prevent the event from proceeding.
-    async fn dispatch(
-        &self,
-        event: HookEvent,
-        context: &serde_json::Value,
-    ) -> Vec<HookOutcome>;
+    async fn dispatch(&self, event: HookEvent, context: &serde_json::Value) -> Vec<HookOutcome>;
 
     /// Reload hooks from disk.
     fn reload(&mut self) -> Result<(), String>;

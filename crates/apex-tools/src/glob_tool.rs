@@ -43,14 +43,12 @@ pub async fn execute(call: &ToolCall) -> Result<ToolResult, ToolError> {
         .map_err(|e| ToolError::InvalidInput(format!("invalid glob pattern: {e}")))?;
 
     let mut results: Vec<(PathBuf, SystemTime)> = Vec::new();
-    for entry in entries {
-        if let Ok(path) = entry {
-            // Single metadata() call to check file type and get mtime.
-            if let Ok(meta) = path.metadata() {
-                if meta.is_file() {
-                    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                    results.push((path, mtime));
-                }
+    for path in entries.flatten() {
+        // Single metadata() call to check file type and get mtime.
+        if let Ok(meta) = path.metadata() {
+            if meta.is_file() {
+                let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                results.push((path, mtime));
             }
         }
     }
@@ -206,7 +204,10 @@ mod tests {
         let matches = result.output["matches"].as_array().unwrap();
         assert_eq!(matches.len(), 2);
         let first = matches[0].as_str().unwrap();
-        assert!(first.contains("new.txt"), "most recent file should be first");
+        assert!(
+            first.contains("new.txt"),
+            "most recent file should be first"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

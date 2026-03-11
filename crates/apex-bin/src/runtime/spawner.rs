@@ -1,30 +1,106 @@
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use async_trait::async_trait;
 
-use apex_core::config::{CompactionSection, ConsolidationSection, Invariants, MemoryMode, RoleProfile};
+use apex_core::config::{
+    CompactionSection, ConsolidationSection, Invariants, MemoryMode, RoleProfile,
+};
 use apex_core::context::{MessageComposer, TokenEstimator};
-use apex_core::domain::{MessageHeaders, MessageType, QueueMessage};
+use apex_core::domain::{MessageHeaders, MessageType, QueueMessage, ToolCall, ToolDef, ToolResult};
 use apex_core::error::ToolError;
-use apex_core::ports::{HookRegistry, LlmProvider, MemoryStore, Queue, SkillStore, ToolRegistry, WorkingMemory};
+use apex_core::ports::{
+    HookRegistry, LlmProvider, MemoryStore, Queue, SkillStore, SubAgentResult, SubAgentSpawner,
+    ToolRegistry, WorkingMemory,
+};
 
-use apex_core::ports::{SubAgentResult, SubAgentSpawner};
-
+use apex_engine::{
+    worker_loop, ClaimContext, ClaimToolFactory, ProjectPaths, WorkerContext, WorkerLimits,
+};
+use apex_infra::{FsScratchpadStore, RfbmqAdapter, SqliteMemoryStore};
 use apex_tools::FilteredHookRegistry;
 
-use crate::paths::ProjectPaths;
-use crate::registry::{build_static_tools, CompositeToolRegistry, OwnedFilteredToolRegistry};
-use crate::worker::{worker_loop, WorkerContext, WorkerLimits};
+use super::CliClaimToolFactory;
 
-/// Factory closures for creating infra components without depending on apex-infra.
-pub struct InfraFactories {
-    pub queue: Arc<dyn Fn(&std::path::Path) -> Result<Arc<dyn Queue>, String> + Send + Sync>,
-    pub working_memory: Arc<dyn Fn(&std::path::Path) -> Arc<dyn WorkingMemory> + Send + Sync>,
-    pub memory_store: Arc<dyn Fn(&std::path::Path) -> Result<Arc<dyn MemoryStore>, String> + Send + Sync>,
-    pub skill_store: Arc<dyn Fn(&std::path::Path) -> Arc<dyn SkillStore> + Send + Sync>,
+// ── SubAgentRuntimeBuilder ──────────────────────────────────────────
+
+/// Typed builder for sub-agent infrastructure components, replacing
+/// the old `InfraFactories` closure bag.  Lives in the assembly crate
+/// where concrete infra types are directly available.
+pub struct SubAgentRuntimeBuilder;
+
+impl SubAgentRuntimeBuilder {
+    pub fn build_queue(&self, path: &Path) -> Result<Arc<dyn Queue>, String> {
+        RfbmqAdapter::init(path)
+            .map(|a| Arc::new(a) as Arc<dyn Queue>)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn build_working_memory(&self, path: &Path) -> Arc<dyn WorkingMemory> {
+        Arc::new(FsScratchpadStore::new(path.to_path_buf()))
+    }
+
+    pub fn build_memory_store(&self, path: &Path) -> Result<Arc<dyn MemoryStore>, String> {
+        SqliteMemoryStore::open(path)
+            .map(|s| Arc::new(s) as Arc<dyn MemoryStore>)
+            .map_err(|e| e.to_string())
+    }
 }
+
+// ── FilteredToolRegistryBox ─────────────────────────────────────────
+//
+// Generic filter wrapper for any `Box<dyn ToolRegistry>`.
+// Used by `FilteredClaimToolFactory` to filter the *combined* registry
+// output (static + per-claim memory + queue tools).
+
+struct FilteredToolRegistryBox {
+    inner: Box<dyn ToolRegistry>,
+    allowed: HashSet<String>,
+}
+
+#[async_trait]
+impl ToolRegistry for FilteredToolRegistryBox {
+    fn definitions(&self) -> Vec<ToolDef> {
+        self.inner
+            .definitions()
+            .into_iter()
+            .filter(|d| self.allowed.contains(&d.schema.name))
+            .collect()
+    }
+
+    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        if !self.allowed.contains(&call.name) {
+            return Err(ToolError::UnknownTool(call.name.clone()));
+        }
+        self.inner.execute(call).await
+    }
+}
+
+// ── FilteredClaimToolFactory ────────────────────────────────────────
+
+/// Wraps a `CliClaimToolFactory` and applies an allow-list filter to
+/// the *combined* registry it produces.  This ensures role-based
+/// filtering covers all tools — static, per-claim memory, and queue —
+/// not just static tools (fixing the gap addressed in 3C.3).
+struct FilteredClaimToolFactory {
+    inner: CliClaimToolFactory,
+    allowed: HashSet<String>,
+}
+
+#[async_trait]
+impl ClaimToolFactory for FilteredClaimToolFactory {
+    async fn build(&self, ctx: &ClaimContext) -> Box<dyn ToolRegistry> {
+        let registry = self.inner.build(ctx).await;
+        Box::new(FilteredToolRegistryBox {
+            inner: registry,
+            allowed: self.allowed.clone(),
+        })
+    }
+}
+
+// ── SpawnerConfig ───────────────────────────────────────────────────
 
 /// Static configuration for sub-agent spawning.
 pub struct SpawnerConfig {
@@ -39,8 +115,12 @@ pub struct SpawnerConfig {
     pub consolidation: ConsolidationSection,
 }
 
-/// Concrete SubAgentSpawner that runs sub-agents in-process with their own
-/// queue, working memory, and (optionally isolated) long-term memory.
+// ── InProcessSpawner ────────────────────────────────────────────────
+
+/// Concrete `SubAgentSpawner` that runs sub-agents in-process with
+/// their own queue, working memory, and (optionally isolated) long-term
+/// memory.  Uses `SubAgentRuntimeBuilder` to create infra components
+/// and `CliClaimToolFactory` for per-claim tool assembly.
 pub struct InProcessSpawner {
     pub project_paths: ProjectPaths,
     pub parent_long_term: Arc<dyn MemoryStore>,
@@ -48,8 +128,9 @@ pub struct InProcessSpawner {
     pub llm: Arc<dyn LlmProvider>,
     pub estimator: Arc<Mutex<TokenEstimator>>,
     pub config: SpawnerConfig,
-    pub infra: Arc<InfraFactories>,
-    /// Optional hooks from the parent agent. Only hooks with `propagate: true` are inherited.
+    pub runtime: Arc<SubAgentRuntimeBuilder>,
+    /// Optional hooks from the parent agent.  Only hooks with
+    /// `propagate: true` are inherited by sub-agents.
     pub hooks: Option<Arc<dyn HookRegistry>>,
 }
 
@@ -64,33 +145,46 @@ impl SubAgentSpawner for InProcessSpawner {
         let short_uuid = apex_core::generate_id(&role.name);
 
         // 1. Create ephemeral queue
-        let sub_queue_dir = self.project_paths.queues_dir.join(format!("sub-{}", short_uuid));
-        let sub_queue = (self.infra.queue)(&sub_queue_dir)
+        let sub_queue_dir = self
+            .project_paths
+            .queues_dir
+            .join(format!("sub-{}", short_uuid));
+        let sub_queue = self
+            .runtime
+            .build_queue(&sub_queue_dir)
             .map_err(|e| ToolError::Execution(format!("failed to create sub-agent queue: {e}")))?;
 
         // 2. Create ephemeral working memory directory
-        let sub_memory_dir = self.project_paths.working_memory.join(format!("sub-{}", short_uuid));
-        tokio::fs::create_dir_all(&sub_memory_dir).await
-            .map_err(|e| ToolError::Execution(format!("failed to create sub-agent memory dir: {e}")))?;
-        let sub_memory = (self.infra.working_memory)(&sub_memory_dir);
+        let sub_memory_dir = self
+            .project_paths
+            .working_memory
+            .join(format!("sub-{}", short_uuid));
+        tokio::fs::create_dir_all(&sub_memory_dir)
+            .await
+            .map_err(|e| {
+                ToolError::Execution(format!("failed to create sub-agent memory dir: {e}"))
+            })?;
+        let sub_memory = self.runtime.build_working_memory(&sub_memory_dir);
 
         // 3. Resolve long-term memory based on role's memory mode
         let sub_long_term: Arc<dyn MemoryStore> = match role.memory {
             MemoryMode::Shared => Arc::clone(&self.parent_long_term),
             MemoryMode::Isolated => {
-                let isolated_dir = self.project_paths.long_term_dir.join(format!("sub-{}", short_uuid));
+                let isolated_dir = self
+                    .project_paths
+                    .long_term_dir
+                    .join(format!("sub-{}", short_uuid));
                 let db_path = isolated_dir.join("memory.db");
-                (self.infra.memory_store)(&db_path)
-                    .map_err(|e| ToolError::Execution(format!("failed to create isolated memory: {e}")))?
+                self.runtime.build_memory_store(&db_path).map_err(|e| {
+                    ToolError::Execution(format!("failed to create isolated memory: {e}"))
+                })?
             }
         };
 
         // 3b. Skills are always shared (they're files on disk)
         let sub_skills: Arc<dyn SkillStore> = Arc::clone(&self.parent_skills);
 
-        // 4. Resolve LLM — use role's model override if different
-        // For now, we always use the parent's LLM since creating a new provider
-        // requires infra knowledge. The model override would need the factory pattern too.
+        // 4. Resolve LLM — use parent's for now (model override needs factory pattern)
         let sub_llm = Arc::clone(&self.llm);
 
         // 5. Build a new spawner for sub-sub-agents (with decremented depth)
@@ -122,12 +216,12 @@ impl SubAgentSpawner for InProcessSpawner {
                 compaction: self.config.compaction.clone(),
                 consolidation: self.config.consolidation.clone(),
             },
-            infra: Arc::clone(&self.infra),
+            runtime: Arc::clone(&self.runtime),
             hooks: sub_hooks.clone(),
         });
 
         // 6. Build static tools for sub-agent
-        let sub_static_tools = build_static_tools(
+        let sub_static_tools = super::build_static_tools(
             &self.project_paths,
             sub_memory.clone(),
             sub_long_term.clone(),
@@ -138,21 +232,41 @@ impl SubAgentSpawner for InProcessSpawner {
             sub_depth,
         );
 
-        // 7. Apply tool filtering if the role restricts tools or delegation
+        // 7. Build claim tool factory, with role-based filtering if needed.
+        //
+        //    3C.3: Filtering wraps the *combined* registry (static + per-claim
+        //    memory + queue tools) via FilteredClaimToolFactory, so queue tools
+        //    and per-claim memory tools are also subject to role restrictions.
+        let base_factory = CliClaimToolFactory {
+            static_tools: Arc::clone(&sub_static_tools),
+            estimator: Arc::clone(&self.estimator),
+        };
+
         let needs_filtering = !role.tools.is_empty() || !role.can_delegate;
-        let filtered_static_tools: Arc<CompositeToolRegistry> = if needs_filtering {
+        let claim_factory: Arc<dyn ClaimToolFactory> = if needs_filtering {
             let mut allowed: HashSet<String> = if !role.tools.is_empty() {
                 role.tools.iter().cloned().collect()
             } else {
-                sub_static_tools.definitions().iter().map(|d| d.schema.name.clone()).collect()
+                // Start with all static tool names
+                let mut names: HashSet<String> = sub_static_tools
+                    .definitions()
+                    .iter()
+                    .map(|d| d.schema.name.clone())
+                    .collect();
+                // Include per-claim queue tool names that aren't in static tools
+                names.insert("decompose_goal".to_string());
+                names.insert("queue_read_done".to_string());
+                names
             };
             if !role.can_delegate {
                 allowed.remove("delegate");
             }
-            let filtered = OwnedFilteredToolRegistry::new(sub_static_tools, allowed);
-            Arc::new(CompositeToolRegistry::new(vec![Box::new(filtered)]))
+            Arc::new(FilteredClaimToolFactory {
+                inner: base_factory,
+                allowed,
+            })
         } else {
-            sub_static_tools
+            Arc::new(base_factory)
         };
 
         // 8. Push task as Goal to sub-agent's queue
@@ -168,12 +282,15 @@ impl SubAgentSpawner for InProcessSpawner {
             },
             body,
         };
-        sub_queue.push(msg).await.map_err(|e| ToolError::Execution(format!("failed to push goal: {e}")))?;
+        sub_queue
+            .push(msg)
+            .await
+            .map_err(|e| ToolError::Execution(format!("failed to push goal: {e}")))?;
 
         // 9. Build WorkerContext and spawn concurrent workers
         let ctx = WorkerContext {
             queue: sub_queue.clone(),
-            tools: filtered_static_tools,
+            claim_tool_factory: claim_factory,
             llm: sub_llm,
             memory: sub_memory,
             long_term: sub_long_term,
@@ -197,9 +314,9 @@ impl SubAgentSpawner for InProcessSpawner {
         let mut handles = Vec::with_capacity(num_workers);
         for worker_id in 0..num_workers {
             let ctx = ctx.clone();
-            handles.push(tokio::spawn(async move {
-                worker_loop(ctx, worker_id).await
-            }));
+            handles.push(tokio::spawn(
+                async move { worker_loop(ctx, worker_id).await },
+            ));
         }
         for handle in handles {
             handle
@@ -209,9 +326,13 @@ impl SubAgentSpawner for InProcessSpawner {
         }
 
         // 10. Collect results from done/ and failed/
-        let done_metas = sub_queue.list_with_state("done").await
+        let done_metas = sub_queue
+            .list_with_state("done")
+            .await
             .map_err(|e| ToolError::Execution(format!("failed to list done: {e}")))?;
-        let failed_metas = sub_queue.list_with_state("failed").await
+        let failed_metas = sub_queue
+            .list_with_state("failed")
+            .await
             .map_err(|e| ToolError::Execution(format!("failed to list failed: {e}")))?;
 
         let mut done_bodies = Vec::new();
@@ -240,7 +361,10 @@ impl SubAgentSpawner for InProcessSpawner {
         let _ = tokio::fs::remove_dir_all(&sub_memory_dir).await;
         // Clean up isolated long-term memory if used
         if role.memory == MemoryMode::Isolated {
-            let isolated_dir = self.project_paths.long_term_dir.join(format!("sub-{}", short_uuid));
+            let isolated_dir = self
+                .project_paths
+                .long_term_dir
+                .join(format!("sub-{}", short_uuid));
             let _ = tokio::fs::remove_dir_all(&isolated_dir).await;
         }
 

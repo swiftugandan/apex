@@ -25,7 +25,10 @@ pub struct ValidationReport {
 
 impl ValidationReport {
     pub fn is_ok(&self) -> bool {
-        !self.issues.iter().any(|i| i.severity == IssueSeverity::Error)
+        !self
+            .issues
+            .iter()
+            .any(|i| i.severity == IssueSeverity::Error)
     }
 
     pub fn errors(&self) -> Vec<&ValidationIssue> {
@@ -45,7 +48,10 @@ impl ValidationReport {
                 IssueSeverity::Error => "ERROR",
                 IssueSeverity::Warning => "WARN ",
             };
-            out.push_str(&format!("[{}] {}: {}\n", prefix, issue.field, issue.message));
+            out.push_str(&format!(
+                "[{}] {}: {}\n",
+                prefix, issue.field, issue.message
+            ));
         }
         out
     }

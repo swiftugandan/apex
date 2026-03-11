@@ -192,7 +192,10 @@ impl Queue {
     }
 
     pub fn complete(&self, claimed: &ClaimedMessage) -> Result<()> {
-        let done_path = self.root().join(DIR_DONE).join(format!("{}.md", claimed.id()));
+        let done_path = self
+            .root()
+            .join(DIR_DONE)
+            .join(format!("{}.md", claimed.id()));
         durable_rename(claimed.path(), &done_path, self.fsync_mode())?;
         Ok(())
     }
@@ -265,8 +268,7 @@ impl Queue {
             };
 
             // Check if orphan: ID already exists in pending/ or failed/
-            let is_orphan =
-                pending_ids.contains(&id) || self.id_exists_in_dir(DIR_FAILED, &id)?;
+            let is_orphan = pending_ids.contains(&id) || self.id_exists_in_dir(DIR_FAILED, &id)?;
 
             let claimed_path = processing_dir.join(name);
             if is_orphan {
@@ -548,9 +550,8 @@ fn extract_ts_from_filename(filename: &str) -> Option<i64> {
 
 /// Convert Created-At ISO 8601 string to filename timestamp format (zero-padded)
 fn created_at_to_filename_ts(created_at: &str) -> Result<String> {
-    let dt = parse_created_at(created_at).ok_or_else(|| {
-        Error::Parse(format!("cannot parse Created-At: {}", created_at))
-    })?;
+    let dt = parse_created_at(created_at)
+        .ok_or_else(|| Error::Parse(format!("cannot parse Created-At: {}", created_at)))?;
     Ok(format_ts(dt))
 }
 
@@ -559,9 +560,7 @@ fn parse_created_at(created_at: &str) -> Option<chrono::DateTime<Utc>> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(created_at) {
         return Some(dt.with_timezone(&Utc));
     }
-    if let Ok(ndt) =
-        chrono::NaiveDateTime::parse_from_str(created_at, "%Y-%m-%dT%H:%M:%S%.fZ")
-    {
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(created_at, "%Y-%m-%dT%H:%M:%S%.fZ") {
         return Some(ndt.and_utc());
     }
     None

@@ -42,13 +42,13 @@ pub async fn execute(call: &ToolCall) -> Result<ToolResult, ToolError> {
 }
 
 async fn execute_str_replace(call: &ToolCall, path: &str) -> Result<ToolResult, ToolError> {
-    let old_string = call.input["old_string"]
-        .as_str()
-        .ok_or_else(|| ToolError::InvalidInput("missing 'old_string' field for str_replace".into()))?;
+    let old_string = call.input["old_string"].as_str().ok_or_else(|| {
+        ToolError::InvalidInput("missing 'old_string' field for str_replace".into())
+    })?;
 
-    let new_string = call.input["new_string"]
-        .as_str()
-        .ok_or_else(|| ToolError::InvalidInput("missing 'new_string' field for str_replace".into()))?;
+    let new_string = call.input["new_string"].as_str().ok_or_else(|| {
+        ToolError::InvalidInput("missing 'new_string' field for str_replace".into())
+    })?;
 
     let replace_all = call.input["replace_all"].as_bool().unwrap_or(false);
 

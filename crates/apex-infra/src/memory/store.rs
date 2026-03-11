@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
-use async_trait::async_trait;
 use apex_core::domain::Scratchpad;
 use apex_core::error::MemoryError;
 use apex_core::ports::WorkingMemory;
+use async_trait::async_trait;
 
 pub struct FsScratchpadStore {
     base_dir: PathBuf,
@@ -74,7 +74,7 @@ impl WorkingMemory for FsScratchpadStore {
             .map_err(|e| MemoryError::Io(e.to_string()))?
         {
             let path = entry.path();
-            if !path.extension().is_some_and(|ext| ext == "md") {
+            if path.extension().is_none_or(|ext| ext != "md") {
                 continue;
             }
             let metadata = entry
@@ -196,14 +196,19 @@ mod tests {
         let store = FsScratchpadStore::new(dir.path().to_path_buf());
 
         // Create scratchpads
-        store.save(&Scratchpad::new("old-job", "old")).await.unwrap();
-        store.save(&Scratchpad::new("new-job", "new")).await.unwrap();
+        store
+            .save(&Scratchpad::new("old-job", "old"))
+            .await
+            .unwrap();
+        store
+            .save(&Scratchpad::new("new-job", "new"))
+            .await
+            .unwrap();
 
         // Backdate the old one to 10 days ago
         let old_path = dir.path().join("old-job.md");
         let ten_days_ago = SystemTime::now() - Duration::from_secs(10 * 86400);
-        let times = fs::FileTimes::new()
-            .set_modified(ten_days_ago);
+        let times = fs::FileTimes::new().set_modified(ten_days_ago);
         let file = fs::File::options().write(true).open(&old_path).unwrap();
         file.set_times(times).unwrap();
 

@@ -12,7 +12,6 @@ apex-core = { path = "../apex-core" }
 apex-engine = { path = "../apex-engine" }
 apex-tools = { path = "../apex-tools" }
 apex-infra = { path = "../apex-infra" }
-rfbmq-core = { path = "../../vendor/rfbmq-core" }
 anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true

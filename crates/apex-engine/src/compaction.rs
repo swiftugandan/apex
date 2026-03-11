@@ -59,7 +59,9 @@ pub(crate) async fn compact_messages(
                 ContentBlock::ToolUse { name, .. } => {
                     conversation_text.push_str(&format!("[{role_label}]: Called tool: {name}\n\n"));
                 }
-                ContentBlock::ToolResult { content, is_error, .. } => {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
                     let label = if *is_error { "error" } else { "ok" };
                     conversation_text.push_str(&format!("[Tool result ({label})]: {content}\n\n"));
                 }
@@ -90,9 +92,7 @@ pub(crate) async fn compact_messages(
             if text.is_empty() {
                 return Err("LLM returned empty summary".into());
             }
-            format!(
-                "[Conversation compacted: {compacted_count} messages summarized]\n\n{text}"
-            )
+            format!("[Conversation compacted: {compacted_count} messages summarized]\n\n{text}")
         }
         Err(err) => {
             return Err(format!("LLM summary failed: {err}"));
@@ -102,7 +102,8 @@ pub(crate) async fn compact_messages(
     let preserve_count = messages.len() - split_point;
     let mut result = Vec::with_capacity(1 + 1 + preserve_count);
     result.push(messages[0].clone()); // original task (User)
-    result.push(ChatMessage {          // summary (Assistant)
+    result.push(ChatMessage {
+        // summary (Assistant)
         role: MessageRole::Assistant,
         content: vec![ContentBlock::Text { text: summary_text }],
     });
@@ -148,24 +149,34 @@ mod tests {
 
     impl MockLlmProvider {
         fn success(text: &str) -> Self {
-            Self { response: Ok(text.to_string()) }
+            Self {
+                response: Ok(text.to_string()),
+            }
         }
 
         fn error() -> Self {
-            Self { response: Err(LlmError::Api("mock error".into())) }
+            Self {
+                response: Err(LlmError::Api("mock error".into())),
+            }
         }
     }
 
     #[async_trait]
     impl LlmProvider for MockLlmProvider {
-        async fn complete(&self, _req: CompletionRequest<'_>) -> Result<CompletionResponse, LlmError> {
+        async fn complete(
+            &self,
+            _req: CompletionRequest<'_>,
+        ) -> Result<CompletionResponse, LlmError> {
             match &self.response {
                 Ok(text) => Ok(CompletionResponse {
                     message: ChatMessage {
                         role: MessageRole::Assistant,
                         content: vec![ContentBlock::Text { text: text.clone() }],
                     },
-                    usage: TokenUsage { input_tokens: 100, output_tokens: 50 },
+                    usage: TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: 50,
+                    },
                     stop_reason: StopReason::EndTurn,
                 }),
                 Err(e) => Err(LlmError::Api(e.to_string())),
@@ -180,8 +191,12 @@ mod tests {
             unimplemented!("not needed for compaction tests")
         }
 
-        fn model_id(&self) -> &str { "mock-model" }
-        fn context_window(&self) -> usize { 200_000 }
+        fn model_id(&self) -> &str {
+            "mock-model"
+        }
+        fn context_window(&self) -> usize {
+            200_000
+        }
     }
 
     // ── compact_messages tests ──────────────────────────────────────
@@ -189,7 +204,9 @@ mod tests {
     #[tokio::test]
     async fn compact_uses_llm_summary() {
         let messages = make_messages(20);
-        let llm = MockLlmProvider::success("## Summary\n- Worked on the original task\n- Used shell_exec to run tests");
+        let llm = MockLlmProvider::success(
+            "## Summary\n- Worked on the original task\n- Used shell_exec to run tests",
+        );
 
         let result = compact_messages(&messages, &llm, 3, 1024).await;
 
@@ -209,7 +226,8 @@ mod tests {
         assert_eq!(compacted[1].role, MessageRole::Assistant);
         for i in 1..compacted.len() {
             assert_ne!(
-                compacted[i].role, compacted[i - 1].role,
+                compacted[i].role,
+                compacted[i - 1].role,
                 "alternation violated at index {i}"
             );
         }
@@ -258,7 +276,162 @@ mod tests {
         // Verify alternation holds
         for i in 1..compacted.len() {
             assert_ne!(
-                compacted[i].role, compacted[i - 1].role,
+                compacted[i].role,
+                compacted[i - 1].role,
+                "alternation violated at index {i}"
+            );
+        }
+    }
+
+    // ── Characterization tests — compaction logic ──
+    //
+    // These tests pin the structural contract of `compact_messages()`:
+    //   1. First message (original task) is always preserved verbatim.
+    //   2. Second message is an Assistant summary containing the compacted count.
+    //   3. Preserved tail messages are appended unchanged.
+    //   4. Strict User/Assistant alternation is maintained throughout.
+    //   5. The returned `count` equals the number of middle messages summarized.
+    //
+    // Phase 2 changes the *trigger* mechanism (auto-compaction instead of a
+    // virtual tool) but must not change these structural guarantees.
+
+    #[tokio::test]
+    async fn characterization_compaction_preserves_first_message_verbatim() {
+        let messages = make_messages(10);
+        let llm = MockLlmProvider::success("Summary of work");
+
+        let (compacted, _count) = compact_messages(&messages, &llm, 2, 1024)
+            .await
+            .expect("compaction should succeed");
+
+        assert_eq!(compacted[0].role, MessageRole::User);
+        assert_eq!(
+            compacted[0].text(),
+            "Original task",
+            "first message must be preserved exactly as the original task"
+        );
+    }
+
+    #[tokio::test]
+    async fn characterization_compaction_summary_contains_count_marker() {
+        let messages = make_messages(10);
+        let llm = MockLlmProvider::success("Summary of conversation");
+
+        let (compacted, count) = compact_messages(&messages, &llm, 2, 1024)
+            .await
+            .expect("compaction should succeed");
+
+        assert!(count > 0, "should report non-zero compacted count");
+        let summary_text = compacted[1].text();
+        assert!(
+            summary_text.contains(&format!("{count} messages summarized")),
+            "summary should contain the compacted count marker, got: {summary_text}"
+        );
+        assert_eq!(
+            compacted[1].role,
+            MessageRole::Assistant,
+            "summary must be an Assistant message for proper alternation"
+        );
+    }
+
+    #[tokio::test]
+    async fn characterization_compaction_preserved_tail_is_unchanged() {
+        let messages = make_messages(8); // 17 messages total
+        let llm = MockLlmProvider::success("Summary");
+        let preserve_turns = 2;
+
+        let (compacted, count) = compact_messages(&messages, &llm, preserve_turns, 1024)
+            .await
+            .expect("compaction should succeed");
+
+        // The compacted tail = everything after [original_task, summary].
+        // The split point may shift by +1 to maintain User-first alternation,
+        // so we derive the actual tail from the returned count instead of
+        // assuming an exact `preserve_turns * 2` length.
+        let actual_split = count + 1; // messages[1..split_point] were summarized
+        let original_tail = &messages[actual_split..];
+        let compacted_tail = &compacted[2..]; // skip [original_task, summary]
+
+        assert_eq!(
+            compacted_tail.len(),
+            original_tail.len(),
+            "preserved tail length must match: expected {} got {}",
+            original_tail.len(),
+            compacted_tail.len()
+        );
+
+        for (i, (orig, comp)) in original_tail.iter().zip(compacted_tail.iter()).enumerate() {
+            assert_eq!(orig.role, comp.role, "tail message {i} role mismatch");
+            assert_eq!(orig.text(), comp.text(), "tail message {i} text mismatch");
+        }
+    }
+
+    #[tokio::test]
+    async fn characterization_compaction_count_equals_summarized_middle() {
+        let messages = make_messages(10); // 21 messages
+        let llm = MockLlmProvider::success("Summary");
+        let preserve_turns = 3;
+
+        let (compacted, count) = compact_messages(&messages, &llm, preserve_turns, 1024)
+            .await
+            .expect("compaction should succeed");
+
+        // count = split_point - 1 (we summarize messages[1..split_point])
+        // compacted = 1 (original) + 1 (summary) + preserved tail
+        let preserved_tail_len = compacted.len() - 2;
+        let expected_count = messages.len() - 1 - preserved_tail_len;
+        assert_eq!(
+            count, expected_count,
+            "returned count must equal the number of middle messages that were summarized"
+        );
+    }
+
+    #[tokio::test]
+    async fn characterization_compaction_with_tool_use_blocks() {
+        // Ensure messages containing ToolUse and ToolResult blocks are serialized
+        // into the summary prompt (i.e. not silently dropped).
+        let mut messages = vec![ChatMessage::user_text("Fix the bug")];
+        messages.push(ChatMessage {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "tu-1".into(),
+                name: "shell_exec".into(),
+                input: serde_json::json!({"cmd": "cargo test"}),
+            }],
+        });
+        messages.push(ChatMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "tu-1".into(),
+                content: "3 tests passed".into(),
+                is_error: false,
+            }],
+        });
+        // Add more pairs to have enough to compact
+        for i in 0..6 {
+            messages.push(ChatMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: format!("Resp {i}"),
+                }],
+            });
+            messages.push(ChatMessage::user_text(format!("Follow {i}")));
+        }
+
+        let llm = MockLlmProvider::success("Ran cargo test, 3 tests passed");
+        let result = compact_messages(&messages, &llm, 2, 1024).await;
+
+        assert!(
+            result.is_ok(),
+            "compaction should handle ToolUse/ToolResult blocks"
+        );
+        let (compacted, count) = result.unwrap();
+        assert!(count > 0);
+        // Alternation must still hold
+        for i in 1..compacted.len() {
+            assert_ne!(
+                compacted[i].role,
+                compacted[i - 1].role,
                 "alternation violated at index {i}"
             );
         }
@@ -271,14 +444,18 @@ mod tests {
         for i in 0..5 {
             messages.push(ChatMessage {
                 role: MessageRole::Assistant,
-                content: vec![ContentBlock::Text { text: format!("Resp {i}") }],
+                content: vec![ContentBlock::Text {
+                    text: format!("Resp {i}"),
+                }],
             });
             messages.push(ChatMessage::user_text(format!("Follow {i}")));
         }
         // Add a trailing Assistant message
         messages.push(ChatMessage {
             role: MessageRole::Assistant,
-            content: vec![ContentBlock::Text { text: "Final resp".into() }],
+            content: vec![ContentBlock::Text {
+                text: "Final resp".into(),
+            }],
         });
 
         let llm = MockLlmProvider::success("Summary");
@@ -289,7 +466,8 @@ mod tests {
         // Verify alternation
         for i in 1..compacted.len() {
             assert_ne!(
-                compacted[i].role, compacted[i - 1].role,
+                compacted[i].role,
+                compacted[i - 1].role,
                 "alternation violated at index {i}"
             );
         }

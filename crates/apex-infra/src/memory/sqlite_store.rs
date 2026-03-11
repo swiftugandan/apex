@@ -59,11 +59,13 @@ impl SqliteMemoryStore {
 
         // Populate FTS index for pre-existing databases upgraded to FTS5.
         // Only rebuilds when facts exist but FTS index is empty.
-        let needs_rebuild: bool = conn.query_row(
-            "SELECT (SELECT COUNT(*) FROM facts) > 0 AND (SELECT COUNT(*) FROM facts_fts) = 0",
-            [],
-            |row| row.get(0),
-        ).unwrap_or(false);
+        let needs_rebuild: bool = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM facts) > 0 AND (SELECT COUNT(*) FROM facts_fts) = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
         if needs_rebuild {
             let _ = conn.execute_batch("INSERT INTO facts_fts(facts_fts) VALUES('rebuild');");
         }
@@ -120,8 +122,7 @@ impl MemoryStore for SqliteMemoryStore {
             fact.id.0.clone()
         };
         let now = Self::now_iso();
-        let tags_json =
-            serde_json::to_string(&fact.tags).unwrap_or_else(|_| "[]".to_string());
+        let tags_json = serde_json::to_string(&fact.tags).unwrap_or_else(|_| "[]".to_string());
         let created = if fact.created_at.is_empty() {
             &now
         } else {
@@ -148,8 +149,13 @@ impl MemoryStore for SqliteMemoryStore {
         type FactRow = (String, String, String, f64, String, String, String);
         let map_row = |row: &rusqlite::Row| -> rusqlite::Result<FactRow> {
             Ok((
-                row.get(0)?, row.get(1)?, row.get(2)?,
-                row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?,
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
             ))
         };
 
@@ -163,7 +169,8 @@ impl MemoryStore for SqliteMemoryStore {
                 )
                 .map_err(|e| MemoryError::Database(e.to_string()))?;
 
-            let result = stmt.query_map(rusqlite::params![limit as i64], &map_row)
+            let result = stmt
+                .query_map(rusqlite::params![limit as i64], &map_row)
                 .map_err(|e| MemoryError::Database(e.to_string()))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| MemoryError::Database(e.to_string()));
@@ -188,7 +195,10 @@ impl MemoryStore for SqliteMemoryStore {
                 Ok(rows) => Ok(rows),
                 Err(e) => {
                     eprintln!("warning: FTS5 query failed ({e}), falling back to LIKE");
-                    let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+                    let escaped = query
+                        .replace('\\', "\\\\")
+                        .replace('%', "\\%")
+                        .replace('_', "\\_");
                     let pattern = format!("%{escaped}%");
                     let mut stmt = conn
                         .prepare(
@@ -200,7 +210,8 @@ impl MemoryStore for SqliteMemoryStore {
                         )
                         .map_err(|e| MemoryError::Database(e.to_string()))?;
 
-                    let result = stmt.query_map(rusqlite::params![pattern, limit as i64], &map_row)
+                    let result = stmt
+                        .query_map(rusqlite::params![pattern, limit as i64], &map_row)
                         .map_err(|e| MemoryError::Database(e.to_string()))?
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|e| MemoryError::Database(e.to_string()));

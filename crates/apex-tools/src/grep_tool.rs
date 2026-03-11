@@ -36,7 +36,9 @@ pub async fn execute(call: &ToolCall) -> Result<ToolResult, ToolError> {
 
     let path = call.input["path"].as_str().unwrap_or(".");
     let glob_filter = call.input["glob"].as_str();
-    let output_mode = call.input["output_mode"].as_str().unwrap_or("files_with_matches");
+    let output_mode = call.input["output_mode"]
+        .as_str()
+        .unwrap_or("files_with_matches");
     let context_lines = call.input["context"].as_u64().unwrap_or(0) as usize;
     let case_insensitive = call.input["case_insensitive"].as_bool().unwrap_or(false);
     let max_results = call.input["max_results"].as_u64().unwrap_or(100) as usize;
@@ -47,7 +49,7 @@ pub async fn execute(call: &ToolCall) -> Result<ToolResult, ToolError> {
         .map_err(|e| ToolError::InvalidInput(format!("invalid regex: {e}")))?;
 
     let glob_matcher = glob_filter
-        .map(|g| glob::Pattern::new(g))
+        .map(glob::Pattern::new)
         .transpose()
         .map_err(|e| ToolError::InvalidInput(format!("invalid glob filter: {e}")))?;
 
@@ -163,26 +165,27 @@ fn collect_files(path: &str, glob_matcher: &Option<glob::Pattern>) -> Vec<PathBu
 
     let mut files = Vec::new();
     let walker = walkdir::WalkDir::new(path).into_iter();
-    for entry in walker.filter_entry(|e| {
-        // Skip hidden directories (but allow the root)
-        if e.depth() > 0 {
-            if let Some(name) = e.file_name().to_str() {
-                return !is_hidden(name);
+    for entry in walker
+        .filter_entry(|e| {
+            // Skip hidden directories (but allow the root)
+            if e.depth() > 0 {
+                if let Some(name) = e.file_name().to_str() {
+                    return !is_hidden(name);
+                }
             }
-        }
-        true
-    }) {
-        if let Ok(entry) = entry {
-            if entry.file_type().is_file() {
-                if let Some(ref g) = glob_matcher {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if !g.matches(name) {
-                            continue;
-                        }
+            true
+        })
+        .flatten()
+    {
+        if entry.file_type().is_file() {
+            if let Some(ref g) = glob_matcher {
+                if let Some(name) = entry.file_name().to_str() {
+                    if !g.matches(name) {
+                        continue;
                     }
                 }
-                files.push(entry.into_path());
             }
+            files.push(entry.into_path());
         }
     }
     files

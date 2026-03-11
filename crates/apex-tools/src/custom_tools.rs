@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -91,22 +91,22 @@ impl CustomToolRegistry {
         }
     }
 
-    fn manifest_path(tools_dir: &PathBuf) -> PathBuf {
+    fn manifest_path(tools_dir: &Path) -> PathBuf {
         tools_dir.join("manifest.toml")
     }
 
-    fn custom_dir(tools_dir: &PathBuf) -> PathBuf {
+    fn custom_dir(tools_dir: &Path) -> PathBuf {
         tools_dir.join("custom")
     }
 
-    fn load_manifest(tools_dir: &PathBuf) -> Option<Vec<ManifestEntry>> {
+    fn load_manifest(tools_dir: &Path) -> Option<Vec<ManifestEntry>> {
         let path = Self::manifest_path(tools_dir);
         let content = std::fs::read_to_string(&path).ok()?;
         let manifest: ToolManifest = toml::from_str(&content).ok()?;
         Some(manifest.tool)
     }
 
-    fn save_manifest(tools_dir: &PathBuf, entries: &[ManifestEntry]) -> Result<(), String> {
+    fn save_manifest(tools_dir: &Path, entries: &[ManifestEntry]) -> Result<(), String> {
         let manifest = ToolManifest {
             tool: entries.to_vec(),
         };
@@ -176,8 +176,9 @@ impl ToolRegistry for CustomToolRegistry {
         // Use try_read to avoid deadlocks; if locked, return just create_tool.
         if let Ok(entries) = self.entries.try_read() {
             for entry in entries.iter() {
-                let schema_path =
-                    Self::custom_dir(&self.tools_dir).join(&entry.name).join(&entry.schema_file);
+                let schema_path = Self::custom_dir(&self.tools_dir)
+                    .join(&entry.name)
+                    .join(&entry.schema_file);
                 if let Ok(schema_content) = std::fs::read_to_string(&schema_path) {
                     if let Ok(input_schema) = serde_json::from_str(&schema_content) {
                         defs.push(ToolDef {
@@ -220,10 +221,7 @@ fn validate_name(name: &str) -> Result<(), String> {
     if name.len() > 64 {
         return Err("tool name too long (max 64 chars)".into());
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err("tool name must contain only alphanumeric characters and hyphens".into());
     }
     if BUILTIN_NAMES.contains(&name) {
@@ -311,7 +309,11 @@ impl CustomToolRegistry {
         let schema_str = serde_json::to_string_pretty(input_schema).unwrap_or_default();
         if let Err(e) = std::fs::write(&schema_path, &schema_str) {
             let _ = std::fs::remove_dir_all(&tool_dir);
-            return Ok(error_result(call, &format!("write schema.json: {e}"), start));
+            return Ok(error_result(
+                call,
+                &format!("write schema.json: {e}"),
+                start,
+            ));
         }
 
         // Write test.sh
@@ -490,10 +492,10 @@ impl CustomToolRegistry {
                 let is_error = !output.status.success();
 
                 // Try to parse stdout as JSON, otherwise wrap it
-                let parsed_output: serde_json::Value =
-                    serde_json::from_str(&stdout).unwrap_or_else(|_| {
-                        json!({ "output": stdout.trim(), "stderr": stderr.trim() })
-                    });
+                let parsed_output: serde_json::Value = serde_json::from_str(&stdout)
+                    .unwrap_or_else(
+                        |_| json!({ "output": stdout.trim(), "stderr": stderr.trim() }),
+                    );
 
                 // Apply spill if output is large
                 let output_str = serde_json::to_string(&parsed_output).unwrap_or_default();
@@ -605,7 +607,10 @@ task_pattern = "validate.*json"
         let manifest: ToolManifest = toml::from_str(toml_str).unwrap();
         assert_eq!(manifest.tool.len(), 2);
         assert_eq!(manifest.tool[0].name, "csv-parser");
-        assert_eq!(manifest.tool[1].task_pattern.as_deref(), Some("validate.*json"));
+        assert_eq!(
+            manifest.tool[1].task_pattern.as_deref(),
+            Some("validate.*json")
+        );
     }
 
     #[test]

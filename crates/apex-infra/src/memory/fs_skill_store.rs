@@ -99,7 +99,6 @@ impl SkillStore for FsSkillStore {
 
         // Check for existing skill with same task_pattern
         if let Some(existing) = all.iter().find(|s| s.task_pattern == skill.task_pattern) {
-
             // Upsert: keep the existing ID and counters, update approach/tools/notes
             skill.id = existing.id.clone();
             skill.success_count = existing.success_count;
@@ -147,7 +146,11 @@ impl SkillStore for FsSkillStore {
         let all = self.load_all()?;
         let mut sorted: Vec<Skill> = all.as_ref().clone();
         // Sort by fitness descending
-        sorted.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| {
+            b.fitness
+                .partial_cmp(&a.fitness)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         sorted.truncate(limit);
         Ok(sorted)
     }
@@ -288,9 +291,18 @@ mod tests {
         };
         store.store_skill(skill).await.unwrap();
 
-        store.update_skill_fitness(&SkillId("s-bad".to_string()), false).await.unwrap();
-        store.update_skill_fitness(&SkillId("s-bad".to_string()), false).await.unwrap();
-        store.update_skill_fitness(&SkillId("s-bad".to_string()), false).await.unwrap();
+        store
+            .update_skill_fitness(&SkillId("s-bad".to_string()), false)
+            .await
+            .unwrap();
+        store
+            .update_skill_fitness(&SkillId("s-bad".to_string()), false)
+            .await
+            .unwrap();
+        store
+            .update_skill_fitness(&SkillId("s-bad".to_string()), false)
+            .await
+            .unwrap();
 
         let found = store.find_skill("flaky").await.unwrap();
         assert!(found.is_none(), "retired skill should be filtered out");

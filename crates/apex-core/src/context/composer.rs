@@ -7,17 +7,9 @@ const MAX_SKILL_TOKENS: u32 = 500;
 const MAX_CRITERIA_TOKENS: u32 = 500;
 const MAX_ATTEMPTS_TOKENS: u32 = 2000;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct MessageComposer {
     estimator: TokenEstimator,
-}
-
-impl Default for MessageComposer {
-    fn default() -> Self {
-        Self {
-            estimator: TokenEstimator::default(),
-        }
-    }
 }
 
 impl MessageComposer {
@@ -227,6 +219,7 @@ impl MessageComposer {
     }
 
     /// Compose a subtask message body with embedded parent context and long-term memory.
+    #[allow(clippy::too_many_arguments)]
     pub fn compose_subtask_with_memory(
         &self,
         title: &str,
@@ -271,22 +264,23 @@ impl MessageComposer {
             out.push_str(&format!("**Fitness:** {:.2}\n\n", skill.fitness));
         }
 
-        let effective_criteria =
-            if acceptance_criteria == "(to be determined by agent)" {
-                if let Some(skill) = recommended_skill {
-                    if let Some(ref template) = skill.criteria_template {
-                        template.as_str()
-                    } else {
-                        acceptance_criteria
-                    }
+        let effective_criteria = if acceptance_criteria == "(to be determined by agent)" {
+            if let Some(skill) = recommended_skill {
+                if let Some(ref template) = skill.criteria_template {
+                    template.as_str()
                 } else {
                     acceptance_criteria
                 }
             } else {
                 acceptance_criteria
-            };
+            }
+        } else {
+            acceptance_criteria
+        };
 
-        let budgeted_criteria = self.estimator.budget(effective_criteria, MAX_CRITERIA_TOKENS);
+        let budgeted_criteria = self
+            .estimator
+            .budget(effective_criteria, MAX_CRITERIA_TOKENS);
 
         out.push_str(&format!(
             "## Task\n\

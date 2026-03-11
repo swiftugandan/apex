@@ -10,8 +10,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use apex_core::domain::{
-    HookActionType, HookDef, HookEvent, HookFilter, HookOutcome,
-    OnFailureBehavior,
+    HookActionType, HookDef, HookEvent, HookFilter, HookOutcome, OnFailureBehavior,
 };
 use apex_core::ports::HookRegistry;
 
@@ -154,7 +153,8 @@ impl FsHookRegistry {
         match hook.action.action_type {
             HookActionType::Script | HookActionType::Transform => {
                 if hook.action.command.is_none() {
-                    errors.push("action.command is required for script/transform hooks".to_string());
+                    errors
+                        .push("action.command is required for script/transform hooks".to_string());
                 }
             }
             HookActionType::Inject => {
@@ -284,11 +284,7 @@ async fn dispatch_hooks(
 }
 
 /// Execute a single hook action and return the outcome.
-async fn execute_hook(
-    hook: &HookDef,
-    context: &Value,
-    working_dir: Option<&Path>,
-) -> HookOutcome {
+async fn execute_hook(hook: &HookDef, context: &Value, working_dir: Option<&Path>) -> HookOutcome {
     match hook.action.action_type {
         HookActionType::Block => {
             let msg = hook
@@ -360,10 +356,9 @@ async fn execute_hook(
                     }
                 }
                 Err(e) => match hook.action.on_failure {
-                    OnFailureBehavior::Block => HookOutcome::Block(format!(
-                        "Hook '{}' failed: {e}",
-                        hook.hook.name
-                    )),
+                    OnFailureBehavior::Block => {
+                        HookOutcome::Block(format!("Hook '{}' failed: {e}", hook.hook.name))
+                    }
                     OnFailureBehavior::Warn => {
                         eprintln!("warning: hook '{}' failed: {e}", hook.hook.name);
                         HookOutcome::Continue(None)
@@ -417,10 +412,7 @@ impl HookRegistry for FsHookRegistry {
         };
 
         // Derive working directory from hooks_dir parent (the .apex directory's parent = project root)
-        let working_dir = self
-            .hooks_dir
-            .parent()
-            .and_then(|apex| apex.parent());
+        let working_dir = self.hooks_dir.parent().and_then(|apex| apex.parent());
 
         dispatch_hooks(&hooks, context, working_dir).await
     }

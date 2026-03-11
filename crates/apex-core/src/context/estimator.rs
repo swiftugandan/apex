@@ -1,17 +1,9 @@
 use crate::domain::{CalibrationData, ContentType};
 
 /// Stateful token estimator with content-type awareness and self-calibration.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct TokenEstimator {
     calibration: CalibrationData,
-}
-
-impl Default for TokenEstimator {
-    fn default() -> Self {
-        Self {
-            calibration: CalibrationData::default(),
-        }
-    }
 }
 
 impl TokenEstimator {
@@ -100,8 +92,7 @@ impl TokenEstimator {
         let observed_ratio = prompt_text.len() as f32 / actual_tokens as f32;
 
         self.calibration.sample_count += 1;
-        let alpha =
-            (2.0_f32 / (self.calibration.sample_count as f32 + 1.0)).clamp(0.05, 0.5);
+        let alpha = (2.0_f32 / (self.calibration.sample_count as f32 + 1.0)).clamp(0.05, 0.5);
 
         match ct {
             ContentType::Prose => {
@@ -113,8 +104,8 @@ impl TokenEstimator {
                     alpha * observed_ratio + (1.0 - alpha) * self.calibration.chars_per_token_code;
             }
             ContentType::Mixed => {
-                self.calibration.chars_per_token_mixed = alpha * observed_ratio
-                    + (1.0 - alpha) * self.calibration.chars_per_token_mixed;
+                self.calibration.chars_per_token_mixed =
+                    alpha * observed_ratio + (1.0 - alpha) * self.calibration.chars_per_token_mixed;
             }
         }
     }
@@ -173,7 +164,8 @@ mod tests {
 
     #[test]
     fn classify_mixed() {
-        let text = "This function does X.\nIt works like this:\nfn foo() {\n    bar();\n}\nThat's it.";
+        let text =
+            "This function does X.\nIt works like this:\nfn foo() {\n    bar();\n}\nThat's it.";
         assert_eq!(TokenEstimator::classify(text), ContentType::Mixed);
     }
 

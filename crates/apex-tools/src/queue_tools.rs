@@ -25,6 +25,7 @@ pub struct QueueToolRegistry {
 }
 
 impl QueueToolRegistry {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         queue: Arc<dyn Queue>,
         correlation_id: String,
@@ -193,14 +194,22 @@ impl QueueToolRegistry {
             let (facts, skill) = {
                 let facts_fut = async {
                     if let Some(ref store) = self.store {
-                        store.query_facts(&info.description, 3).await.ok().unwrap_or_default()
+                        store
+                            .query_facts(&info.description, 3)
+                            .await
+                            .ok()
+                            .unwrap_or_default()
                     } else {
                         Vec::new()
                     }
                 };
                 let skill_fut = async {
                     if let Some(ref skill_store) = self.skill_store {
-                        skill_store.find_skill(&info.description).await.ok().flatten()
+                        skill_store
+                            .find_skill(&info.description)
+                            .await
+                            .ok()
+                            .flatten()
                     } else {
                         None
                     }
@@ -351,7 +360,11 @@ impl QueueToolRegistry {
                 }
             }
         }
-        if visited == n { Ok(()) } else { Err("cycle") }
+        if visited == n {
+            Ok(())
+        } else {
+            Err("cycle")
+        }
     }
 }
 
@@ -497,27 +510,86 @@ mod tests {
         struct MinimalQueue;
         #[async_trait]
         impl Queue for MinimalQueue {
-            async fn push(&self, _msg: QueueMessage) -> Result<String, apex_core::error::QueueError> {
+            async fn push(
+                &self,
+                _msg: QueueMessage,
+            ) -> Result<String, apex_core::error::QueueError> {
                 Ok("id".into())
             }
-            async fn pop(&self) -> Result<Option<apex_core::domain::ClaimedTask>, apex_core::error::QueueError> { Ok(None) }
-            async fn update_body(&self, _c: &apex_core::domain::ClaimedTask, _b: &str) -> Result<(), apex_core::error::QueueError> { Ok(()) }
-            async fn ack(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
-            async fn nack(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
-            async fn nack_with_delay(&self, _c: &apex_core::domain::ClaimedTask, _d: std::time::Duration) -> Result<(), apex_core::error::QueueError> { Ok(()) }
-            async fn reject(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
-            async fn depth(&self) -> Result<apex_core::domain::QueueDepth, apex_core::error::QueueError> { Ok(Default::default()) }
-            async fn reap(&self) -> Result<apex_core::domain::ReapResult, apex_core::error::QueueError> { Ok(Default::default()) }
-            async fn list_done(&self, _cid: &str) -> Result<Vec<String>, apex_core::error::QueueError> { Ok(vec![]) }
-            async fn read_done_body(&self, _id: &str) -> Result<String, apex_core::error::QueueError> { Ok(String::new()) }
-            async fn list_with_state(&self, _s: &str) -> Result<Vec<apex_core::domain::QueueMessageMeta>, apex_core::error::QueueError> { Ok(vec![]) }
+            async fn pop(
+                &self,
+            ) -> Result<Option<apex_core::domain::ClaimedTask>, apex_core::error::QueueError>
+            {
+                Ok(None)
+            }
+            async fn update_body(
+                &self,
+                _c: &apex_core::domain::ClaimedTask,
+                _b: &str,
+            ) -> Result<(), apex_core::error::QueueError> {
+                Ok(())
+            }
+            async fn ack(
+                &self,
+                _c: &apex_core::domain::ClaimedTask,
+            ) -> Result<(), apex_core::error::QueueError> {
+                Ok(())
+            }
+            async fn nack(
+                &self,
+                _c: &apex_core::domain::ClaimedTask,
+            ) -> Result<(), apex_core::error::QueueError> {
+                Ok(())
+            }
+            async fn nack_with_delay(
+                &self,
+                _c: &apex_core::domain::ClaimedTask,
+                _d: std::time::Duration,
+            ) -> Result<(), apex_core::error::QueueError> {
+                Ok(())
+            }
+            async fn reject(
+                &self,
+                _c: &apex_core::domain::ClaimedTask,
+            ) -> Result<(), apex_core::error::QueueError> {
+                Ok(())
+            }
+            async fn depth(
+                &self,
+            ) -> Result<apex_core::domain::QueueDepth, apex_core::error::QueueError> {
+                Ok(Default::default())
+            }
+            async fn reap(
+                &self,
+            ) -> Result<apex_core::domain::ReapResult, apex_core::error::QueueError> {
+                Ok(Default::default())
+            }
+            async fn list_done(
+                &self,
+                _cid: &str,
+            ) -> Result<Vec<String>, apex_core::error::QueueError> {
+                Ok(vec![])
+            }
+            async fn read_done_body(
+                &self,
+                _id: &str,
+            ) -> Result<String, apex_core::error::QueueError> {
+                Ok(String::new())
+            }
+            async fn list_with_state(
+                &self,
+                _s: &str,
+            ) -> Result<Vec<apex_core::domain::QueueMessageMeta>, apex_core::error::QueueError>
+            {
+                Ok(vec![])
+            }
         }
 
         let registry = QueueToolRegistry::new(
             Arc::new(MinimalQueue),
             "corr-1".into(),
-            0,   // current_depth
-            3,   // max_depth
+            0, // current_depth
+            3, // max_depth
             "parent goal".into(),
             "parent body".into(),
             None,
@@ -578,20 +650,79 @@ mod tests {
         struct MinimalQueue2;
         #[async_trait]
         impl Queue for MinimalQueue2 {
-            async fn push(&self, _msg: QueueMessage) -> Result<String, apex_core::error::QueueError> {
+            async fn push(
+                &self,
+                _msg: QueueMessage,
+            ) -> Result<String, apex_core::error::QueueError> {
                 Ok("id".into())
             }
-            async fn pop(&self) -> Result<Option<apex_core::domain::ClaimedTask>, apex_core::error::QueueError> { Ok(None) }
-            async fn update_body(&self, _c: &apex_core::domain::ClaimedTask, _b: &str) -> Result<(), apex_core::error::QueueError> { Ok(()) }
-            async fn ack(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
-            async fn nack(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
-            async fn nack_with_delay(&self, _c: &apex_core::domain::ClaimedTask, _d: std::time::Duration) -> Result<(), apex_core::error::QueueError> { Ok(()) }
-            async fn reject(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
-            async fn depth(&self) -> Result<apex_core::domain::QueueDepth, apex_core::error::QueueError> { Ok(Default::default()) }
-            async fn reap(&self) -> Result<apex_core::domain::ReapResult, apex_core::error::QueueError> { Ok(Default::default()) }
-            async fn list_done(&self, _cid: &str) -> Result<Vec<String>, apex_core::error::QueueError> { Ok(vec![]) }
-            async fn read_done_body(&self, _id: &str) -> Result<String, apex_core::error::QueueError> { Ok(String::new()) }
-            async fn list_with_state(&self, _s: &str) -> Result<Vec<apex_core::domain::QueueMessageMeta>, apex_core::error::QueueError> { Ok(vec![]) }
+            async fn pop(
+                &self,
+            ) -> Result<Option<apex_core::domain::ClaimedTask>, apex_core::error::QueueError>
+            {
+                Ok(None)
+            }
+            async fn update_body(
+                &self,
+                _c: &apex_core::domain::ClaimedTask,
+                _b: &str,
+            ) -> Result<(), apex_core::error::QueueError> {
+                Ok(())
+            }
+            async fn ack(
+                &self,
+                _c: &apex_core::domain::ClaimedTask,
+            ) -> Result<(), apex_core::error::QueueError> {
+                Ok(())
+            }
+            async fn nack(
+                &self,
+                _c: &apex_core::domain::ClaimedTask,
+            ) -> Result<(), apex_core::error::QueueError> {
+                Ok(())
+            }
+            async fn nack_with_delay(
+                &self,
+                _c: &apex_core::domain::ClaimedTask,
+                _d: std::time::Duration,
+            ) -> Result<(), apex_core::error::QueueError> {
+                Ok(())
+            }
+            async fn reject(
+                &self,
+                _c: &apex_core::domain::ClaimedTask,
+            ) -> Result<(), apex_core::error::QueueError> {
+                Ok(())
+            }
+            async fn depth(
+                &self,
+            ) -> Result<apex_core::domain::QueueDepth, apex_core::error::QueueError> {
+                Ok(Default::default())
+            }
+            async fn reap(
+                &self,
+            ) -> Result<apex_core::domain::ReapResult, apex_core::error::QueueError> {
+                Ok(Default::default())
+            }
+            async fn list_done(
+                &self,
+                _cid: &str,
+            ) -> Result<Vec<String>, apex_core::error::QueueError> {
+                Ok(vec![])
+            }
+            async fn read_done_body(
+                &self,
+                _id: &str,
+            ) -> Result<String, apex_core::error::QueueError> {
+                Ok(String::new())
+            }
+            async fn list_with_state(
+                &self,
+                _s: &str,
+            ) -> Result<Vec<apex_core::domain::QueueMessageMeta>, apex_core::error::QueueError>
+            {
+                Ok(vec![])
+            }
         }
 
         let hooks: Arc<dyn HookRegistry> = Arc::new(BlockingHookRegistry);
@@ -631,20 +762,79 @@ mod tests {
         struct MinimalQueue3;
         #[async_trait]
         impl Queue for MinimalQueue3 {
-            async fn push(&self, _msg: QueueMessage) -> Result<String, apex_core::error::QueueError> {
+            async fn push(
+                &self,
+                _msg: QueueMessage,
+            ) -> Result<String, apex_core::error::QueueError> {
                 Ok("id".into())
             }
-            async fn pop(&self) -> Result<Option<apex_core::domain::ClaimedTask>, apex_core::error::QueueError> { Ok(None) }
-            async fn update_body(&self, _c: &apex_core::domain::ClaimedTask, _b: &str) -> Result<(), apex_core::error::QueueError> { Ok(()) }
-            async fn ack(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
-            async fn nack(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
-            async fn nack_with_delay(&self, _c: &apex_core::domain::ClaimedTask, _d: std::time::Duration) -> Result<(), apex_core::error::QueueError> { Ok(()) }
-            async fn reject(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
-            async fn depth(&self) -> Result<apex_core::domain::QueueDepth, apex_core::error::QueueError> { Ok(Default::default()) }
-            async fn reap(&self) -> Result<apex_core::domain::ReapResult, apex_core::error::QueueError> { Ok(Default::default()) }
-            async fn list_done(&self, _cid: &str) -> Result<Vec<String>, apex_core::error::QueueError> { Ok(vec![]) }
-            async fn read_done_body(&self, _id: &str) -> Result<String, apex_core::error::QueueError> { Ok(String::new()) }
-            async fn list_with_state(&self, _s: &str) -> Result<Vec<apex_core::domain::QueueMessageMeta>, apex_core::error::QueueError> { Ok(vec![]) }
+            async fn pop(
+                &self,
+            ) -> Result<Option<apex_core::domain::ClaimedTask>, apex_core::error::QueueError>
+            {
+                Ok(None)
+            }
+            async fn update_body(
+                &self,
+                _c: &apex_core::domain::ClaimedTask,
+                _b: &str,
+            ) -> Result<(), apex_core::error::QueueError> {
+                Ok(())
+            }
+            async fn ack(
+                &self,
+                _c: &apex_core::domain::ClaimedTask,
+            ) -> Result<(), apex_core::error::QueueError> {
+                Ok(())
+            }
+            async fn nack(
+                &self,
+                _c: &apex_core::domain::ClaimedTask,
+            ) -> Result<(), apex_core::error::QueueError> {
+                Ok(())
+            }
+            async fn nack_with_delay(
+                &self,
+                _c: &apex_core::domain::ClaimedTask,
+                _d: std::time::Duration,
+            ) -> Result<(), apex_core::error::QueueError> {
+                Ok(())
+            }
+            async fn reject(
+                &self,
+                _c: &apex_core::domain::ClaimedTask,
+            ) -> Result<(), apex_core::error::QueueError> {
+                Ok(())
+            }
+            async fn depth(
+                &self,
+            ) -> Result<apex_core::domain::QueueDepth, apex_core::error::QueueError> {
+                Ok(Default::default())
+            }
+            async fn reap(
+                &self,
+            ) -> Result<apex_core::domain::ReapResult, apex_core::error::QueueError> {
+                Ok(Default::default())
+            }
+            async fn list_done(
+                &self,
+                _cid: &str,
+            ) -> Result<Vec<String>, apex_core::error::QueueError> {
+                Ok(vec![])
+            }
+            async fn read_done_body(
+                &self,
+                _id: &str,
+            ) -> Result<String, apex_core::error::QueueError> {
+                Ok(String::new())
+            }
+            async fn list_with_state(
+                &self,
+                _s: &str,
+            ) -> Result<Vec<apex_core::domain::QueueMessageMeta>, apex_core::error::QueueError>
+            {
+                Ok(vec![])
+            }
         }
 
         // No hooks — push should succeed

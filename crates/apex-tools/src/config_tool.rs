@@ -71,7 +71,7 @@ impl ToolRegistry for ConfigToolRegistry {
     }
 }
 
-use crate::tool_result_helpers::{ok_result, err_result};
+use crate::tool_result_helpers::{err_result, ok_result};
 
 impl ConfigToolRegistry {
     fn handle_read(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -89,9 +89,7 @@ impl ConfigToolRegistry {
         let changes = match call.input.get("changes") {
             Some(c) if c.is_object() => c,
             Some(_) => return err_result(call, "\"changes\" must be an object"),
-            None => {
-                return err_result(call, "\"changes\" field is required for action=update")
-            }
+            None => return err_result(call, "\"changes\" field is required for action=update"),
         };
 
         let current = ConfigLoader::load_agent_config(&self.config_dir)

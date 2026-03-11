@@ -26,7 +26,9 @@ impl Message {
         }
 
         let h = &self.header;
-        let id = h.id.as_ref().expect("MessageId must be set before serializing");
+        let id =
+            h.id.as_ref()
+                .expect("MessageId must be set before serializing");
         let mut buf = String::with_capacity(512 + self.body.len());
 
         // Writing to a String via fmt::Write is infallible (only fails on OOM,
@@ -214,9 +216,10 @@ fn parse_header_block(block: &str) -> Result<Header> {
                     .split(',')
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
-                    .map(|s| s.parse::<MessageId>().map_err(|_| {
-                        Error::Parse(format!("invalid dependency ID: '{}'", s))
-                    }))
+                    .map(|s| {
+                        s.parse::<MessageId>()
+                            .map_err(|_| Error::Parse(format!("invalid dependency ID: '{}'", s)))
+                    })
                     .collect::<Result<Vec<MessageId>>>()?;
             }
             "custom" => {

@@ -22,7 +22,11 @@ pub struct ParseMessageIdError(String);
 
 impl fmt::Display for ParseMessageIdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid message ID: '{}' (expected {} hex chars)", self.0, ID_LEN)
+        write!(
+            f,
+            "invalid message ID: '{}' (expected {} hex chars)",
+            self.0, ID_LEN
+        )
     }
 }
 
@@ -86,12 +90,15 @@ impl ClaimedMessage {
             .file_name()
             .ok_or_else(|| crate::error::Error::InvalidPath(path.display().to_string()))?
             .to_string_lossy();
-        let stem = name.strip_suffix(".md")
+        let stem = name
+            .strip_suffix(".md")
             .ok_or_else(|| crate::error::Error::InvalidPath(path.display().to_string()))?;
-        let dot_pos = stem.find('.')
+        let dot_pos = stem
+            .find('.')
             .ok_or_else(|| crate::error::Error::InvalidPath(path.display().to_string()))?;
         let id_str = &stem[dot_pos + 1..];
-        let id: MessageId = id_str.parse()
+        let id: MessageId = id_str
+            .parse()
             .map_err(|_| crate::error::Error::InvalidPath(path.display().to_string()))?;
         Ok(ClaimedMessage { path, id })
     }
@@ -246,11 +253,7 @@ pub struct Queue {
 }
 
 impl Queue {
-    pub(crate) fn new(
-        root: PathBuf,
-        use_priority_dirs: bool,
-        max_pending: i64,
-    ) -> Self {
+    pub(crate) fn new(root: PathBuf, use_priority_dirs: bool, max_pending: i64) -> Self {
         Queue {
             root,
             max_retries: DEFAULT_RETRIES,

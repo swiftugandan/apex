@@ -8,13 +8,28 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use apex_core::domain::{
-    CalibrationData, ChatMessage, ClaimedTask, CompletionRequest, CompletionResponse,
-    ContentBlock, Fact, FactId, MessageRole, QueueDepth, QueueMessage, QueueMessageMeta,
-    ReapResult, Scratchpad, Skill, SkillId, StopReason, ToolCall, ToolCompletionResponse,
-    ToolDef, ToolResult, ToolSchema, TokenUsage,
+    CalibrationData, ChatMessage, ClaimedTask, CompletionRequest, CompletionResponse, ContentBlock,
+    Fact, FactId, MessageRole, QueueDepth, QueueMessage, QueueMessageMeta, ReapResult, Scratchpad,
+    Skill, SkillId, StopReason, TokenUsage, ToolCall, ToolCompletionResponse, ToolDef, ToolResult,
+    ToolSchema,
 };
 use apex_core::error::{LlmError, MemoryError, QueueError, ToolError};
 use apex_core::ports::{LlmProvider, MemoryStore, Queue, SkillStore, ToolRegistry, WorkingMemory};
+
+use crate::claim_tool_factory::{ClaimContext, ClaimToolFactory};
+
+// ── MockClaimToolFactory ──────────────────────────────────────────
+
+/// Returns an empty tool registry. Sufficient for tests that never
+/// process a claim (e.g. `worker_exits_on_empty_queue`).
+pub struct MockClaimToolFactory;
+
+#[async_trait]
+impl ClaimToolFactory for MockClaimToolFactory {
+    async fn build(&self, _ctx: &ClaimContext) -> Box<dyn ToolRegistry> {
+        Box::new(MockToolRegistry::echo("unused"))
+    }
+}
 
 // ── Call recording helpers ────────────────────────────────────────
 
@@ -30,13 +45,21 @@ pub fn call_log<T>() -> CallLog<T> {
 /// Panics if more calls are made than responses are queued.
 pub struct MockLlmProvider {
     pub responses: Mutex<VecDeque<Result<ToolCompletionResponse, LlmError>>>,
+    pub context_window: usize,
 }
 
 impl MockLlmProvider {
     pub fn new(responses: Vec<Result<ToolCompletionResponse, LlmError>>) -> Self {
         Self {
             responses: Mutex::new(responses.into()),
+            context_window: 200_000,
         }
+    }
+
+    /// Create a provider with a custom context window size.
+    pub fn with_context_window(mut self, size: usize) -> Self {
+        self.context_window = size;
+        self
     }
 
     /// Create a provider that returns a single text-only response (end_turn).
@@ -125,10 +148,7 @@ impl MockLlmProvider {
 
 #[async_trait]
 impl LlmProvider for MockLlmProvider {
-    async fn complete(
-        &self,
-        _req: CompletionRequest<'_>,
-    ) -> Result<CompletionResponse, LlmError> {
+    async fn complete(&self, _req: CompletionRequest<'_>) -> Result<CompletionResponse, LlmError> {
         let mut queue = self.responses.lock().await;
         let resp = queue
             .pop_front()
@@ -159,7 +179,7 @@ impl LlmProvider for MockLlmProvider {
     }
 
     fn context_window(&self) -> usize {
-        200_000
+        self.context_window
     }
 }
 
@@ -173,10 +193,7 @@ pub struct MockToolRegistry {
 }
 
 impl MockToolRegistry {
-    pub fn new(
-        defs: Vec<ToolDef>,
-        responses: Vec<Result<ToolResult, ToolError>>,
-    ) -> Self {
+    pub fn new(defs: Vec<ToolDef>, responses: Vec<Result<ToolResult, ToolError>>) -> Self {
         Self {
             defs,
             responses: Mutex::new(responses.into()),
@@ -314,10 +331,7 @@ impl MockQueue {
 impl Queue for MockQueue {
     async fn push(&self, msg: QueueMessage) -> Result<String, QueueError> {
         let id = apex_core::generate_id("mock");
-        self.actions
-            .lock()
-            .await
-            .push(QueueAction::Push(msg));
+        self.actions.lock().await.push(QueueAction::Push(msg));
         Ok(id)
     }
 

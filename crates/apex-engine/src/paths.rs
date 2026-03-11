@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 
 const DEFAULT_HOOK_NON_RETRYABLE: &str = r#"[hook]
 name = "non_retryable_errors"
@@ -105,8 +105,7 @@ impl ProjectPaths {
 
     /// Create all required directories. Used by `apex init`.
     pub fn create_dirs(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.apex_dir)
-            .context("failed to create .apex/ directory")?;
+        std::fs::create_dir_all(&self.apex_dir).context("failed to create .apex/ directory")?;
         std::fs::create_dir_all(&self.queues_dir)
             .context("failed to create .apex/queues/ directory")?;
         std::fs::create_dir_all(&self.working_memory)
@@ -140,8 +139,14 @@ impl ProjectPaths {
         std::fs::create_dir_all(&on_failure_dir)
             .context("failed to create .apex/hooks/on_failure.d/ directory")?;
 
-        write_if_absent(&on_failure_dir.join("non-retryable.toml"), DEFAULT_HOOK_NON_RETRYABLE)?;
-        write_if_absent(&on_failure_dir.join("rate-limit-backoff.toml"), DEFAULT_HOOK_RATE_LIMIT)?;
+        write_if_absent(
+            &on_failure_dir.join("non-retryable.toml"),
+            DEFAULT_HOOK_NON_RETRYABLE,
+        )?;
+        write_if_absent(
+            &on_failure_dir.join("rate-limit-backoff.toml"),
+            DEFAULT_HOOK_RATE_LIMIT,
+        )?;
 
         Ok(())
     }

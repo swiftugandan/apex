@@ -85,9 +85,7 @@ impl HooksToolRegistry {
             .parse()
             .map_err(|e: String| ToolError::InvalidInput(e))?;
 
-        let action_type_str = input["action_type"]
-            .as_str()
-            .unwrap_or("script");
+        let action_type_str = input["action_type"].as_str().unwrap_or("script");
 
         let action_type = match action_type_str {
             "script" => HookActionType::Script,
@@ -104,9 +102,7 @@ impl HooksToolRegistry {
         let priority = input["priority"].as_i64().unwrap_or(50) as i32;
 
         let filter = HookFilter {
-            tool: input["filter_tool"]
-                .as_str()
-                .map(String::from),
+            tool: input["filter_tool"].as_str().map(String::from),
         };
 
         let on_failure_str = input["on_failure"].as_str().unwrap_or("warn");
@@ -210,7 +206,11 @@ impl HooksToolRegistry {
                 "transform" => HookActionType::Transform,
                 "block" => HookActionType::Block,
                 "inject" => HookActionType::Inject,
-                other => return Err(ToolError::InvalidInput(format!("unknown action type: {other}"))),
+                other => {
+                    return Err(ToolError::InvalidInput(format!(
+                        "unknown action type: {other}"
+                    )))
+                }
             }
         } else {
             existing.action.action_type
@@ -712,6 +712,9 @@ command = "echo check"
         let result = registry.execute(&call).await;
         assert!(result.is_err());
         let err_msg = format!("{:?}", result.unwrap_err());
-        assert!(err_msg.contains("edit"), "error should mention edit: {err_msg}");
+        assert!(
+            err_msg.contains("edit"),
+            "error should mention edit: {err_msg}"
+        );
     }
 }

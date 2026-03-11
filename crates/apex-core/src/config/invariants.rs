@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Operator-defined ceilings that the agent cannot exceed.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Invariants {
     #[serde(default)]
     pub limits: InvariantLimits,
@@ -62,14 +62,6 @@ impl Default for InvariantLimits {
             max_body_tokens: default_max_body_tokens(),
             max_retries: default_max_retries(),
             max_sub_agent_depth: default_max_sub_agent_depth(),
-        }
-    }
-}
-
-impl Default for Invariants {
-    fn default() -> Self {
-        Self {
-            limits: InvariantLimits::default(),
         }
     }
 }

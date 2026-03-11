@@ -10,12 +10,10 @@ use apex_core::domain::{
 };
 use apex_core::ports::{HookRegistry, LlmProvider, MemoryStore, Queue, SkillStore, WorkingMemory};
 
-use apex_tools::QueueToolRegistry;
-
 use crate::agentic_loop::{run_agentic_loop, LoopConfig, LoopOutcome};
+use crate::claim_tool_factory::{ClaimContext, ClaimToolFactory};
 use crate::consolidation::consolidate_learnings;
 use crate::log::dispatch_log;
-use crate::registry::{ApexToolRegistry, CompositeToolRegistry};
 use crate::util::{composer_from_estimator, extract_title, now_unix_ts};
 
 // ── WorkerContext ───────────────────────────────────────────────────
@@ -34,7 +32,7 @@ pub struct WorkerLimits {
 #[derive(Clone)]
 pub struct WorkerContext {
     pub queue: Arc<dyn Queue>,
-    pub tools: Arc<CompositeToolRegistry>,
+    pub claim_tool_factory: Arc<dyn ClaimToolFactory>,
     pub llm: Arc<dyn LlmProvider>,
     pub memory: Arc<dyn WorkingMemory>,
     pub long_term: Arc<dyn MemoryStore>,
@@ -53,11 +51,7 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
     let mut empty_cycles = 0u32;
 
     loop {
-        let claimed = ctx
-            .queue
-            .pop()
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let claimed = ctx.queue.pop().await.map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let claimed = match claimed {
             Some(c) => {
@@ -101,40 +95,27 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
             let retry = claimed.headers.retry_count;
             dispatch_log(
                 ctx.hooks.as_deref(),
-                || serde_json::json!({
-                    "level": "info",
-                    "event": "claim_start",
-                    "worker_id": worker_id,
-                    "message_type": type_label,
-                    "message_id": id,
-                    "depth": depth,
-                    "retry_count": retry,
-                }),
+                || {
+                    serde_json::json!({
+                        "level": "info",
+                        "event": "claim_start",
+                        "worker_id": worker_id,
+                        "message_type": type_label,
+                        "message_id": id,
+                        "depth": depth,
+                        "retry_count": retry,
+                    })
+                },
                 &msg,
             )
             .await;
         }
 
-        // Build per-claim tool registry (static tools + queue tools)
-        let composer = composer_from_estimator(&ctx.estimator).await;
-        let title = extract_title(&claimed.body);
-        let queue_tools = QueueToolRegistry::new(
-            Arc::clone(&ctx.queue),
-            claimed.headers.correlation_id.clone(),
-            claimed.headers.depth,
-            ctx.limits.max_depth,
-            title.clone(),
-            claimed.body.clone(),
-            Some(Arc::clone(&ctx.long_term)),
-            Some(Arc::clone(&ctx.skills)),
-            composer,
-        )
-        .with_hooks(ctx.hooks.clone());
-
-        let result = execute_claim(&ctx, &claimed, queue_tools).await;
+        let result = execute_claim(&ctx, &claimed).await;
 
         match result {
             Ok(record) => {
+                let title = extract_title(&claimed.body);
                 let result_body = MessageComposer::compose_result(&title, &record);
                 ctx.queue
                     .update_body(&claimed, &result_body)
@@ -152,13 +133,15 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
                     let id = &claimed.id;
                     dispatch_log(
                         ctx.hooks.as_deref(),
-                        || serde_json::json!({
-                            "level": "info",
-                            "event": "claim_done",
-                            "worker_id": worker_id,
-                            "message_type": type_label,
-                            "message_id": id,
-                        }),
+                        || {
+                            serde_json::json!({
+                                "level": "info",
+                                "event": "claim_done",
+                                "worker_id": worker_id,
+                                "message_type": type_label,
+                                "message_id": id,
+                            })
+                        },
                         &msg,
                     )
                     .await;
@@ -167,8 +150,14 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
             Err((record, err, scratchpad)) => {
                 let composer = composer_from_estimator(&ctx.estimator).await;
                 handle_failure(
-                    ctx.queue.as_ref(), &claimed, &record, &err, &scratchpad,
-                    worker_id, &composer, ctx.limits.max_retries,
+                    ctx.queue.as_ref(),
+                    &claimed,
+                    &record,
+                    &err,
+                    &scratchpad,
+                    worker_id,
+                    &composer,
+                    ctx.limits.max_retries,
                     ctx.hooks.as_deref(),
                 )
                 .await?;
@@ -182,7 +171,6 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
 async fn execute_claim(
     ctx: &WorkerContext,
     claimed: &ClaimedTask,
-    queue_tools: QueueToolRegistry,
 ) -> std::result::Result<AttemptRecord, (AttemptRecord, String, apex_core::domain::Scratchpad)> {
     let started_at = now_unix_ts();
     let job_id = &claimed.headers.correlation_id;
@@ -228,17 +216,27 @@ async fn execute_claim(
     let messages = vec![ChatMessage::user_text(&initial_body)];
 
     let scratchpad_arc = Arc::new(Mutex::new(scratchpad));
-    let tools = ApexToolRegistry {
-        static_tools: Arc::clone(&ctx.tools),
-        queue_tools,
-        scratchpad: Some(Arc::clone(&scratchpad_arc)),
-        memory: Some(Arc::clone(&ctx.memory)),
+
+    // Build per-claim tools via the factory
+    let claim_ctx = ClaimContext {
+        queue: Arc::clone(&ctx.queue),
+        correlation_id: claimed.headers.correlation_id.clone(),
+        current_depth: claimed.headers.depth,
+        max_depth: ctx.limits.max_depth,
+        parent_goal: extract_title(&claimed.body),
+        parent_body: claimed.body.clone(),
+        long_term: Arc::clone(&ctx.long_term),
+        skills: Arc::clone(&ctx.skills),
+        memory: Arc::clone(&ctx.memory),
+        scratchpad: Arc::clone(&scratchpad_arc),
+        hooks: ctx.hooks.clone(),
     };
+    let tools = ctx.claim_tool_factory.build(&claim_ctx).await;
 
     let loop_config = LoopConfig {
         persona: &ctx.persona,
         llm: ctx.llm.as_ref(),
-        tools: &tools,
+        tools: tools.as_ref(),
         estimator: &ctx.estimator,
         max_tool_result_bytes: ctx.limits.max_tool_result_bytes,
         max_output_tokens: ctx.limits.max_output_tokens,
@@ -351,6 +349,7 @@ enum FailureAction {
     RetryDefault,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_failure(
     queue: &dyn Queue,
     claimed: &ClaimedTask,
@@ -364,19 +363,20 @@ async fn handle_failure(
 ) -> Result<()> {
     dispatch_log(
         hooks,
-        || serde_json::json!({
-            "level": "error",
-            "event": "claim_failed",
-            "worker_id": worker_id,
-            "message_id": &claimed.id,
-            "error": err,
-        }),
+        || {
+            serde_json::json!({
+                "level": "error",
+                "event": "claim_failed",
+                "worker_id": worker_id,
+                "message_id": &claimed.id,
+                "error": err,
+            })
+        },
         &format!("[worker {worker_id}] ✗ {} failed: {err}", claimed.id),
     )
     .await;
 
-    let updated_body =
-        composer.append_attempt_with_memory(&claimed.body, record, scratchpad);
+    let updated_body = composer.append_attempt_with_memory(&claimed.body, record, scratchpad);
 
     queue
         .update_body(claimed, &updated_body)
@@ -421,13 +421,15 @@ async fn handle_failure(
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             dispatch_log(
                 hooks,
-                || serde_json::json!({
-                    "level": "warn",
-                    "event": "claim_rejected",
-                    "worker_id": worker_id,
-                    "message_id": &claimed.id,
-                    "reason": reason,
-                }),
+                || {
+                    serde_json::json!({
+                        "level": "warn",
+                        "event": "claim_rejected",
+                        "worker_id": worker_id,
+                        "message_id": &claimed.id,
+                        "reason": reason,
+                    })
+                },
                 &format!("[worker {worker_id}]   ↳ {reason}, moved to failed/"),
             )
             .await;
@@ -435,13 +437,15 @@ async fn handle_failure(
         FailureAction::RetryWithBackoff(secs) => {
             dispatch_log(
                 hooks,
-                || serde_json::json!({
-                    "level": "warn",
-                    "event": "retry_backoff",
-                    "worker_id": worker_id,
-                    "message_id": &claimed.id,
-                    "backoff_secs": secs,
-                }),
+                || {
+                    serde_json::json!({
+                        "level": "warn",
+                        "event": "retry_backoff",
+                        "worker_id": worker_id,
+                        "message_id": &claimed.id,
+                        "backoff_secs": secs,
+                    })
+                },
                 &format!("[worker {worker_id}]   ↳ Backoff, delaying {secs}s before retry"),
             )
             .await;
@@ -462,26 +466,30 @@ async fn handle_failure(
         if claimed.headers.retry_count + 1 >= max_retries {
             dispatch_log(
                 hooks,
-                || serde_json::json!({
-                    "level": "warn",
-                    "event": "max_retries_reached",
-                    "worker_id": worker_id,
-                    "message_id": &claimed.id,
-                }),
+                || {
+                    serde_json::json!({
+                        "level": "warn",
+                        "event": "max_retries_reached",
+                        "worker_id": worker_id,
+                        "message_id": &claimed.id,
+                    })
+                },
                 &format!("[worker {worker_id}]   ↳ Max retries reached, moved to failed/"),
             )
             .await;
         } else {
             dispatch_log(
                 hooks,
-                || serde_json::json!({
-                    "level": "info",
-                    "event": "retry_scheduled",
-                    "worker_id": worker_id,
-                    "message_id": &claimed.id,
-                    "attempt": claimed.headers.retry_count + 2,
-                    "max_retries": max_retries,
-                }),
+                || {
+                    serde_json::json!({
+                        "level": "info",
+                        "event": "retry_scheduled",
+                        "worker_id": worker_id,
+                        "message_id": &claimed.id,
+                        "attempt": claimed.headers.retry_count + 2,
+                        "max_retries": max_retries,
+                    })
+                },
                 &format!(
                     "[worker {worker_id}]   ↳ Requeued for retry (attempt {} of {})",
                     claimed.headers.retry_count + 2,
@@ -498,8 +506,8 @@ async fn handle_failure(
 mod tests {
     use super::*;
 
-    use apex_core::domain::QueueDepth;
     use crate::test_mocks::*;
+    use apex_core::domain::QueueDepth;
 
     fn make_claimed(id: &str, retry_count: u32) -> ClaimedTask {
         ClaimedTask {
@@ -538,8 +546,15 @@ mod tests {
         let composer = MessageComposer::default();
 
         handle_failure(
-            &queue, &claimed, &record, "authentication_error: bad token", &scratchpad,
-            0, &composer, 3, None,
+            &queue,
+            &claimed,
+            &record,
+            "authentication_error: bad token",
+            &scratchpad,
+            0,
+            &composer,
+            3,
+            None,
         )
         .await
         .unwrap();
@@ -562,8 +577,15 @@ mod tests {
         let composer = MessageComposer::default();
 
         handle_failure(
-            &queue, &claimed, &record, "connection timeout", &scratchpad,
-            0, &composer, 3, None,
+            &queue,
+            &claimed,
+            &record,
+            "connection timeout",
+            &scratchpad,
+            0,
+            &composer,
+            3,
+            None,
         )
         .await
         .unwrap();
@@ -575,7 +597,9 @@ mod tests {
             actions
         );
         assert!(!actions.iter().any(|a| matches!(a, QueueAction::Reject(_))));
-        assert!(!actions.iter().any(|a| matches!(a, QueueAction::NackWithDelay(_, _))));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, QueueAction::NackWithDelay(_, _))));
     }
 
     #[tokio::test]
@@ -586,7 +610,7 @@ mod tests {
             processing: 0,
         });
 
-        let tools = Arc::new(crate::registry::CompositeToolRegistry::new(vec![]));
+        let claim_factory: Arc<dyn ClaimToolFactory> = Arc::new(MockClaimToolFactory);
         let llm: Arc<dyn LlmProvider> = Arc::new(MockLlmProvider::text_only("unused"));
         let memory: Arc<dyn WorkingMemory> = Arc::new(MockWorkingMemory::new());
         let long_term: Arc<dyn MemoryStore> = Arc::new(MockMemoryStore::new());
@@ -594,7 +618,7 @@ mod tests {
 
         let ctx = WorkerContext {
             queue: queue as Arc<dyn Queue>,
-            tools,
+            claim_tool_factory: claim_factory,
             llm,
             memory,
             long_term,

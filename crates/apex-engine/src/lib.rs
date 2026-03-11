@@ -1,8 +1,7 @@
 mod agentic_loop;
+mod claim_tool_factory;
 mod compaction;
 mod consolidation;
-pub mod constants;
-mod delegate;
 pub mod log;
 mod paths;
 mod registry;
@@ -13,8 +12,7 @@ mod worker;
 pub(crate) mod test_mocks;
 
 pub use agentic_loop::{run_agentic_loop, LoopConfig, LoopOutcome};
-pub use delegate::{InfraFactories, InProcessSpawner, SpawnerConfig};
+pub use claim_tool_factory::{ClaimContext, ClaimToolFactory};
 pub use paths::ProjectPaths;
-pub use registry::{build_static_tools, ApexToolRegistry, CompositeToolRegistry, OwnedFilteredToolRegistry};
+pub use registry::{CompositeToolRegistry, OwnedFilteredToolRegistry};
 pub use worker::{worker_loop, WorkerContext, WorkerLimits};
-
