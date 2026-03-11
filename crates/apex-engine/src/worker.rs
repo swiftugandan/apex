@@ -3,18 +3,18 @@ use tokio::sync::Mutex;
 
 use anyhow::Result;
 
-use apex_core::config::CompactionSection;
+use apex_core::config::{CompactionSection, ConsolidationSection};
 use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{
-    AttemptOutcome, AttemptRecord, ChatMessage, ClaimedTask, MessageType,
+    AttemptOutcome, AttemptRecord, ChatMessage, ClaimedTask, HookEvent, HookOutcome, MessageType,
 };
-use apex_core::ports::{LlmProvider, MemoryStore, Queue, SkillStore, WorkingMemory};
+use apex_core::ports::{HookRegistry, LlmProvider, MemoryStore, Queue, SkillStore, WorkingMemory};
 
 use apex_tools::QueueToolRegistry;
 
-use crate::agentic_loop::{run_agentic_loop, LoopConfig};
+use crate::agentic_loop::{run_agentic_loop, LoopConfig, LoopOutcome};
 use crate::consolidation::consolidate_learnings;
-use crate::constants::{MAX_EMPTY_CYCLES, RATE_LIMIT_BACKOFF_SECS};
+use crate::log::dispatch_log;
 use crate::registry::{ApexToolRegistry, CompositeToolRegistry};
 use crate::util::{composer_from_estimator, extract_title, now_unix_ts};
 
@@ -33,8 +33,12 @@ pub struct WorkerContext {
     pub max_retries: u32,
     pub max_tool_result_bytes: usize,
     pub max_output_tokens: u32,
+    pub max_turns: usize,
+    pub max_empty_cycles: u32,
     pub estimator: Arc<Mutex<TokenEstimator>>,
     pub compaction: CompactionSection,
+    pub consolidation: ConsolidationSection,
+    pub hooks: Option<Arc<dyn HookRegistry>>,
 }
 
 // ── Worker loop ─────────────────────────────────────────────────────
@@ -66,7 +70,7 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
                 }
 
                 empty_cycles += 1;
-                if empty_cycles > MAX_EMPTY_CYCLES {
+                if empty_cycles > ctx.max_empty_cycles {
                     eprintln!("[worker {worker_id}] giving up after {empty_cycles} empty cycles");
                     return Ok(());
                 }
@@ -81,10 +85,29 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
             MessageType::Subtask => "subtask",
             MessageType::Continuation => "continuation",
         };
-        eprintln!(
-            "[worker {worker_id}] ▶ Processing {type_label} {} (depth {}, retry {})",
-            claimed.id, claimed.headers.depth, claimed.headers.retry_count
-        );
+        {
+            let msg = format!(
+                "[worker {worker_id}] ▶ Processing {type_label} {} (depth {}, retry {})",
+                claimed.id, claimed.headers.depth, claimed.headers.retry_count
+            );
+            let id = &claimed.id;
+            let depth = claimed.headers.depth;
+            let retry = claimed.headers.retry_count;
+            dispatch_log(
+                ctx.hooks.as_deref(),
+                || serde_json::json!({
+                    "level": "info",
+                    "event": "claim_start",
+                    "worker_id": worker_id,
+                    "message_type": type_label,
+                    "message_id": id,
+                    "depth": depth,
+                    "retry_count": retry,
+                }),
+                &msg,
+            )
+            .await;
+        }
 
         // Build per-claim tool registry (static tools + queue tools)
         let composer = composer_from_estimator(&ctx.estimator).await;
@@ -99,7 +122,8 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
             Some(Arc::clone(&ctx.long_term)),
             Some(Arc::clone(&ctx.skills)),
             composer,
-        );
+        )
+        .with_hooks(ctx.hooks.clone());
 
         let result = execute_claim(&ctx, &claimed, queue_tools).await;
 
@@ -114,16 +138,32 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
                     .ack(&claimed)
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                eprintln!(
-                    "[worker {worker_id}] ✓ {type_label} {} completed",
-                    claimed.id
-                );
+                {
+                    let msg = format!(
+                        "[worker {worker_id}] ✓ {type_label} {} completed",
+                        claimed.id
+                    );
+                    let id = &claimed.id;
+                    dispatch_log(
+                        ctx.hooks.as_deref(),
+                        || serde_json::json!({
+                            "level": "info",
+                            "event": "claim_done",
+                            "worker_id": worker_id,
+                            "message_type": type_label,
+                            "message_id": id,
+                        }),
+                        &msg,
+                    )
+                    .await;
+                }
             }
             Err((record, err, scratchpad)) => {
                 let composer = composer_from_estimator(&ctx.estimator).await;
                 handle_failure(
                     ctx.queue.as_ref(), &claimed, &record, &err, &scratchpad,
                     worker_id, &composer, ctx.max_retries,
+                    ctx.hooks.as_deref(),
                 )
                 .await?;
             }
@@ -163,6 +203,22 @@ async fn execute_claim(
         }
     };
 
+    // ── after_claim hooks ──
+    let mut initial_body = initial_body;
+    if let Some(ref hooks) = ctx.hooks {
+        let hook_ctx = serde_json::json!({
+            "job_id": job_id,
+            "message_type": format!("{:?}", claimed.headers.message_type),
+            "depth": claimed.headers.depth,
+        });
+        let outcomes = hooks.dispatch(HookEvent::AfterClaim, &hook_ctx).await;
+        for outcome in outcomes {
+            if let HookOutcome::Inject(content) = outcome {
+                initial_body = format!("{initial_body}\n\n---\n{content}");
+            }
+        }
+    }
+
     let messages = vec![ChatMessage::user_text(&initial_body)];
 
     let scratchpad_arc = Arc::new(Mutex::new(scratchpad));
@@ -186,8 +242,10 @@ async fn execute_claim(
         timeout: None,
         compaction_preserve_turns: ctx.compaction.preserve_turns,
         compaction_max_summary_tokens: ctx.compaction.max_summary_tokens,
+        max_turns: ctx.max_turns,
+        hooks: ctx.hooks.as_deref(),
     };
-    let (turns, final_text, _messages) = run_agentic_loop(messages, &loop_config).await;
+    let (turns, loop_outcome, _messages) = run_agentic_loop(messages, &loop_config).await;
 
     // Persist calibration data after loop completes
     {
@@ -201,20 +259,32 @@ async fn execute_claim(
         Err(arc) => arc.lock().await.clone(),
     };
 
-    if let Some(ref text) = final_text {
-        if text.starts_with("LLM error:") {
-            let record = AttemptRecord {
-                attempt_number: claimed.headers.retry_count + 1,
-                started_at,
-                finished_at: now_unix_ts(),
-                turns,
-                final_text: None,
-                outcome: AttemptOutcome::Failed,
-                failure_reason: Some(text.clone()),
-            };
-            return Err((record, text.clone(), scratchpad));
-        }
+    // Map failure outcomes to Err; success outcomes fall through.
+    let failure_reason = match &loop_outcome {
+        LoopOutcome::LlmError(err) => Some(format!("LLM error: {err}")),
+        LoopOutcome::TimedOut => Some("loop timeout exceeded".to_string()),
+        LoopOutcome::Cancelled => Some("cancelled".to_string()),
+        LoopOutcome::BlockedByHook(msg) => Some(format!("blocked by hook: {msg}")),
+        LoopOutcome::Completed(_) | LoopOutcome::MaxTurnsExhausted => None,
+    };
+    if let Some(reason) = failure_reason {
+        let record = AttemptRecord {
+            attempt_number: claimed.headers.retry_count + 1,
+            started_at,
+            finished_at: now_unix_ts(),
+            turns,
+            final_text: None,
+            outcome: AttemptOutcome::Failed,
+            failure_reason: Some(reason.clone()),
+        };
+        return Err((record, reason, scratchpad));
     }
+
+    // Extract final_text from Completed variant
+    let final_text = match loop_outcome {
+        LoopOutcome::Completed(text) => text,
+        _ => None,
+    };
 
     // Scratchpad is already up-to-date — tool calls went through the mutex.
     // Just persist the final state.
@@ -230,42 +300,48 @@ async fn execute_claim(
         failure_reason: None,
     };
 
-    // Best-effort consolidation
-    consolidate_learnings(
-        ctx.long_term.as_ref(),
-        ctx.skills.as_ref(),
-        &claimed.headers.correlation_id,
-        &record,
-        &scratchpad,
-    )
-    .await;
+    // ── on_success hooks (fire before consolidation so hooks can block it) ──
+    let mut skip_consolidation = false;
+    if let Some(ref hooks) = ctx.hooks {
+        let hook_ctx = serde_json::json!({
+            "job_id": job_id,
+            "turns": record.turns.len(),
+            "final_text": record.final_text,
+        });
+        for outcome in hooks.dispatch(HookEvent::OnSuccess, &hook_ctx).await {
+            if let HookOutcome::Block(_) = outcome {
+                skip_consolidation = true;
+                break;
+            }
+        }
+    }
+
+    // Best-effort consolidation (respects config + hook decisions)
+    if ctx.consolidation.enabled && !skip_consolidation {
+        consolidate_learnings(
+            ctx.long_term.as_ref(),
+            ctx.skills.as_ref(),
+            &claimed.headers.correlation_id,
+            &record,
+            &scratchpad,
+            &ctx.consolidation,
+        )
+        .await;
+    }
 
     Ok(record)
 }
 
 // ── Failure handling ────────────────────────────────────────────────
 
-/// Returns true if the error is non-retryable (e.g. auth, billing, invalid config).
-fn is_non_retryable(err: &str) -> bool {
-    let non_retryable_patterns = [
-        "credit balance is too low",
-        "invalid x-api-key",
-        "invalid api key",
-        "authentication_error",
-        "permission_error",
-        "not_found_error",
-        "configuration error:",
-    ];
-    let lower = err.to_lowercase();
-    non_retryable_patterns
-        .iter()
-        .any(|pattern| lower.contains(pattern))
-}
-
-/// Returns true if the error is a rate limit (429) that should be retried with backoff.
-fn is_rate_limited(err: &str) -> bool {
-    let lower = err.to_lowercase();
-    lower.contains("rate_limit") || lower.contains("429") || lower.contains("too many requests")
+/// What to do after a failure is classified by hooks.
+enum FailureAction {
+    /// Non-retryable: move to failed/ immediately.
+    Reject(String),
+    /// Retry after a specified backoff (in seconds).
+    RetryWithBackoff(u64),
+    /// Generic failure: nack without delay, let the queue handle redelivery.
+    RetryDefault,
 }
 
 async fn handle_failure(
@@ -277,8 +353,20 @@ async fn handle_failure(
     worker_id: usize,
     composer: &MessageComposer,
     max_retries: u32,
+    hooks: Option<&dyn HookRegistry>,
 ) -> Result<()> {
-    eprintln!("[worker {worker_id}] ✗ {} failed: {err}", claimed.id);
+    dispatch_log(
+        hooks,
+        || serde_json::json!({
+            "level": "error",
+            "event": "claim_failed",
+            "worker_id": worker_id,
+            "message_id": &claimed.id,
+            "error": err,
+        }),
+        &format!("[worker {worker_id}] ✗ {} failed: {err}", claimed.id),
+    )
+    .await;
 
     let updated_body =
         composer.append_attempt_with_memory(&claimed.body, record, scratchpad);
@@ -288,39 +376,113 @@ async fn handle_failure(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    if is_non_retryable(err) {
-        queue
-            .reject(claimed)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        eprintln!("[worker {worker_id}]   ↳ Non-retryable error, moved to failed/");
-        return Ok(());
+    // Let on_failure hooks classify the error; default to plain retry.
+    let mut action = FailureAction::RetryDefault;
+    if let Some(h) = hooks {
+        let ctx = serde_json::json!({
+            "error": err,
+            "retry_count": claimed.headers.retry_count,
+            "job_id": &claimed.headers.correlation_id,
+        });
+        for outcome in h.dispatch(HookEvent::OnFailure, &ctx).await {
+            match outcome {
+                HookOutcome::Block(reason) => {
+                    action = FailureAction::Reject(reason);
+                    break;
+                }
+                HookOutcome::Continue(Some(json_str)) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                        if let Some(reason) = v.get("block").and_then(|s| s.as_str()) {
+                            action = FailureAction::Reject(reason.to_string());
+                        } else if let Some(secs) = v.get("backoff_secs").and_then(|s| s.as_u64()) {
+                            action = FailureAction::RetryWithBackoff(secs);
+                        }
+                    }
+                    break;
+                }
+                _ => {} // Continue(None) = no opinion, continue to next hook
+            }
+        }
     }
 
-    if is_rate_limited(err) {
-        let backoff_secs = RATE_LIMIT_BACKOFF_SECS * (claimed.headers.retry_count + 1) as u64;
-        eprintln!(
-            "[worker {worker_id}]   ↳ Rate limited, delaying {backoff_secs}s before retry"
-        );
-        queue
-            .nack_with_delay(claimed, std::time::Duration::from_secs(backoff_secs))
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    } else {
-        queue
-            .nack(claimed)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Act on the decision
+    match action {
+        FailureAction::Reject(ref reason) => {
+            queue
+                .reject(claimed)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            dispatch_log(
+                hooks,
+                || serde_json::json!({
+                    "level": "warn",
+                    "event": "claim_rejected",
+                    "worker_id": worker_id,
+                    "message_id": &claimed.id,
+                    "reason": reason,
+                }),
+                &format!("[worker {worker_id}]   ↳ {reason}, moved to failed/"),
+            )
+            .await;
+        }
+        FailureAction::RetryWithBackoff(secs) => {
+            dispatch_log(
+                hooks,
+                || serde_json::json!({
+                    "level": "warn",
+                    "event": "retry_backoff",
+                    "worker_id": worker_id,
+                    "message_id": &claimed.id,
+                    "backoff_secs": secs,
+                }),
+                &format!("[worker {worker_id}]   ↳ Backoff, delaying {secs}s before retry"),
+            )
+            .await;
+            queue
+                .nack_with_delay(claimed, std::time::Duration::from_secs(secs))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        FailureAction::RetryDefault => {
+            queue
+                .nack(claimed)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
     }
 
-    if claimed.headers.retry_count + 1 >= max_retries {
-        eprintln!("[worker {worker_id}]   ↳ Max retries reached, moved to failed/");
-    } else {
-        eprintln!(
-            "[worker {worker_id}]   ↳ Requeued for retry (attempt {} of {})",
-            claimed.headers.retry_count + 2,
-            max_retries
-        );
+    if !matches!(action, FailureAction::Reject(_)) {
+        if claimed.headers.retry_count + 1 >= max_retries {
+            dispatch_log(
+                hooks,
+                || serde_json::json!({
+                    "level": "warn",
+                    "event": "max_retries_reached",
+                    "worker_id": worker_id,
+                    "message_id": &claimed.id,
+                }),
+                &format!("[worker {worker_id}]   ↳ Max retries reached, moved to failed/"),
+            )
+            .await;
+        } else {
+            dispatch_log(
+                hooks,
+                || serde_json::json!({
+                    "level": "info",
+                    "event": "retry_scheduled",
+                    "worker_id": worker_id,
+                    "message_id": &claimed.id,
+                    "attempt": claimed.headers.retry_count + 2,
+                    "max_retries": max_retries,
+                }),
+                &format!(
+                    "[worker {worker_id}]   ↳ Requeued for retry (attempt {} of {})",
+                    claimed.headers.retry_count + 2,
+                    max_retries
+                ),
+            )
+            .await;
+        }
     }
     Ok(())
 }
@@ -328,50 +490,6 @@ async fn handle_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── is_non_retryable ──────────────────────────────────────────
-
-    #[test]
-    fn is_non_retryable_positive() {
-        let patterns = [
-            "credit balance is too low",
-            "invalid x-api-key",
-            "Invalid API Key provided",
-            "authentication_error: bad token",
-            "permission_error: no access",
-            "not_found_error: model gone",
-            "configuration error: missing key",
-        ];
-        for p in patterns {
-            assert!(is_non_retryable(p), "should match: {p}");
-        }
-    }
-
-    #[test]
-    fn is_non_retryable_negative() {
-        assert!(!is_non_retryable("connection timeout"));
-        assert!(!is_non_retryable("internal error"));
-        assert!(!is_non_retryable("rate_limit exceeded"));
-        assert!(!is_non_retryable("something went wrong"));
-    }
-
-    // ── is_rate_limited ───────────────────────────────────────────
-
-    #[test]
-    fn is_rate_limited_positive() {
-        assert!(is_rate_limited("rate_limit exceeded"));
-        assert!(is_rate_limited("Error 429: too many"));
-        assert!(is_rate_limited("too many requests, slow down"));
-    }
-
-    #[test]
-    fn is_rate_limited_negative() {
-        assert!(!is_rate_limited("connection timeout"));
-        assert!(!is_rate_limited("internal error"));
-        assert!(!is_rate_limited("authentication_error"));
-    }
-
-    // ── handle_failure ────────────────────────────────────────────
 
     use apex_core::domain::QueueDepth;
     use crate::test_mocks::*;
@@ -403,8 +521,9 @@ mod tests {
         }
     }
 
+    // Without hooks, all errors default to plain nack (RetryDefault)
     #[tokio::test]
-    async fn handle_failure_non_retryable_rejects() {
+    async fn handle_failure_no_hooks_nacks() {
         let queue = MockQueue::new();
         let claimed = make_claimed("task-1", 0);
         let record = make_record();
@@ -413,47 +532,18 @@ mod tests {
 
         handle_failure(
             &queue, &claimed, &record, "authentication_error: bad token", &scratchpad,
-            0, &composer, 3,
+            0, &composer, 3, None,
         )
         .await
         .unwrap();
 
         let actions = queue.actions.lock().await;
-        // Should have UpdateBody + Reject
+        // Without hooks, everything defaults to nack
         assert!(
-            actions.iter().any(|a| matches!(a, QueueAction::Reject(_))),
-            "expected Reject action, got: {:?}",
+            actions.iter().any(|a| matches!(a, QueueAction::Nack(_))),
+            "expected Nack action, got: {:?}",
             actions
         );
-    }
-
-    #[tokio::test]
-    async fn handle_failure_rate_limited_delays() {
-        let queue = MockQueue::new();
-        let claimed = make_claimed("task-2", 1); // retry_count=1
-        let record = make_record();
-        let scratchpad = apex_core::domain::Scratchpad::new("j2", "goal");
-        let composer = MessageComposer::default();
-
-        handle_failure(
-            &queue, &claimed, &record, "rate_limit exceeded", &scratchpad,
-            0, &composer, 3,
-        )
-        .await
-        .unwrap();
-
-        let actions = queue.actions.lock().await;
-        let nack_delay = actions.iter().find_map(|a| {
-            if let QueueAction::NackWithDelay(_, d) = a {
-                Some(*d)
-            } else {
-                None
-            }
-        });
-        assert!(nack_delay.is_some(), "expected NackWithDelay");
-        // backoff = RATE_LIMIT_BACKOFF_SECS * (retry_count + 1) = 30 * 2 = 60
-        let expected = std::time::Duration::from_secs(RATE_LIMIT_BACKOFF_SECS * 2);
-        assert_eq!(nack_delay.unwrap(), expected);
     }
 
     #[tokio::test]
@@ -466,7 +556,7 @@ mod tests {
 
         handle_failure(
             &queue, &claimed, &record, "connection timeout", &scratchpad,
-            0, &composer, 3,
+            0, &composer, 3, None,
         )
         .await
         .unwrap();
@@ -477,7 +567,6 @@ mod tests {
             "expected Nack action, got: {:?}",
             actions
         );
-        // Should NOT have Reject or NackWithDelay
         assert!(!actions.iter().any(|a| matches!(a, QueueAction::Reject(_))));
         assert!(!actions.iter().any(|a| matches!(a, QueueAction::NackWithDelay(_, _))));
     }
@@ -485,7 +574,6 @@ mod tests {
     #[tokio::test]
     async fn worker_exits_on_empty_queue() {
         let queue = Arc::new(MockQueue::new());
-        // Set depth to 0/0 so worker exits immediately
         *queue.depth_override.lock().await = Some(QueueDepth {
             pending: 0,
             processing: 0,
@@ -509,11 +597,15 @@ mod tests {
             max_retries: 3,
             max_tool_result_bytes: 10_000,
             max_output_tokens: 4096,
+            max_turns: 32,
+            max_empty_cycles: 300,
             estimator: Arc::new(Mutex::new(TokenEstimator::default())),
             compaction: CompactionSection {
                 preserve_turns: 3,
                 max_summary_tokens: 1024,
             },
+            consolidation: ConsolidationSection::default(),
+            hooks: None,
         };
 
         let result = worker_loop(ctx, 0).await;

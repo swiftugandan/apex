@@ -44,6 +44,14 @@ pub struct AgentSection {
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: u32,
 
+    /// Maximum number of LLM turns in a single agentic loop.
+    #[serde(default = "default_max_turns")]
+    pub max_turns: usize,
+
+    /// Number of empty poll cycles before a worker gives up.
+    #[serde(default = "default_max_empty_cycles")]
+    pub max_empty_cycles: u32,
+
     /// Number of days to retain scratchpad files before garbage collection.
     #[serde(default = "default_scratchpad_retention_days")]
     pub scratchpad_retention_days: u32,
@@ -172,6 +180,12 @@ fn default_max_retries() -> u32 {
 fn default_max_output_tokens() -> u32 {
     16_384
 }
+fn default_max_turns() -> usize {
+    32
+}
+fn default_max_empty_cycles() -> u32 {
+    300
+}
 fn default_scratchpad_retention_days() -> u32 {
     7
 }
@@ -257,6 +271,8 @@ impl Default for AgentSection {
             max_depth: default_max_depth(),
             max_retries: default_max_retries(),
             max_output_tokens: default_max_output_tokens(),
+            max_turns: default_max_turns(),
+            max_empty_cycles: default_max_empty_cycles(),
             scratchpad_retention_days: default_scratchpad_retention_days(),
             tools: vec![],
         }

@@ -814,6 +814,162 @@ fn parse_log_line(line: &str) -> Option<LogEntry> {
     })
 }
 
+// ── Lifecycle Hook types ──────────────────────────────────────────
+
+/// Events at which hooks can fire within the lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    BeforeTurn,
+    AfterTurn,
+    BeforeToolCall,
+    AfterToolResult,
+    BeforePush,
+    AfterClaim,
+    OnSuccess,
+    OnFailure,
+    OnLog,
+}
+
+impl std::fmt::Display for HookEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            HookEvent::BeforeTurn => "before_turn",
+            HookEvent::AfterTurn => "after_turn",
+            HookEvent::BeforeToolCall => "before_tool_call",
+            HookEvent::AfterToolResult => "after_tool_result",
+            HookEvent::BeforePush => "before_push",
+            HookEvent::AfterClaim => "after_claim",
+            HookEvent::OnSuccess => "on_success",
+            HookEvent::OnFailure => "on_failure",
+            HookEvent::OnLog => "on_log",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::str::FromStr for HookEvent {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "before_turn" => Ok(HookEvent::BeforeTurn),
+            "after_turn" => Ok(HookEvent::AfterTurn),
+            "before_tool_call" => Ok(HookEvent::BeforeToolCall),
+            "after_tool_result" => Ok(HookEvent::AfterToolResult),
+            "before_push" => Ok(HookEvent::BeforePush),
+            "after_claim" => Ok(HookEvent::AfterClaim),
+            "on_success" => Ok(HookEvent::OnSuccess),
+            "on_failure" => Ok(HookEvent::OnFailure),
+            "on_log" => Ok(HookEvent::OnLog),
+            other => Err(format!("unknown hook event: {other}")),
+        }
+    }
+}
+
+/// What a hook does when it fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookActionType {
+    Script,
+    Transform,
+    Block,
+    Inject,
+}
+
+/// What happens when a hook script fails (non-zero exit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnFailureBehavior {
+    Block,
+    Warn,
+    Continue,
+}
+
+impl Default for OnFailureBehavior {
+    fn default() -> Self {
+        OnFailureBehavior::Warn
+    }
+}
+
+/// Optional filter for when a hook should trigger.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HookFilter {
+    /// Only fire for this specific tool name (for before_tool_call / after_tool_result).
+    #[serde(default)]
+    pub tool: Option<String>,
+}
+
+/// Action configuration for a hook.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookAction {
+    #[serde(rename = "type")]
+    pub action_type: HookActionType,
+    /// Command to execute (for script/transform types).
+    #[serde(default)]
+    pub command: Option<String>,
+    /// What to pipe to stdin: "tool_call", "tool_result", "message", "context".
+    #[serde(default)]
+    pub input: Option<String>,
+    /// Timeout in milliseconds for script execution.
+    #[serde(default = "default_hook_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Content to inject (for inject type).
+    #[serde(default)]
+    pub content: Option<String>,
+    /// What to do when the action fails.
+    #[serde(default)]
+    pub on_failure: OnFailureBehavior,
+    /// Message to use when blocking.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+fn default_hook_timeout_ms() -> u64 {
+    5000
+}
+
+/// A complete hook definition, parsed from a TOML file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookDef {
+    pub hook: HookMeta,
+    pub action: HookAction,
+    /// The file path this hook was loaded from (set at load time, not in TOML).
+    #[serde(skip)]
+    pub source_path: Option<String>,
+}
+
+/// Metadata section of a hook definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookMeta {
+    pub name: String,
+    pub event: HookEvent,
+    #[serde(default)]
+    pub filter: HookFilter,
+    #[serde(default = "default_hook_priority")]
+    pub priority: i32,
+    /// If true, the agent cannot modify or delete this hook.
+    #[serde(default)]
+    pub invariant: bool,
+    /// If true, this hook propagates to sub-agents spawned via delegate.
+    #[serde(default)]
+    pub propagate: bool,
+}
+
+fn default_hook_priority() -> i32 {
+    50
+}
+
+/// The result of running a hook action.
+#[derive(Debug, Clone)]
+pub enum HookOutcome {
+    /// Hook completed successfully, optionally with transformed data.
+    Continue(Option<String>),
+    /// Hook says to block the event from proceeding.
+    Block(String),
+    /// Hook wants to inject content into context.
+    Inject(String),
+}
+
 /// An attempt record capturing a full execution attempt for a task.
 #[derive(Debug, Clone)]
 pub struct AttemptRecord {

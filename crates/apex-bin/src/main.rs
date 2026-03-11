@@ -14,6 +14,8 @@ use apex_engine::{
     InProcessSpawner, InfraFactories, ProjectPaths, SpawnerConfig, WorkerContext,
     build_static_tools, worker_loop,
 };
+use apex_core::ports::HookRegistry;
+use apex_tools::FsHookRegistry;
 use apex_infra::{AnthropicProvider, FsSkillStore, FsScratchpadStore, RfbmqAdapter, SqliteMemoryStore};
 use apex_tools::spill::SpillManager;
 
@@ -93,9 +95,21 @@ async fn main() -> Result<()> {
                 Some(sub) => bail!("unknown config subcommand: {sub}. Available: show, invariants"),
             }
         }
+        Some("hooks") => {
+            let subcmd = args.get(1).map(|s| s.as_str());
+            match subcmd {
+                Some("list") | None => cmd_hooks_list().await,
+                Some("show") => {
+                    let name = args.get(2).context("Usage: apex hooks show <name>")?;
+                    cmd_hooks_show(name).await
+                }
+                Some("validate") => cmd_hooks_validate().await,
+                Some(sub) => bail!("unknown hooks subcommand: {sub}. Available: list, show, validate"),
+            }
+        }
         Some("validate") => cmd_validate().await,
         Some(cmd) => bail!(
-            "unknown command: {cmd}. Available: init, run, queue, cat, work, status, memory, scratch, tools, config, validate"
+            "unknown command: {cmd}. Available: init, run, queue, cat, work, status, memory, scratch, tools, config, hooks, validate"
         ),
         None => bail!("no command provided. Usage: apex <command>"),
     }
@@ -128,6 +142,7 @@ async fn cmd_init() -> Result<()> {
     eprintln!("  tools:    {}", paths.tools_dir.display());
     eprintln!("  config:   {}", paths.config_dir.display());
     eprintln!("  prompts:  {}", paths.prompts_dir.display());
+    eprintln!("  hooks:    {}", paths.hooks_dir.display());
     Ok(())
 }
 
@@ -370,6 +385,9 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
             Arc::new(FsSkillStore::new(path.to_path_buf())) as Arc<dyn SkillStore>
         }),
     });
+    let hooks: Arc<dyn apex_core::ports::HookRegistry> =
+        Arc::new(FsHookRegistry::new(paths.hooks_dir.clone()));
+
     let spawner: Arc<dyn apex_core::ports::SubAgentSpawner> = Arc::new(InProcessSpawner {
         project_paths: paths.clone(),
         parent_long_term: long_term.clone(),
@@ -382,9 +400,13 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
             max_tool_result_bytes,
             max_output_tokens,
             remaining_delegate_depth,
+            max_turns: agent_config.agent.max_turns,
+            max_empty_cycles: agent_config.agent.max_empty_cycles,
             compaction: agent_config.compaction.clone(),
+            consolidation: agent_config.consolidation.clone(),
         },
         infra,
+        hooks: Some(Arc::clone(&hooks)),
     });
 
     let static_tools = build_static_tools(
@@ -412,8 +434,12 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         max_retries,
         max_tool_result_bytes,
         max_output_tokens,
+        max_turns: agent_config.agent.max_turns,
+        max_empty_cycles: agent_config.agent.max_empty_cycles,
         estimator,
         compaction: agent_config.compaction.clone(),
+        consolidation: agent_config.consolidation.clone(),
+        hooks: Some(hooks),
     };
 
     if max_concurrent <= 1 {
@@ -668,6 +694,106 @@ async fn cmd_config_invariants() -> Result<()> {
     Ok(())
 }
 
+// ── Hooks commands ─────────────────────────────────────────────────
+
+async fn cmd_hooks_list() -> Result<()> {
+    let paths = ProjectPaths::resolve()?;
+    let registry = FsHookRegistry::new(paths.hooks_dir);
+    let hooks = registry.all_hooks();
+
+    if hooks.is_empty() {
+        println!("No hooks registered.");
+        return Ok(());
+    }
+
+    let rows: Vec<Vec<String>> = hooks
+        .iter()
+        .map(|h| {
+            vec![
+                h.hook.name.clone(),
+                h.hook.event.to_string(),
+                h.hook.priority.to_string(),
+                format!("{:?}", h.action.action_type).to_lowercase(),
+                h.hook.filter.tool.as_deref().unwrap_or("*").to_string(),
+                if h.hook.invariant { "yes".to_string() } else { "no".to_string() },
+            ]
+        })
+        .collect();
+
+    print_table(
+        "Hooks",
+        &[
+            ("Name", 24),
+            ("Event", 20),
+            ("Priority", 10),
+            ("Type", 12),
+            ("Filter", 16),
+            ("Invariant", 10),
+        ],
+        rows,
+    );
+    Ok(())
+}
+
+async fn cmd_hooks_show(name: &str) -> Result<()> {
+    let paths = ProjectPaths::resolve()?;
+    let registry = FsHookRegistry::new(paths.hooks_dir);
+    let hooks = registry.all_hooks();
+
+    let hook = hooks
+        .iter()
+        .find(|h| h.hook.name == name)
+        .context(format!("hook '{name}' not found"))?;
+
+    println!("── Hook: {} ──", hook.hook.name);
+    println!("  Event:     {}", hook.hook.event);
+    println!("  Priority:  {}", hook.hook.priority);
+    println!("  Type:      {:?}", hook.action.action_type);
+    println!("  Invariant: {}", hook.hook.invariant);
+
+    if let Some(ref tool) = hook.hook.filter.tool {
+        println!("  Filter:    tool={tool}");
+    }
+    if let Some(ref cmd) = hook.action.command {
+        println!("  Command:   {cmd}");
+    }
+    if let Some(ref c) = hook.action.content {
+        println!("  Content:   {}", truncate_col(c, 60));
+    }
+    if let Some(ref msg) = hook.action.message {
+        println!("  Message:   {msg}");
+    }
+
+    // Show source file contents
+    if let Some(ref path) = hook.source_path {
+        println!("\n── Source: {path} ──");
+        if let Ok(content) = std::fs::read_to_string(path) {
+            println!("{content}");
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_hooks_validate() -> Result<()> {
+    let paths = ProjectPaths::resolve()?;
+    let registry = FsHookRegistry::new(paths.hooks_dir);
+    let issues = registry.validate_all();
+
+    if issues.is_empty() {
+        println!("All hooks are valid.");
+    } else {
+        for (name, errs) in &issues {
+            eprintln!("[ERROR] {name}:");
+            for err in errs {
+                eprintln!("  - {err}");
+            }
+        }
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 async fn cmd_validate() -> Result<()> {
     let paths = ProjectPaths::resolve()?;
     let invariants = ConfigLoader::load_invariants(&paths.config_dir)?;
@@ -675,12 +801,35 @@ async fn cmd_validate() -> Result<()> {
     let report = validate_full(&config, &invariants, &paths.prompts_dir);
 
     let display = report.display();
+    let mut has_errors = !report.is_ok();
+
     if report.is_ok() {
         println!("{display}");
-        Ok(())
     } else {
         eprintln!("{display}");
+    }
+
+    // Also validate hooks
+    let hook_registry = FsHookRegistry::new(paths.hooks_dir);
+    let hook_issues = hook_registry.validate_all();
+    if !hook_issues.is_empty() {
+        has_errors = true;
+        for (name, errs) in &hook_issues {
+            eprintln!("[ERROR] hook {name}:");
+            for err in errs {
+                eprintln!("  - {err}");
+            }
+        }
+    } else {
+        let hook_count = hook_registry.all_hooks().len();
+        if hook_count > 0 {
+            println!("Hooks: {hook_count} hook(s) validated.");
+        }
+    }
+
+    if has_errors {
         std::process::exit(1);
     }
+    Ok(())
 }
 

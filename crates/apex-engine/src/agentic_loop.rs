@@ -6,16 +6,33 @@ use tokio_util::sync::CancellationToken;
 
 use apex_core::context::TokenEstimator;
 use apex_core::domain::{
-    ChatMessage, CompletionRequest, ContentBlock, LogEntry, MessageRole,
-    ToolCallRecord, TurnRecord,
+    ChatMessage, CompletionRequest, ContentBlock, HookEvent, HookOutcome,
+    LogEntry, MessageRole, ToolCallRecord, TurnRecord,
 };
-use apex_core::ports::{LlmProvider, ToolRegistry, WorkingMemory};
+use apex_core::ports::{HookRegistry, LlmProvider, ToolRegistry, WorkingMemory};
 
 use apex_core::summarize_json;
 
 use crate::compaction::compact_messages;
+use crate::constants::COMPACT_CONVERSATION_TOOL;
+use crate::log::dispatch_log;
 
-use crate::constants::{COMPACT_CONVERSATION_TOOL, MAX_TURNS};
+/// Outcome of an agentic loop run.
+#[derive(Debug, Clone)]
+pub enum LoopOutcome {
+    /// Normal finish with optional final text from the LLM.
+    Completed(Option<String>),
+    /// LLM provider returned an error.
+    LlmError(String),
+    /// Cancellation token was triggered.
+    Cancelled,
+    /// Wall-clock deadline exceeded.
+    TimedOut,
+    /// A BeforeTurn hook blocked execution.
+    BlockedByHook(String),
+    /// Hit the turn limit without the LLM finishing.
+    MaxTurnsExhausted,
+}
 
 /// Configuration bundle for the agentic loop.
 pub struct LoopConfig<'a> {
@@ -33,6 +50,10 @@ pub struct LoopConfig<'a> {
     pub timeout: Option<Duration>,
     pub compaction_preserve_turns: usize,
     pub compaction_max_summary_tokens: u32,
+    /// Maximum number of LLM turns in this loop.
+    pub max_turns: usize,
+    /// Optional lifecycle hook registry.
+    pub hooks: Option<&'a dyn HookRegistry>,
 }
 
 /// Runs the multi-turn LLM + tool execution loop. Shared between
@@ -40,25 +61,47 @@ pub struct LoopConfig<'a> {
 pub async fn run_agentic_loop(
     initial_messages: Vec<ChatMessage>,
     config: &LoopConfig<'_>,
-) -> (Vec<TurnRecord>, Option<String>, Vec<ChatMessage>) {
+) -> (Vec<TurnRecord>, LoopOutcome, Vec<ChatMessage>) {
     let mut messages = initial_messages;
     let mut turns: Vec<TurnRecord> = Vec::new();
-    let mut final_text: Option<String> = None;
+    let mut outcome: Option<LoopOutcome> = None;
     let deadline = config.timeout.map(|d| Instant::now() + d);
     let schemas = config.tools.schemas();
     let system_prompt = config.persona.to_string();
 
-    for turn_num in 0..MAX_TURNS {
+    for turn_num in 0..config.max_turns {
         // Check cancellation and timeout before each turn
         if let Some(token) = config.cancel {
             if token.is_cancelled() {
-                final_text = Some("Cancelled".to_string());
+                outcome = Some(LoopOutcome::Cancelled);
                 break;
             }
         }
         if let Some(dl) = deadline {
             if Instant::now() >= dl {
-                final_text = Some("LLM error: loop timeout exceeded".to_string());
+                outcome = Some(LoopOutcome::TimedOut);
+                break;
+            }
+        }
+
+        // ── before_turn hooks ──
+        if let Some(hooks) = config.hooks {
+            let ctx = serde_json::json!({ "turn": turn_num + 1 });
+            let outcomes = hooks.dispatch(HookEvent::BeforeTurn, &ctx).await;
+            for hook_outcome in outcomes {
+                match hook_outcome {
+                    HookOutcome::Inject(content) => {
+                        // Inject content as a user message before the LLM call
+                        messages.push(ChatMessage::user_text(&content));
+                    }
+                    HookOutcome::Block(msg) => {
+                        outcome = Some(LoopOutcome::BlockedByHook(msg));
+                        break;
+                    }
+                    HookOutcome::Continue(_) => {}
+                }
+            }
+            if outcome.is_some() {
                 break;
             }
         }
@@ -73,19 +116,36 @@ pub async fn run_agentic_loop(
         let resp = match config.llm.complete_with_tools(req, &schemas).await {
             Ok(r) => r,
             Err(err) => {
-                // Signal LLM error via final_text starting with "LLM error:"
-                final_text = Some(format!("LLM error: {err}"));
+                outcome = Some(LoopOutcome::LlmError(format!("{err}")));
                 break;
             }
         };
 
-        eprintln!(
-            "  turn {}: {} tool call(s), {} input / {} output tokens",
-            turn_num + 1,
-            resp.tool_calls.len(),
-            resp.usage.input_tokens,
-            resp.usage.output_tokens,
-        );
+        {
+            let msg = format!(
+                "  turn {}: {} tool call(s), {} input / {} output tokens",
+                turn_num + 1,
+                resp.tool_calls.len(),
+                resp.usage.input_tokens,
+                resp.usage.output_tokens,
+            );
+            let tool_count = resp.tool_calls.len();
+            let input_toks = resp.usage.input_tokens;
+            let output_toks = resp.usage.output_tokens;
+            dispatch_log(
+                config.hooks,
+                || serde_json::json!({
+                    "level": "info",
+                    "event": "turn_summary",
+                    "turn": turn_num + 1,
+                    "tool_calls": tool_count,
+                    "input_tokens": input_toks,
+                    "output_tokens": output_toks,
+                }),
+                &msg,
+            )
+            .await;
+        }
 
         // Calibrate token estimator (in-memory only; caller persists after loop)
         {
@@ -102,13 +162,12 @@ pub async fn run_agentic_loop(
 
         if resp.tool_calls.is_empty() {
             let text = resp.text();
-            if !text.is_empty() {
-                final_text = Some(text);
-            }
+            let final_text = if text.is_empty() { None } else { Some(text) };
             turns.push(TurnRecord {
                 tool_calls: vec![],
                 usage: resp.usage,
             });
+            outcome = Some(LoopOutcome::Completed(final_text));
             break;
         }
 
@@ -116,11 +175,69 @@ pub async fn run_agentic_loop(
         let mut result_blocks = Vec::new();
 
         // Execute non-compaction tool calls concurrently
-        let tool_futures: Vec<_> = resp.tool_calls.iter()
+        // Note: before_tool_call hooks run per-call before execution.
+        // If hooks need to block, we collect blocked calls first.
+        let non_compact_calls: Vec<_> = resp.tool_calls.iter()
             .filter(|c| c.name != COMPACT_CONVERSATION_TOOL)
+            .collect();
+
+        // Check before_tool_call hooks (must be sequential since hooks may block)
+        let mut blocked_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(hooks) = config.hooks {
+            for call in &non_compact_calls {
+                let ctx = serde_json::json!({
+                    "tool": call.name,
+                    "name": call.name,
+                    "id": call.id,
+                    "input": call.input,
+                });
+                let outcomes = hooks.dispatch(HookEvent::BeforeToolCall, &ctx).await;
+                for outcome in &outcomes {
+                    if let HookOutcome::Block(msg) = outcome {
+                        dispatch_log(
+                            config.hooks,
+                            || serde_json::json!({
+                                "level": "warn",
+                                "event": "tool_blocked",
+                                "tool": &call.name,
+                                "id": &call.id,
+                                "reason": &msg,
+                            }),
+                            &format!("  ↳ {}(…) BLOCKED: {}", call.name, msg),
+                        ).await;
+                        blocked_calls.insert(call.id.clone());
+                        result_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: call.id.clone(),
+                            content: format!("Blocked by hook: {msg}"),
+                            is_error: true,
+                        });
+                        call_records.push(ToolCallRecord {
+                            name: call.name.clone(),
+                            input_summary: summarize_json(&call.input, 80),
+                            output_summary: format!("BLOCKED: {msg}"),
+                            is_error: true,
+                            duration_ms: 0,
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+
+        let tool_futures: Vec<_> = non_compact_calls.iter()
+            .filter(|c| !blocked_calls.contains(&c.id))
             .map(|call| {
             async move {
-                eprintln!("  ↳ {}(…)", call.name);
+                dispatch_log(
+                    config.hooks,
+                    || serde_json::json!({
+                        "level": "info",
+                        "event": "tool_start",
+                        "tool": &call.name,
+                        "id": &call.id,
+                    }),
+                    &format!("  ↳ {}(…)", call.name),
+                ).await;
                 let start = Instant::now();
                 let result = match config.tools.execute(call).await {
                     Ok(r) => r,
@@ -151,16 +268,39 @@ pub async fn run_agentic_loop(
 
             let raw_content = serde_json::to_string(&result.output)
                 .unwrap_or_else(|_| "{}".to_string());
-            let content = if raw_content.len() > config.max_tool_result_bytes {
-                let truncated = apex_core::truncate_str(&raw_content, config.max_tool_result_bytes);
-                format!("{truncated}\n\n[truncated: {orig} bytes → {kept} bytes]",
-                    orig = raw_content.len(), kept = truncated.len())
-            } else {
-                raw_content
-            };
+
+            // ── after_tool_result hooks ──
+            // Pass untruncated content to hooks so they see the full output.
+            let mut final_content = raw_content.clone();
+            let mut was_transformed = false;
+            if let Some(hooks) = config.hooks {
+                let ctx = serde_json::json!({
+                    "tool": call.name,
+                    "name": call.name,
+                    "id": call.id,
+                    "output": &raw_content,
+                    "is_error": result.is_error,
+                    "max_tool_result_bytes": config.max_tool_result_bytes,
+                });
+                let outcomes = hooks.dispatch(HookEvent::AfterToolResult, &ctx).await;
+                for outcome in outcomes {
+                    if let HookOutcome::Continue(Some(transformed)) = outcome {
+                        final_content = transformed;
+                        was_transformed = true;
+                    }
+                }
+            }
+
+            // Apply default truncation as fallback only if no Transform hook acted.
+            if !was_transformed && final_content.len() > config.max_tool_result_bytes {
+                let truncated = apex_core::truncate_str(&final_content, config.max_tool_result_bytes);
+                final_content = format!("{truncated}\n\n[truncated: {orig} bytes → {kept} bytes]",
+                    orig = raw_content.len(), kept = truncated.len());
+            }
+
             result_blocks.push(ContentBlock::ToolResult {
                 tool_use_id: result.tool_use_id,
-                content,
+                content: final_content,
                 is_error: result.is_error,
             });
         }
@@ -170,7 +310,16 @@ pub async fn run_agentic_loop(
             let mut compact_iter = resp.tool_calls.iter()
                 .filter(|c| c.name == COMPACT_CONVERSATION_TOOL);
             if let Some(compact_call) = compact_iter.next() {
-                eprintln!("  ↳ compact_conversation(…)");
+                dispatch_log(
+                    config.hooks,
+                    || serde_json::json!({
+                        "level": "info",
+                        "event": "tool_start",
+                        "tool": "compact_conversation",
+                    }),
+                    "  ↳ compact_conversation(…)",
+                )
+                .await;
                 let start = Instant::now();
                 match compact_messages(
                     &messages,
@@ -246,9 +395,19 @@ pub async fn run_agentic_loop(
             role: MessageRole::User,
             content: result_blocks,
         });
+
+        // ── after_turn hooks ──
+        if let Some(hooks) = config.hooks {
+            let ctx = serde_json::json!({
+                "turn": turn_num + 1,
+                "tool_count": turns.last().map_or(0, |t: &TurnRecord| t.tool_calls.len()),
+            });
+            let _ = hooks.dispatch(HookEvent::AfterTurn, &ctx).await;
+        }
     }
 
-    (turns, final_text, messages)
+    let outcome = outcome.unwrap_or(LoopOutcome::MaxTurnsExhausted);
+    (turns, outcome, messages)
 }
 
 #[cfg(test)]
@@ -280,14 +439,16 @@ mod tests {
             timeout: None,
             compaction_preserve_turns: 3,
             compaction_max_summary_tokens: 1024,
+            max_turns: 32,
+            hooks: None,
         };
 
         let messages = vec![ChatMessage::user_text("Hi")];
-        let (turns, final_text, _msgs) = run_agentic_loop(messages, &config).await;
+        let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
 
         assert_eq!(turns.len(), 1);
         assert!(turns[0].tool_calls.is_empty());
-        assert_eq!(final_text.as_deref(), Some("Hello, world!"));
+        assert!(matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "Hello, world!"));
     }
 
     #[tokio::test]
@@ -314,16 +475,18 @@ mod tests {
             timeout: None,
             compaction_preserve_turns: 3,
             compaction_max_summary_tokens: 1024,
+            max_turns: 32,
+            hooks: None,
         };
 
         let messages = vec![ChatMessage::user_text("Do something")];
-        let (turns, final_text, _msgs) = run_agentic_loop(messages, &config).await;
+        let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
 
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].tool_calls.len(), 1);
         assert_eq!(turns[0].tool_calls[0].name, "test_tool");
         assert!(turns[1].tool_calls.is_empty());
-        assert_eq!(final_text.as_deref(), Some("Done!"));
+        assert!(matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "Done!"));
 
         // Verify the tool was actually called
         let calls = tools.calls.lock().await;
@@ -350,14 +513,15 @@ mod tests {
             timeout: None,
             compaction_preserve_turns: 3,
             compaction_max_summary_tokens: 1024,
+            max_turns: 32,
+            hooks: None,
         };
 
         let messages = vec![ChatMessage::user_text("Hi")];
-        let (_turns, final_text, _msgs) = run_agentic_loop(messages, &config).await;
+        let (_turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
 
-        let text = final_text.unwrap();
-        assert!(text.starts_with("LLM error:"), "got: {text}");
-        assert!(text.contains("API overloaded"));
+        assert!(matches!(&outcome, LoopOutcome::LlmError(e) if e.contains("API overloaded")),
+            "got: {outcome:?}");
     }
 
     #[tokio::test]
@@ -384,16 +548,18 @@ mod tests {
             timeout: None,
             compaction_preserve_turns: 3,
             compaction_max_summary_tokens: 1024,
+            max_turns: 32,
+            hooks: None,
         };
 
         let messages = vec![ChatMessage::user_text("Do something")];
-        let (turns, final_text, _msgs) = run_agentic_loop(messages, &config).await;
+        let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
 
         // Tool error should be converted to ToolResult with is_error:true
         assert_eq!(turns[0].tool_calls.len(), 1);
         assert!(turns[0].tool_calls[0].is_error);
         // Loop should continue and get the final text
-        assert_eq!(final_text.as_deref(), Some("Recovered"));
+        assert!(matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "Recovered"));
     }
 
     #[tokio::test]
@@ -417,13 +583,15 @@ mod tests {
             timeout: None,
             compaction_preserve_turns: 3,
             compaction_max_summary_tokens: 1024,
+            max_turns: 32,
+            hooks: None,
         };
 
         let messages = vec![ChatMessage::user_text("Hi")];
-        let (turns, final_text, _msgs) = run_agentic_loop(messages, &config).await;
+        let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
 
         assert!(turns.is_empty());
-        assert_eq!(final_text.as_deref(), Some("Cancelled"));
+        assert!(matches!(outcome, LoopOutcome::Cancelled));
     }
 
     #[tokio::test]
@@ -445,25 +613,26 @@ mod tests {
             timeout: Some(Duration::from_secs(0)), // Already expired
             compaction_preserve_turns: 3,
             compaction_max_summary_tokens: 1024,
+            max_turns: 32,
+            hooks: None,
         };
 
         let messages = vec![ChatMessage::user_text("Hi")];
-        let (turns, final_text, _msgs) = run_agentic_loop(messages, &config).await;
+        let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
 
         assert!(turns.is_empty());
-        let text = final_text.unwrap();
-        assert!(text.contains("loop timeout exceeded"), "got: {text}");
+        assert!(matches!(outcome, LoopOutcome::TimedOut));
     }
 
     #[tokio::test]
     async fn loop_stops_at_max_turns() {
+        let max_turns = 8;
         let tool_call = ToolCall {
             id: "call-1".into(),
             name: "test_tool".into(),
             input: serde_json::json!({}),
         };
-        // Queue MAX_TURNS worth of tool-call responses
-        let llm = MockLlmProvider::always_tool_call(tool_call, MAX_TURNS + 5);
+        let llm = MockLlmProvider::always_tool_call(tool_call, max_turns + 5);
         let tools = MockToolRegistry::echo("test_tool");
         let estimator = default_estimator();
 
@@ -480,12 +649,15 @@ mod tests {
             timeout: None,
             compaction_preserve_turns: 3,
             compaction_max_summary_tokens: 1024,
+            max_turns,
+            hooks: None,
         };
 
         let messages = vec![ChatMessage::user_text("Do something")];
-        let (turns, _final_text, _msgs) = run_agentic_loop(messages, &config).await;
+        let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
 
-        assert_eq!(turns.len(), MAX_TURNS);
+        assert_eq!(turns.len(), max_turns);
+        assert!(matches!(outcome, LoopOutcome::MaxTurnsExhausted));
     }
 
     #[tokio::test]
@@ -513,6 +685,8 @@ mod tests {
             timeout: None,
             compaction_preserve_turns: 3,
             compaction_max_summary_tokens: 1024,
+            max_turns: 32,
+            hooks: None,
         };
 
         let messages = vec![ChatMessage::user_text("Get data")];

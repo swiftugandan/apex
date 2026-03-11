@@ -1,3 +1,4 @@
+use apex_core::config::ConsolidationSection;
 use apex_core::domain::{
     slugify, AttemptOutcome, AttemptRecord, Fact, FactId, Scratchpad, Skill, SkillId, SkillStatus,
     SubtaskStatus,
@@ -15,33 +16,36 @@ pub async fn consolidate_learnings(
     correlation_id: &str,
     record: &AttemptRecord,
     scratchpad: &Scratchpad,
+    config: &ConsolidationSection,
 ) {
     // 1. Extract facts from "## New Facts Discovered" sections
-    if let Some(ref text) = record.final_text {
-        let mut in_facts_section = false;
-        for line in text.lines() {
-            if line.contains("New Facts Discovered") || line.contains("new facts discovered") {
-                in_facts_section = true;
-                continue;
-            }
-            if in_facts_section && line.starts_with("## ") {
-                break;
-            }
-            if in_facts_section {
-                if let Some(content) = line.strip_prefix("- ") {
-                    let content = content.trim();
-                    if !content.is_empty() {
-                        let fact = Fact {
-                            id: FactId(String::new()),
-                            content: content.to_string(),
-                            source_job: correlation_id.to_string(),
-                            confidence: 0.8,
-                            created_at: String::new(),
-                            last_verified: String::new(),
-                            tags: vec![],
-                        };
-                        if let Err(e) = store.store_fact(fact).await {
-                            log_consolidation_err("failed to store fact", &e);
+    if config.extract_facts {
+        if let Some(ref text) = record.final_text {
+            let mut in_facts_section = false;
+            for line in text.lines() {
+                if line.contains("New Facts Discovered") || line.contains("new facts discovered") {
+                    in_facts_section = true;
+                    continue;
+                }
+                if in_facts_section && line.starts_with("## ") {
+                    break;
+                }
+                if in_facts_section {
+                    if let Some(content) = line.strip_prefix("- ") {
+                        let content = content.trim();
+                        if !content.is_empty() {
+                            let fact = Fact {
+                                id: FactId(String::new()),
+                                content: content.to_string(),
+                                source_job: correlation_id.to_string(),
+                                confidence: 0.8,
+                                created_at: String::new(),
+                                last_verified: String::new(),
+                                tags: vec![],
+                            };
+                            if let Err(e) = store.store_fact(fact).await {
+                                log_consolidation_err("failed to store fact", &e);
+                            }
                         }
                     }
                 }
@@ -50,65 +54,67 @@ pub async fn consolidate_learnings(
     }
 
     // 2. Skills: update fitness for successful tasks
-    let title = &scratchpad.goal;
-    if !title.is_empty() {
-        match skill_store.find_skill(title).await {
-            Ok(Some(skill)) => {
-                if let Err(e) = skill_store
-                    .update_skill_fitness(&skill.id, record.outcome == AttemptOutcome::Success)
-                    .await
-                {
-                    log_consolidation_err("failed to update skill fitness", &e);
-                }
-            }
-            Ok(None) => {
-                let tools_used: Vec<String> = record
-                    .turns
-                    .iter()
-                    .flat_map(|t| t.tool_calls.iter())
-                    .map(|tc| tc.name.clone())
-                    .collect::<std::collections::HashSet<_>>()
-                    .into_iter()
-                    .collect();
-
-                if !tools_used.is_empty() && record.outcome == AttemptOutcome::Success {
-                    let approach = record
-                        .final_text
-                        .as_deref()
-                        .unwrap_or("")
-                        .lines()
-                        .take(3)
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let skill = Skill {
-                        id: SkillId(String::new()),
-                        name: slugify(title),
-                        description: title.to_string(),
-                        task_pattern: title.to_string(),
-                        approach,
-                        tools_used,
-                        criteria_template: None,
-                        success_count: 1,
-                        failure_count: 0,
-                        fitness: 0.5,
-                        min_samples: 3,
-                        last_used: String::new(),
-                        notes: String::new(),
-                        status: SkillStatus::Active,
-                    };
-                    if let Err(e) = skill_store.store_skill(skill).await {
-                        log_consolidation_err("failed to store skill", &e);
+    if config.extract_skills {
+        let title = &scratchpad.goal;
+        if !title.is_empty() {
+            match skill_store.find_skill(title).await {
+                Ok(Some(skill)) => {
+                    if let Err(e) = skill_store
+                        .update_skill_fitness(&skill.id, record.outcome == AttemptOutcome::Success)
+                        .await
+                    {
+                        log_consolidation_err("failed to update skill fitness", &e);
                     }
                 }
-            }
-            Err(e) => {
-                log_consolidation_err("failed to find skill", &e);
+                Ok(None) => {
+                    let tools_used: Vec<String> = record
+                        .turns
+                        .iter()
+                        .flat_map(|t| t.tool_calls.iter())
+                        .map(|tc| tc.name.clone())
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect();
+
+                    if !tools_used.is_empty() && record.outcome == AttemptOutcome::Success {
+                        let approach = record
+                            .final_text
+                            .as_deref()
+                            .unwrap_or("")
+                            .lines()
+                            .take(3)
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let skill = Skill {
+                            id: SkillId(String::new()),
+                            name: slugify(title),
+                            description: title.to_string(),
+                            task_pattern: title.to_string(),
+                            approach,
+                            tools_used,
+                            criteria_template: None,
+                            success_count: 1,
+                            failure_count: 0,
+                            fitness: 0.5,
+                            min_samples: 3,
+                            last_used: String::new(),
+                            notes: String::new(),
+                            status: SkillStatus::Active,
+                        };
+                        if let Err(e) = skill_store.store_skill(skill).await {
+                            log_consolidation_err("failed to store skill", &e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log_consolidation_err("failed to find skill", &e);
+                }
             }
         }
     }
 
     // 3. Decomposition skills: for jobs with subtasks, store as a skill
-    if !scratchpad.subtasks.is_empty() && !scratchpad.goal.is_empty() {
+    if config.extract_strategies && !scratchpad.subtasks.is_empty() && !scratchpad.goal.is_empty() {
         let decomposition = scratchpad
             .subtasks
             .iter()

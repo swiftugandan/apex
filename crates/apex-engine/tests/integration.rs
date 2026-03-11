@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use apex_core::config::CompactionSection;
+use apex_core::config::{CompactionSection, ConsolidationSection};
 use apex_core::context::TokenEstimator;
 use apex_core::domain::{
     CalibrationData, ChatMessage, CompletionRequest, CompletionResponse, ContentBlock,
@@ -221,11 +221,15 @@ async fn single_task_roundtrip() {
         max_retries: 3,
         max_tool_result_bytes: 10_000,
         max_output_tokens: 4096,
+        max_turns: 32,
+        max_empty_cycles: 300,
         estimator: Arc::new(Mutex::new(TokenEstimator::default())),
         compaction: CompactionSection {
             preserve_turns: 3,
             max_summary_tokens: 1024,
         },
+        consolidation: ConsolidationSection::default(),
+        hooks: None,
     };
 
     // Run the worker loop — it should process the one message and exit

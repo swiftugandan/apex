@@ -5,10 +5,11 @@ use serde_json::{json, Value};
 
 use apex_core::context::MessageComposer;
 use apex_core::domain::{
-    MessageHeaders, MessageType, QueueMessage, ToolCall, ToolDef, ToolResult, ToolSchema,
+    HookEvent, HookOutcome, MessageHeaders, MessageType, QueueMessage, ToolCall, ToolDef,
+    ToolResult, ToolSchema,
 };
 use apex_core::error::ToolError;
-use apex_core::ports::{MemoryStore, Queue, SkillStore, ToolRegistry};
+use apex_core::ports::{HookRegistry, MemoryStore, Queue, SkillStore, ToolRegistry};
 
 pub struct QueueToolRegistry {
     queue: Arc<dyn Queue>,
@@ -20,6 +21,7 @@ pub struct QueueToolRegistry {
     store: Option<Arc<dyn MemoryStore>>,
     skill_store: Option<Arc<dyn SkillStore>>,
     composer: MessageComposer,
+    hooks: Option<Arc<dyn HookRegistry>>,
 }
 
 impl QueueToolRegistry {
@@ -44,7 +46,35 @@ impl QueueToolRegistry {
             store,
             skill_store,
             composer,
+            hooks: None,
         }
+    }
+
+    /// Set the hook registry for dispatching `before_push` events.
+    pub fn with_hooks(mut self, hooks: Option<Arc<dyn HookRegistry>>) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    /// Dispatch `before_push` hooks. Returns `Err` if any hook blocks the push.
+    async fn dispatch_before_push(&self, msg: &QueueMessage) -> Result<(), ToolError> {
+        let Some(ref hooks) = self.hooks else {
+            return Ok(());
+        };
+        let context = json!({
+            "correlation_id": msg.headers.correlation_id,
+            "message_type": format!("{:?}", msg.headers.message_type),
+            "depth": msg.headers.depth,
+        });
+        let outcomes = hooks.dispatch(HookEvent::BeforePush, &context).await;
+        for outcome in outcomes {
+            if let HookOutcome::Block(reason) = outcome {
+                return Err(ToolError::Execution(format!(
+                    "Push blocked by hook: {reason}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     async fn handle_decompose_goal(&self, input: &Value) -> Result<Value, ToolError> {
@@ -215,6 +245,8 @@ impl QueueToolRegistry {
                 body,
             };
 
+            self.dispatch_before_push(&msg).await?;
+
             let id = self
                 .queue
                 .push(msg)
@@ -240,6 +272,8 @@ impl QueueToolRegistry {
             },
             body: continuation_body,
         };
+
+        self.dispatch_before_push(&continuation_msg).await?;
 
         let continuation_id = self
             .queue
@@ -505,5 +539,134 @@ mod tests {
             matches!(err, ToolError::InvalidInput(ref msg) if msg.contains("cycle")),
             "expected cycle error, got: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn before_push_hook_blocks_decompose() {
+        use apex_core::context::MessageComposer;
+        use apex_core::domain::{HookDef, HookOutcome};
+        use apex_core::ports::HookRegistry;
+        use std::sync::Arc;
+
+        /// A mock hook registry that always blocks before_push events.
+        struct BlockingHookRegistry;
+
+        #[async_trait]
+        impl HookRegistry for BlockingHookRegistry {
+            fn hooks_for(&self, _event: HookEvent) -> Vec<HookDef> {
+                vec![]
+            }
+            fn all_hooks(&self) -> Vec<HookDef> {
+                vec![]
+            }
+            async fn dispatch(
+                &self,
+                event: HookEvent,
+                _context: &serde_json::Value,
+            ) -> Vec<HookOutcome> {
+                if event == HookEvent::BeforePush {
+                    vec![HookOutcome::Block("Push blocked by test".into())]
+                } else {
+                    vec![]
+                }
+            }
+            fn reload(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        struct MinimalQueue2;
+        #[async_trait]
+        impl Queue for MinimalQueue2 {
+            async fn push(&self, _msg: QueueMessage) -> Result<String, apex_core::error::QueueError> {
+                Ok("id".into())
+            }
+            async fn pop(&self) -> Result<Option<apex_core::domain::ClaimedTask>, apex_core::error::QueueError> { Ok(None) }
+            async fn update_body(&self, _c: &apex_core::domain::ClaimedTask, _b: &str) -> Result<(), apex_core::error::QueueError> { Ok(()) }
+            async fn ack(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
+            async fn nack(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
+            async fn nack_with_delay(&self, _c: &apex_core::domain::ClaimedTask, _d: std::time::Duration) -> Result<(), apex_core::error::QueueError> { Ok(()) }
+            async fn reject(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
+            async fn depth(&self) -> Result<apex_core::domain::QueueDepth, apex_core::error::QueueError> { Ok(Default::default()) }
+            async fn reap(&self) -> Result<apex_core::domain::ReapResult, apex_core::error::QueueError> { Ok(Default::default()) }
+            async fn list_done(&self, _cid: &str) -> Result<Vec<String>, apex_core::error::QueueError> { Ok(vec![]) }
+            async fn read_done_body(&self, _id: &str) -> Result<String, apex_core::error::QueueError> { Ok(String::new()) }
+            async fn list_with_state(&self, _s: &str) -> Result<Vec<apex_core::domain::QueueMessageMeta>, apex_core::error::QueueError> { Ok(vec![]) }
+        }
+
+        let hooks: Arc<dyn HookRegistry> = Arc::new(BlockingHookRegistry);
+        let registry = QueueToolRegistry::new(
+            Arc::new(MinimalQueue2),
+            "corr-1".into(),
+            0,
+            3,
+            "parent goal".into(),
+            "parent body".into(),
+            None,
+            None,
+            MessageComposer::default(),
+        )
+        .with_hooks(Some(hooks));
+
+        let input = json!({
+            "subtasks": [
+                { "description": "Task A" },
+            ]
+        });
+
+        let result = registry.handle_decompose_goal(&input).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(ref msg) if msg.contains("blocked")),
+            "expected block error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_hooks_allows_push() {
+        use apex_core::context::MessageComposer;
+        use std::sync::Arc;
+
+        struct MinimalQueue3;
+        #[async_trait]
+        impl Queue for MinimalQueue3 {
+            async fn push(&self, _msg: QueueMessage) -> Result<String, apex_core::error::QueueError> {
+                Ok("id".into())
+            }
+            async fn pop(&self) -> Result<Option<apex_core::domain::ClaimedTask>, apex_core::error::QueueError> { Ok(None) }
+            async fn update_body(&self, _c: &apex_core::domain::ClaimedTask, _b: &str) -> Result<(), apex_core::error::QueueError> { Ok(()) }
+            async fn ack(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
+            async fn nack(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
+            async fn nack_with_delay(&self, _c: &apex_core::domain::ClaimedTask, _d: std::time::Duration) -> Result<(), apex_core::error::QueueError> { Ok(()) }
+            async fn reject(&self, _c: &apex_core::domain::ClaimedTask) -> Result<(), apex_core::error::QueueError> { Ok(()) }
+            async fn depth(&self) -> Result<apex_core::domain::QueueDepth, apex_core::error::QueueError> { Ok(Default::default()) }
+            async fn reap(&self) -> Result<apex_core::domain::ReapResult, apex_core::error::QueueError> { Ok(Default::default()) }
+            async fn list_done(&self, _cid: &str) -> Result<Vec<String>, apex_core::error::QueueError> { Ok(vec![]) }
+            async fn read_done_body(&self, _id: &str) -> Result<String, apex_core::error::QueueError> { Ok(String::new()) }
+            async fn list_with_state(&self, _s: &str) -> Result<Vec<apex_core::domain::QueueMessageMeta>, apex_core::error::QueueError> { Ok(vec![]) }
+        }
+
+        // No hooks — push should succeed
+        let registry = QueueToolRegistry::new(
+            Arc::new(MinimalQueue3),
+            "corr-1".into(),
+            0,
+            3,
+            "parent goal".into(),
+            "parent body".into(),
+            None,
+            None,
+            MessageComposer::default(),
+        );
+
+        let input = json!({
+            "subtasks": [
+                { "description": "Task A" },
+            ]
+        });
+
+        let result = registry.handle_decompose_goal(&input).await;
+        assert!(result.is_ok());
     }
 }

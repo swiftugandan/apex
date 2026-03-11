@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 
 use crate::domain::{
-    CalibrationData, ClaimedTask, CompletionRequest, CompletionResponse, Fact, FactId, QueueDepth,
-    QueueMessage, QueueMessageMeta, ReapResult, Scratchpad, Skill, SkillId,
+    CalibrationData, ClaimedTask, CompletionRequest, CompletionResponse, Fact, FactId,
+    HookDef, HookEvent, HookOutcome,
+    QueueDepth, QueueMessage, QueueMessageMeta, ReapResult, Scratchpad, Skill, SkillId,
     ToolCall, ToolCompletionResponse, ToolDef, ToolResult, ToolSchema,
 };
 use crate::config::RoleProfile;
@@ -82,6 +83,35 @@ pub trait SkillStore: Send + Sync {
     async fn find_skill(&self, task_pattern: &str) -> Result<Option<Skill>, MemoryError>;
     async fn list_skills(&self, limit: usize) -> Result<Vec<Skill>, MemoryError>;
     async fn update_skill_fitness(&self, id: &SkillId, success: bool) -> Result<(), MemoryError>;
+}
+
+/// Registry of lifecycle hooks. Loads hooks from `.apex/hooks/` directories
+/// and dispatches them at lifecycle points.
+#[async_trait]
+pub trait HookRegistry: Send + Sync {
+    /// Get all hook definitions for a given event, sorted by priority (ascending).
+    fn hooks_for(&self, event: HookEvent) -> Vec<HookDef>;
+
+    /// Get all loaded hook definitions.
+    fn all_hooks(&self) -> Vec<HookDef>;
+
+    /// Execute all hooks for a given event with the provided context data.
+    /// Returns a list of outcomes. If any outcome is Block, the caller should
+    /// prevent the event from proceeding.
+    async fn dispatch(
+        &self,
+        event: HookEvent,
+        context: &serde_json::Value,
+    ) -> Vec<HookOutcome>;
+
+    /// Reload hooks from disk.
+    fn reload(&mut self) -> Result<(), String>;
+
+    /// Check if any hooks are registered for the given event (without reloading).
+    /// Used to skip dispatch for high-frequency events like OnLog.
+    fn has_hooks_for(&self, event: HookEvent) -> bool {
+        !self.hooks_for(event).is_empty()
+    }
 }
 
 /// Result returned after a sub-agent completes.

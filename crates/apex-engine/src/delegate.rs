@@ -4,13 +4,15 @@ use tokio::sync::Mutex;
 
 use async_trait::async_trait;
 
-use apex_core::config::{CompactionSection, Invariants, MemoryMode, RoleProfile};
+use apex_core::config::{CompactionSection, ConsolidationSection, Invariants, MemoryMode, RoleProfile};
 use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{MessageHeaders, MessageType, QueueMessage};
 use apex_core::error::ToolError;
-use apex_core::ports::{LlmProvider, MemoryStore, Queue, SkillStore, ToolRegistry, WorkingMemory};
+use apex_core::ports::{HookRegistry, LlmProvider, MemoryStore, Queue, SkillStore, ToolRegistry, WorkingMemory};
 
 use apex_core::ports::{SubAgentResult, SubAgentSpawner};
+
+use apex_tools::FilteredHookRegistry;
 
 use crate::paths::ProjectPaths;
 use crate::registry::{build_static_tools, CompositeToolRegistry, OwnedFilteredToolRegistry};
@@ -31,7 +33,10 @@ pub struct SpawnerConfig {
     pub max_tool_result_bytes: usize,
     pub max_output_tokens: u32,
     pub remaining_delegate_depth: u32,
+    pub max_turns: usize,
+    pub max_empty_cycles: u32,
     pub compaction: CompactionSection,
+    pub consolidation: ConsolidationSection,
 }
 
 /// Concrete SubAgentSpawner that runs sub-agents in-process with their own
@@ -44,6 +49,8 @@ pub struct InProcessSpawner {
     pub estimator: Arc<Mutex<TokenEstimator>>,
     pub config: SpawnerConfig,
     pub infra: Arc<InfraFactories>,
+    /// Optional hooks from the parent agent. Only hooks with `propagate: true` are inherited.
+    pub hooks: Option<Arc<dyn HookRegistry>>,
 }
 
 #[async_trait]
@@ -92,6 +99,12 @@ impl SubAgentSpawner for InProcessSpawner {
         } else {
             0
         };
+        // Propagate only hooks marked with `propagate: true`
+        let sub_hooks: Option<Arc<dyn HookRegistry>> = self
+            .hooks
+            .as_ref()
+            .and_then(|h| FilteredHookRegistry::from_propagatable(h.as_ref()));
+
         let sub_spawner: Arc<dyn SubAgentSpawner> = Arc::new(InProcessSpawner {
             project_paths: self.project_paths.clone(),
             parent_long_term: sub_long_term.clone(),
@@ -104,9 +117,13 @@ impl SubAgentSpawner for InProcessSpawner {
                 max_tool_result_bytes: self.config.max_tool_result_bytes,
                 max_output_tokens: self.config.max_output_tokens,
                 remaining_delegate_depth: sub_depth,
+                max_turns: self.config.max_turns,
+                max_empty_cycles: self.config.max_empty_cycles,
                 compaction: self.config.compaction.clone(),
+                consolidation: self.config.consolidation.clone(),
             },
             infra: Arc::clone(&self.infra),
+            hooks: sub_hooks.clone(),
         });
 
         // 6. Build static tools for sub-agent
@@ -166,8 +183,12 @@ impl SubAgentSpawner for InProcessSpawner {
             max_retries: role.max_retries,
             max_tool_result_bytes: self.config.max_tool_result_bytes,
             max_output_tokens: self.config.max_output_tokens,
+            max_turns: self.config.max_turns,
+            max_empty_cycles: self.config.max_empty_cycles,
             estimator: Arc::clone(&self.estimator),
             compaction: self.config.compaction.clone(),
+            consolidation: self.config.consolidation.clone(),
+            hooks: sub_hooks,
         };
 
         let num_workers = role.max_concurrent.max(1);

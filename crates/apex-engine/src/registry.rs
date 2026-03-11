@@ -16,7 +16,7 @@ use apex_core::ports::{MemoryStore, SkillStore, ToolRegistry, WorkingMemory};
 use apex_core::ports::SubAgentSpawner;
 use apex_tools::{
     BuiltinToolRegistry, ConfigToolRegistry, CustomToolRegistry, DelegateToolRegistry,
-    MemoryToolRegistry, QueueToolRegistry,
+    HooksToolRegistry, MemoryToolRegistry, QueueToolRegistry,
 };
 use apex_tools::spill::SpillManager;
 
@@ -252,11 +252,13 @@ pub fn build_static_tools(
         spawner,
         remaining_delegate_depth,
     );
+    let hooks_tools = HooksToolRegistry::new(paths.hooks_dir.clone());
     Arc::new(CompositeToolRegistry::new(vec![
         Box::new(BuiltinToolRegistry::new(paths.scratch_dir.clone())),
         Box::new(memory_tools),
         Box::new(custom_tools),
         Box::new(config_tools),
         Box::new(delegate_tools),
+        Box::new(hooks_tools),
     ]))
 }

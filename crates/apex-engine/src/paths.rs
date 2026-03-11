@@ -1,6 +1,52 @@
 use std::path::PathBuf;
 use anyhow::{Context, Result};
 
+const DEFAULT_HOOK_NON_RETRYABLE: &str = r#"[hook]
+name = "non_retryable_errors"
+event = "on_failure"
+priority = 0
+invariant = true
+propagate = true
+
+[action]
+action_type = "script"
+command = """
+INPUT=$(cat)
+ERR=$(echo "$INPUT" | jq -r '.error // empty' | tr '[:upper:]' '[:lower:]')
+for pat in "credit balance is too low" "invalid x-api-key" "invalid api key" \
+           "authentication_error" "permission_error" "not_found_error" "configuration error:"; do
+  echo "$ERR" | grep -qi "$pat" && echo '{"block":"Non-retryable error"}' && exit 0
+done
+exit 1
+"""
+input = "context"
+on_failure = "continue"
+"#;
+
+const DEFAULT_HOOK_RATE_LIMIT: &str = r#"[hook]
+name = "rate_limit_backoff"
+event = "on_failure"
+priority = 10
+invariant = true
+propagate = true
+
+[action]
+action_type = "script"
+command = """
+INPUT=$(cat)
+ERR=$(echo "$INPUT" | jq -r '.error // empty' | tr '[:upper:]' '[:lower:]')
+RETRY=$(echo "$INPUT" | jq -r '.retry_count // 0')
+if echo "$ERR" | grep -qiE 'rate_limit|429|too many requests'; then
+  BACKOFF=$(( 30 * (RETRY + 1) ))
+  echo "{\"backoff_secs\": $BACKOFF}"
+  exit 0
+fi
+exit 1
+"""
+input = "context"
+on_failure = "continue"
+"#;
+
 /// Unified project paths struct used by the engine, CLI, and sub-agents.
 /// Single source of truth for all directory locations.
 ///
@@ -19,6 +65,7 @@ pub struct ProjectPaths {
     pub scratch_dir: PathBuf,    // root/.apex/scratch
     pub tools_dir: PathBuf,      // root/.apex/tools
     pub config_dir: PathBuf,     // root/.apex/config
+    pub hooks_dir: PathBuf,      // root/.apex/hooks
 }
 
 impl ProjectPaths {
@@ -45,6 +92,7 @@ impl ProjectPaths {
             scratch_dir: apex_dir.join("scratch"),
             tools_dir: apex_dir.join("tools"),
             config_dir: apex_dir.join("config"),
+            hooks_dir: apex_dir.join("hooks"),
             apex_dir,
             root,
         }
@@ -75,6 +123,33 @@ impl ProjectPaths {
             .context("failed to create .apex/config/ directory")?;
         std::fs::create_dir_all(&self.prompts_dir)
             .context("failed to create .apex/prompts/ directory")?;
+        std::fs::create_dir_all(&self.hooks_dir)
+            .context("failed to create .apex/hooks/ directory")?;
+
+        // Ship default on_failure hooks
+        self.create_default_hooks()?;
+
+        Ok(())
+    }
+
+    /// Write default hook TOML files if they don't already exist.
+    fn create_default_hooks(&self) -> Result<()> {
+        let on_failure_dir = self.hooks_dir.join("on_failure.d");
+        std::fs::create_dir_all(&on_failure_dir)
+            .context("failed to create .apex/hooks/on_failure.d/ directory")?;
+
+        let non_retryable = on_failure_dir.join("non-retryable.toml");
+        if !non_retryable.exists() {
+            std::fs::write(&non_retryable, DEFAULT_HOOK_NON_RETRYABLE)
+                .context("failed to write non-retryable.toml")?;
+        }
+
+        let rate_limit = on_failure_dir.join("rate-limit-backoff.toml");
+        if !rate_limit.exists() {
+            std::fs::write(&rate_limit, DEFAULT_HOOK_RATE_LIMIT)
+                .context("failed to write rate-limit-backoff.toml")?;
+        }
+
         Ok(())
     }
 }
