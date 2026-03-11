@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -15,12 +15,19 @@ use apex_core::domain::{
 };
 use apex_core::ports::HookRegistry;
 
+/// Default cache TTL for hook reloading (5 seconds).
+const HOOK_CACHE_TTL_SECS: u64 = 5;
+
 /// Filesystem-based hook registry. Loads hook definitions from `.apex/hooks/<event>.d/*.toml`.
-/// Uses interior mutability (`RwLock`) so hooks are reloaded from disk on each `dispatch()`,
-/// ensuring newly-created hooks (via `manage_hooks`) are visible immediately.
+/// Uses interior mutability so hooks are reloaded from disk periodically,
+/// ensuring newly-created hooks (via `manage_hooks`) are visible after a short delay.
+/// Reloads are throttled to at most once per `HOOK_CACHE_TTL_SECS` to avoid
+/// directory enumeration + TOML parsing on every dispatch.
 pub struct FsHookRegistry {
     hooks_dir: PathBuf,
     hooks: RwLock<Vec<HookDef>>,
+    last_loaded: Mutex<std::time::Instant>,
+    cache_ttl_secs: u64,
 }
 
 impl FsHookRegistry {
@@ -30,6 +37,8 @@ impl FsHookRegistry {
         Self {
             hooks_dir,
             hooks: RwLock::new(hooks),
+            last_loaded: Mutex::new(std::time::Instant::now()),
+            cache_ttl_secs: HOOK_CACHE_TTL_SECS,
         }
     }
 
@@ -38,6 +47,20 @@ impl FsHookRegistry {
         Self {
             hooks_dir: PathBuf::new(),
             hooks: RwLock::new(Vec::new()),
+            last_loaded: Mutex::new(std::time::Instant::now()),
+            cache_ttl_secs: HOOK_CACHE_TTL_SECS,
+        }
+    }
+
+    /// Create a registry with a custom cache TTL (for testing).
+    #[cfg(test)]
+    fn with_ttl(hooks_dir: PathBuf, ttl_secs: u64) -> Self {
+        let hooks = Self::load_hooks_from_dir(&hooks_dir);
+        Self {
+            hooks_dir,
+            hooks: RwLock::new(hooks),
+            last_loaded: Mutex::new(std::time::Instant::now()),
+            cache_ttl_secs: ttl_secs,
         }
     }
 
@@ -370,11 +393,16 @@ impl HookRegistry for FsHookRegistry {
     }
 
     async fn dispatch(&self, event: HookEvent, context: &Value) -> Vec<HookOutcome> {
-        // Reload hooks from disk so newly-created hooks are visible immediately.
+        // Reload hooks from disk if the cache TTL has elapsed.
         {
-            let fresh = Self::load_hooks_from_dir(&self.hooks_dir);
-            let mut guard = self.hooks.write().unwrap();
-            *guard = fresh;
+            let elapsed = self.last_loaded.lock().unwrap().elapsed();
+            if elapsed >= std::time::Duration::from_secs(self.cache_ttl_secs) {
+                let fresh = Self::load_hooks_from_dir(&self.hooks_dir);
+                let mut guard = self.hooks.write().unwrap();
+                *guard = fresh;
+                drop(guard);
+                *self.last_loaded.lock().unwrap() = std::time::Instant::now();
+            }
         }
 
         let hooks = {
@@ -400,6 +428,7 @@ impl HookRegistry for FsHookRegistry {
     fn reload(&mut self) -> Result<(), String> {
         let fresh = Self::load_hooks_from_dir(&self.hooks_dir);
         *self.hooks.get_mut().unwrap() = fresh;
+        *self.last_loaded.lock().unwrap() = std::time::Instant::now();
         Ok(())
     }
 
@@ -804,8 +833,8 @@ command = "echo ok"
         let hooks_dir = dir.path().join("hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
 
-        // Create registry with no hooks
-        let registry = FsHookRegistry::new(hooks_dir.clone());
+        // Create registry with TTL=0 so reload happens on every dispatch
+        let registry = FsHookRegistry::with_ttl(hooks_dir.clone(), 0);
         let outcomes = registry
             .dispatch(HookEvent::BeforeTurn, &serde_json::json!({}))
             .await;

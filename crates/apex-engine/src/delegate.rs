@@ -16,7 +16,7 @@ use apex_tools::FilteredHookRegistry;
 
 use crate::paths::ProjectPaths;
 use crate::registry::{build_static_tools, CompositeToolRegistry, OwnedFilteredToolRegistry};
-use crate::worker::{worker_loop, WorkerContext};
+use crate::worker::{worker_loop, WorkerContext, WorkerLimits};
 
 /// Factory closures for creating infra components without depending on apex-infra.
 pub struct InfraFactories {
@@ -179,12 +179,14 @@ impl SubAgentSpawner for InProcessSpawner {
             long_term: sub_long_term,
             skills: sub_skills,
             persona: Arc::new(persona.to_string()),
-            max_depth: role.max_depth,
-            max_retries: role.max_retries,
-            max_tool_result_bytes: self.config.max_tool_result_bytes,
-            max_output_tokens: self.config.max_output_tokens,
-            max_turns: self.config.max_turns,
-            max_empty_cycles: self.config.max_empty_cycles,
+            limits: WorkerLimits {
+                max_depth: role.max_depth,
+                max_retries: role.max_retries,
+                max_tool_result_bytes: self.config.max_tool_result_bytes,
+                max_output_tokens: self.config.max_output_tokens,
+                max_turns: self.config.max_turns,
+                max_empty_cycles: self.config.max_empty_cycles,
+            },
             estimator: Arc::clone(&self.estimator),
             compaction: self.config.compaction.clone(),
             consolidation: self.config.consolidation.clone(),

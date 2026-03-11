@@ -133,23 +133,27 @@ impl ProjectPaths {
     }
 
     /// Write default hook TOML files if they don't already exist.
+    /// Uses `create_new` to atomically skip files that already exist,
+    /// avoiding a TOCTOU race between concurrent `apex init` calls.
     fn create_default_hooks(&self) -> Result<()> {
         let on_failure_dir = self.hooks_dir.join("on_failure.d");
         std::fs::create_dir_all(&on_failure_dir)
             .context("failed to create .apex/hooks/on_failure.d/ directory")?;
 
-        let non_retryable = on_failure_dir.join("non-retryable.toml");
-        if !non_retryable.exists() {
-            std::fs::write(&non_retryable, DEFAULT_HOOK_NON_RETRYABLE)
-                .context("failed to write non-retryable.toml")?;
-        }
-
-        let rate_limit = on_failure_dir.join("rate-limit-backoff.toml");
-        if !rate_limit.exists() {
-            std::fs::write(&rate_limit, DEFAULT_HOOK_RATE_LIMIT)
-                .context("failed to write rate-limit-backoff.toml")?;
-        }
+        write_if_absent(&on_failure_dir.join("non-retryable.toml"), DEFAULT_HOOK_NON_RETRYABLE)?;
+        write_if_absent(&on_failure_dir.join("rate-limit-backoff.toml"), DEFAULT_HOOK_RATE_LIMIT)?;
 
         Ok(())
+    }
+}
+
+/// Atomically write `content` to `path`, silently skipping if the file already exists.
+fn write_if_absent(path: &std::path::Path, content: &str) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut f) => f.write_all(content.as_bytes()).map_err(Into::into),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("failed to write {}", path.display())),
     }
 }

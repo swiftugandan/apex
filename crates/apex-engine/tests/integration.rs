@@ -14,7 +14,7 @@ use apex_core::domain::{
 use apex_core::error::{LlmError, MemoryError};
 use apex_core::ports::{LlmProvider, MemoryStore, Queue, SkillStore, WorkingMemory};
 
-use apex_engine::{worker_loop, CompositeToolRegistry, WorkerContext};
+use apex_engine::{worker_loop, CompositeToolRegistry, WorkerContext, WorkerLimits};
 use apex_infra::RfbmqAdapter;
 
 // ── Shared mock implementations for integration tests ─────────────
@@ -217,12 +217,14 @@ async fn single_task_roundtrip() {
         long_term,
         skills,
         persona: Arc::new("You are a helpful assistant.".to_string()),
-        max_depth: 3,
-        max_retries: 3,
-        max_tool_result_bytes: 10_000,
-        max_output_tokens: 4096,
-        max_turns: 32,
-        max_empty_cycles: 300,
+        limits: WorkerLimits {
+            max_depth: 3,
+            max_retries: 3,
+            max_tool_result_bytes: 10_000,
+            max_output_tokens: 4096,
+            max_turns: 32,
+            max_empty_cycles: 300,
+        },
         estimator: Arc::new(Mutex::new(TokenEstimator::default())),
         compaction: CompactionSection {
             preserve_turns: 3,

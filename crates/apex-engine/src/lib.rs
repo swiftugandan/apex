@@ -16,5 +16,5 @@ pub use agentic_loop::{run_agentic_loop, LoopConfig, LoopOutcome};
 pub use delegate::{InfraFactories, InProcessSpawner, SpawnerConfig};
 pub use paths::ProjectPaths;
 pub use registry::{build_static_tools, ApexToolRegistry, CompositeToolRegistry, OwnedFilteredToolRegistry};
-pub use worker::{worker_loop, WorkerContext};
+pub use worker::{worker_loop, WorkerContext, WorkerLimits};
 

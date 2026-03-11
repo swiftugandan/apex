@@ -20,6 +20,17 @@ use crate::util::{composer_from_estimator, extract_title, now_unix_ts};
 
 // ── WorkerContext ───────────────────────────────────────────────────
 
+/// Scalar configuration limits grouped for cleaner construction.
+#[derive(Clone)]
+pub struct WorkerLimits {
+    pub max_depth: u32,
+    pub max_retries: u32,
+    pub max_tool_result_bytes: usize,
+    pub max_output_tokens: u32,
+    pub max_turns: usize,
+    pub max_empty_cycles: u32,
+}
+
 #[derive(Clone)]
 pub struct WorkerContext {
     pub queue: Arc<dyn Queue>,
@@ -29,12 +40,7 @@ pub struct WorkerContext {
     pub long_term: Arc<dyn MemoryStore>,
     pub skills: Arc<dyn SkillStore>,
     pub persona: Arc<String>,
-    pub max_depth: u32,
-    pub max_retries: u32,
-    pub max_tool_result_bytes: usize,
-    pub max_output_tokens: u32,
-    pub max_turns: usize,
-    pub max_empty_cycles: u32,
+    pub limits: WorkerLimits,
     pub estimator: Arc<Mutex<TokenEstimator>>,
     pub compaction: CompactionSection,
     pub consolidation: ConsolidationSection,
@@ -70,7 +76,7 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
                 }
 
                 empty_cycles += 1;
-                if empty_cycles > ctx.max_empty_cycles {
+                if empty_cycles > ctx.limits.max_empty_cycles {
                     eprintln!("[worker {worker_id}] giving up after {empty_cycles} empty cycles");
                     return Ok(());
                 }
@@ -116,7 +122,7 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
             Arc::clone(&ctx.queue),
             claimed.headers.correlation_id.clone(),
             claimed.headers.depth,
-            ctx.max_depth,
+            ctx.limits.max_depth,
             title.clone(),
             claimed.body.clone(),
             Some(Arc::clone(&ctx.long_term)),
@@ -162,7 +168,7 @@ pub async fn worker_loop(ctx: WorkerContext, worker_id: usize) -> Result<()> {
                 let composer = composer_from_estimator(&ctx.estimator).await;
                 handle_failure(
                     ctx.queue.as_ref(), &claimed, &record, &err, &scratchpad,
-                    worker_id, &composer, ctx.max_retries,
+                    worker_id, &composer, ctx.limits.max_retries,
                     ctx.hooks.as_deref(),
                 )
                 .await?;
@@ -234,15 +240,15 @@ async fn execute_claim(
         llm: ctx.llm.as_ref(),
         tools: &tools,
         estimator: &ctx.estimator,
-        max_tool_result_bytes: ctx.max_tool_result_bytes,
-        max_output_tokens: ctx.max_output_tokens,
+        max_tool_result_bytes: ctx.limits.max_tool_result_bytes,
+        max_output_tokens: ctx.limits.max_output_tokens,
         scratchpad: Some(&scratchpad_arc),
         memory: Some(ctx.memory.as_ref()),
         cancel: None,
         timeout: None,
         compaction_preserve_turns: ctx.compaction.preserve_turns,
         compaction_max_summary_tokens: ctx.compaction.max_summary_tokens,
-        max_turns: ctx.max_turns,
+        max_turns: ctx.limits.max_turns,
         hooks: ctx.hooks.as_deref(),
     };
     let (turns, loop_outcome, _messages) = run_agentic_loop(messages, &loop_config).await;
@@ -325,6 +331,7 @@ async fn execute_claim(
             &record,
             &scratchpad,
             &ctx.consolidation,
+            ctx.hooks.as_deref(),
         )
         .await;
     }
@@ -593,12 +600,14 @@ mod tests {
             long_term,
             skills,
             persona: Arc::new("test persona".to_string()),
-            max_depth: 3,
-            max_retries: 3,
-            max_tool_result_bytes: 10_000,
-            max_output_tokens: 4096,
-            max_turns: 32,
-            max_empty_cycles: 300,
+            limits: WorkerLimits {
+                max_depth: 3,
+                max_retries: 3,
+                max_tool_result_bytes: 10_000,
+                max_output_tokens: 4096,
+                max_turns: 32,
+                max_empty_cycles: 300,
+            },
             estimator: Arc::new(Mutex::new(TokenEstimator::default())),
             compaction: CompactionSection {
                 preserve_turns: 3,

@@ -11,7 +11,7 @@ use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{MessageHeaders, MessageType, QueueMessage};
 use apex_core::ports::{MemoryStore, Queue, SkillStore, WorkingMemory};
 use apex_engine::{
-    InProcessSpawner, InfraFactories, ProjectPaths, SpawnerConfig, WorkerContext,
+    InProcessSpawner, InfraFactories, ProjectPaths, SpawnerConfig, WorkerContext, WorkerLimits,
     build_static_tools, worker_loop,
 };
 use apex_core::ports::HookRegistry;
@@ -430,12 +430,14 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         long_term,
         skills,
         persona: Arc::new(persona),
-        max_depth,
-        max_retries,
-        max_tool_result_bytes,
-        max_output_tokens,
-        max_turns: agent_config.agent.max_turns,
-        max_empty_cycles: agent_config.agent.max_empty_cycles,
+        limits: WorkerLimits {
+            max_depth,
+            max_retries,
+            max_tool_result_bytes,
+            max_output_tokens,
+            max_turns: agent_config.agent.max_turns,
+            max_empty_cycles: agent_config.agent.max_empty_cycles,
+        },
         estimator,
         compaction: agent_config.compaction.clone(),
         consolidation: agent_config.consolidation.clone(),
