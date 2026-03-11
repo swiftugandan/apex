@@ -319,7 +319,7 @@ View stored skills with `apex memory skills`.
 
 ## Architecture
 
-See [CLAUDE.md](CLAUDE.md) for crate structure, dependency graph, and architectural details. See [The Apex Manifesto](docs/MANIFESTO.md) for the design principles behind the system.
+See [CLAUDE.md](CLAUDE.md) for crate structure, dependency graph, and architectural details.
 
 ## Building
 
@@ -328,6 +328,15 @@ cargo build -p apex-bin --release
 ```
 
 Produces a single optimized binary (LTO, stripped, panic=abort).
+
+## References
+
+| Resource | Description |
+|----------|-------------|
+| [The Apex Manifesto](docs/MANIFESTO.md) | Design principles behind the system |
+| [CLAUDE.md](CLAUDE.md) | Crate structure, dependency graph, architectural details |
+| [Apex Wiki](https://deepwiki.com/swiftugandan/apex) | Browsable project documentation |
+| [rfbmq Wiki](https://deepwiki.com/swiftugandan/rfbmq) | Documentation for the filesystem-based message queue |
 
 ## License
 
