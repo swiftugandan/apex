@@ -1,4 +1,4 @@
-use crate::domain::{CalibrationData, ContentType};
+use crate::domain::{CalibrationData, ContentType, TokenUsage};
 
 /// Stateful token estimator with content-type awareness and self-calibration.
 #[derive(Clone, Default)]
@@ -110,6 +110,32 @@ impl TokenEstimator {
         }
     }
 
+    /// Calibrate from actual output/reasoning token usage (e.g. from output_tokens_details).
+    /// Updates reasoning_tokens_ema when the provider supplies reasoning_tokens; otherwise no-op.
+    pub fn calibrate_output(&mut self, usage: &TokenUsage) {
+        let r = match usage.output_tokens_details.and_then(|d| d.reasoning_tokens) {
+            Some(r) if r > 0 => r,
+            _ => return,
+        };
+
+        self.calibration.reasoning_sample_count += 1;
+        let alpha =
+            (2.0_f32 / (self.calibration.reasoning_sample_count as f32 + 1.0)).clamp(0.05, 0.5);
+        let observed = r as f32;
+        self.calibration.reasoning_tokens_ema = Some(
+            alpha * observed
+                + (1.0 - alpha) * self.calibration.reasoning_tokens_ema.unwrap_or(observed),
+        );
+    }
+
+    /// Recommended reserved reasoning tokens from calibration (mean + margin).
+    /// Returns None if we have no reasoning samples yet.
+    pub fn recommended_reserved_reasoning_tokens(&self) -> Option<u32> {
+        self.calibration
+            .reasoning_tokens_ema
+            .map(|ema| (ema * 1.2).ceil() as u32)
+    }
+
     /// Get a reference to the current calibration data.
     pub fn calibration_data(&self) -> &CalibrationData {
         &self.calibration
@@ -215,5 +241,59 @@ mod tests {
         let text = "\u{4e00}".repeat(100);
         let result = est.budget(&text, 2);
         assert!(result.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn calibrate_output_no_op_without_details() {
+        let mut est = TokenEstimator::default();
+        let usage = crate::domain::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            output_tokens_details: None,
+            ..Default::default()
+        };
+        est.calibrate_output(&usage);
+        assert!(est.calibration_data().reasoning_tokens_ema.is_none());
+        assert_eq!(est.calibration_data().reasoning_sample_count, 0);
+    }
+
+    #[test]
+    fn calibrate_output_updates_ema_when_reasoning_present() {
+        use crate::domain::{OutputTokensDetails, TokenUsage};
+        let mut est = TokenEstimator::default();
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            output_tokens_details: Some(OutputTokensDetails {
+                reasoning_tokens: Some(2000),
+            }),
+            ..Default::default()
+        };
+        est.calibrate_output(&usage);
+        assert!(est.calibration_data().reasoning_tokens_ema.is_some());
+        assert_eq!(est.calibration_data().reasoning_sample_count, 1);
+        let ema = est.calibration_data().reasoning_tokens_ema.unwrap();
+        assert!((ema - 2000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn recommended_reserved_reasoning_tokens_none_without_samples() {
+        let est = TokenEstimator::default();
+        assert!(est.recommended_reserved_reasoning_tokens().is_none());
+    }
+
+    #[test]
+    fn recommended_reserved_reasoning_tokens_some_after_calibration() {
+        use crate::domain::{OutputTokensDetails, TokenUsage};
+        let mut est = TokenEstimator::default();
+        est.calibrate_output(&TokenUsage {
+            output_tokens_details: Some(OutputTokensDetails {
+                reasoning_tokens: Some(1000),
+            }),
+            ..Default::default()
+        });
+        let rec = est.recommended_reserved_reasoning_tokens();
+        assert!(rec.is_some());
+        assert!(rec.unwrap() >= 1000);
     }
 }

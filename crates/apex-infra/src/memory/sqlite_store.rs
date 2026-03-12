@@ -39,6 +39,8 @@ impl SqliteMemoryStore {
                 chars_per_token_code REAL NOT NULL,
                 chars_per_token_mixed REAL NOT NULL,
                 sample_count INTEGER NOT NULL,
+                reasoning_tokens_ema REAL,
+                reasoning_sample_count INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
@@ -258,13 +260,15 @@ impl MemoryStore for SqliteMemoryStore {
         let conn = self.conn.lock().await;
         let now = Self::now_iso();
         conn.execute(
-            "INSERT OR REPLACE INTO calibration (id, chars_per_token_prose, chars_per_token_code, chars_per_token_mixed, sample_count, updated_at)
-             VALUES ('default', ?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR REPLACE INTO calibration (id, chars_per_token_prose, chars_per_token_code, chars_per_token_mixed, sample_count, reasoning_tokens_ema, reasoning_sample_count, updated_at)
+             VALUES ('default', ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 data.chars_per_token_prose as f64,
                 data.chars_per_token_code as f64,
                 data.chars_per_token_mixed as f64,
                 data.sample_count,
+                data.reasoning_tokens_ema.map(|f| f as f64),
+                data.reasoning_sample_count,
                 now
             ],
         )
@@ -275,7 +279,7 @@ impl MemoryStore for SqliteMemoryStore {
     async fn load_calibration(&self) -> Result<CalibrationData, MemoryError> {
         let conn = self.conn.lock().await;
         let result = conn.query_row(
-            "SELECT chars_per_token_prose, chars_per_token_code, chars_per_token_mixed, sample_count
+            "SELECT chars_per_token_prose, chars_per_token_code, chars_per_token_mixed, sample_count, reasoning_tokens_ema, reasoning_sample_count
              FROM calibration WHERE id = 'default'",
             [],
             |row| {
@@ -284,6 +288,8 @@ impl MemoryStore for SqliteMemoryStore {
                     chars_per_token_code: row.get::<_, f64>(1)? as f32,
                     chars_per_token_mixed: row.get::<_, f64>(2)? as f32,
                     sample_count: row.get(3)?,
+                    reasoning_tokens_ema: row.get::<_, Option<f64>>(4).ok().flatten().map(|f| f as f32),
+                    reasoning_sample_count: row.get(5)?,
                 })
             },
         );

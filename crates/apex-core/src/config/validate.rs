@@ -58,7 +58,7 @@ impl ValidationReport {
 }
 
 /// Validate an agent config against invariant ceilings.
-pub fn validate_against_invariants(
+pub(super) fn validate_against_invariants(
     config: &AgentConfig,
     invariants: &Invariants,
 ) -> ValidationReport {
@@ -125,7 +125,7 @@ pub fn validate_against_invariants(
 }
 
 /// Full validation: invariant ceilings + structural checks.
-pub fn validate_full(
+pub(super) fn validate_full(
     config: &AgentConfig,
     invariants: &Invariants,
     prompts_dir: &Path,

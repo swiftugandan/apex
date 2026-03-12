@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use apex_core::domain::{
-    ChatMessage, CompletionRequest, CompletionResponse, ContentBlock, MessageRole, StopReason,
-    SystemBlock, TokenUsage, ToolCall, ToolCompletionResponse, ToolSchema,
+    ChatMessage, CompletionRequest, CompletionResponse, ContentBlock, MessageRole,
+    OutputTokensDetails, StopReason, SystemBlock, TokenUsage, ToolCall, ToolCompletionResponse,
+    ToolSchema,
 };
 use apex_core::error::LlmError;
 use apex_core::ports::LlmProvider;
@@ -262,11 +263,19 @@ impl OpenAiProvider {
 
     fn parse_usage(response: &OaiResponse) -> TokenUsage {
         match &response.usage {
-            Some(u) => TokenUsage {
-                input_tokens: u.prompt_tokens,
-                output_tokens: u.completion_tokens,
-                ..TokenUsage::default()
-            },
+            Some(u) => {
+                let output_tokens_details = u.completion_tokens_details.as_ref().and_then(|d| {
+                    d.reasoning_tokens.map(|r| OutputTokensDetails {
+                        reasoning_tokens: Some(r),
+                    })
+                });
+                TokenUsage {
+                    input_tokens: u.prompt_tokens,
+                    output_tokens: u.completion_tokens,
+                    output_tokens_details,
+                    ..TokenUsage::default()
+                }
+            }
             None => TokenUsage::default(),
         }
     }
@@ -402,9 +411,17 @@ struct OaiChoiceMessage {
 }
 
 #[derive(Debug, Deserialize)]
+struct OaiCompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
 struct OaiUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    #[serde(default)]
+    completion_tokens_details: Option<OaiCompletionTokensDetails>,
 }
 
 #[cfg(test)]
@@ -603,6 +620,7 @@ mod tests {
             usage: Some(OaiUsage {
                 prompt_tokens: 100,
                 completion_tokens: 50,
+                completion_tokens_details: None,
             }),
         };
 

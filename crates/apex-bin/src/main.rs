@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use apex_core::config::{validate_full, ConfigLoader};
+use apex_core::config::ConfigLoader;
 use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{MessageHeaders, MessageType, QueueMessage};
 use apex_core::ports::HookRegistry;
@@ -385,6 +385,8 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
     let hooks: Arc<dyn apex_core::ports::HookRegistry> =
         Arc::new(FsHookRegistry::new(paths.hooks_dir.clone()));
 
+    let reserved_reasoning_tokens = ConfigLoader::resolve_reserved_reasoning_tokens(&agent_config);
+
     // Build the SubAgentSpawner with typed runtime builder (replaces closure bag)
     let sub_runtime = Arc::new(runtime::SubAgentRuntimeBuilder);
     let spawner: Arc<dyn apex_core::ports::SubAgentSpawner> = Arc::new(runtime::InProcessSpawner {
@@ -399,6 +401,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
             max_tool_result_bytes,
             max_tool_input_bytes,
             max_output_tokens,
+            reserved_reasoning_tokens,
             remaining_delegate_depth,
             max_turns: agent_config.agent.max_turns,
             max_empty_cycles: agent_config.agent.max_empty_cycles,
@@ -445,6 +448,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
             max_retries,
             max_tool_result_bytes,
             max_output_tokens,
+            reserved_reasoning_tokens,
             max_turns: agent_config.agent.max_turns,
             max_empty_cycles: agent_config.agent.max_empty_cycles,
             max_tool_input_bytes,
@@ -856,7 +860,7 @@ async fn cmd_validate() -> Result<()> {
     let paths = ProjectPaths::resolve()?;
     let invariants = ConfigLoader::load_invariants(&paths.config_dir)?;
     let config = ConfigLoader::load_agent_config(&paths.config_dir)?;
-    let report = validate_full(&config, &invariants, &paths.prompts_dir);
+    let report = ConfigLoader::validate_full(&config, &invariants, &paths.prompts_dir);
 
     let display = report.display();
     let mut has_errors = !report.is_ok();

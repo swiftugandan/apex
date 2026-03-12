@@ -2,8 +2,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use super::agent::AgentConfig;
+use super::agent::{default_reserved_reasoning_tokens, AgentConfig};
 use super::invariants::Invariants;
+use super::validate::{self, ValidationReport};
 
 pub struct ConfigLoader;
 
@@ -77,6 +78,31 @@ impl ConfigLoader {
             std::fs::write(&path, &contents).context("failed to write agent.toml")?;
         }
         Ok(())
+    }
+
+    /// Validate an agent config against invariant ceilings.
+    pub fn validate_against_invariants(
+        config: &AgentConfig,
+        invariants: &Invariants,
+    ) -> ValidationReport {
+        validate::validate_against_invariants(config, invariants)
+    }
+
+    /// Full validation: invariant ceilings + structural checks.
+    pub fn validate_full(
+        config: &AgentConfig,
+        invariants: &Invariants,
+        prompts_dir: &Path,
+    ) -> ValidationReport {
+        validate::validate_full(config, invariants, prompts_dir)
+    }
+
+    /// Resolve reserved reasoning tokens: use config value if set, otherwise derive from model id.
+    pub fn resolve_reserved_reasoning_tokens(config: &AgentConfig) -> u32 {
+        config
+            .agent
+            .reserved_reasoning_tokens
+            .unwrap_or_else(|| default_reserved_reasoning_tokens(&config.agent.model))
     }
 }
 

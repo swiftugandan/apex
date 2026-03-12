@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use apex_core::config::{validate_against_invariants, AgentConfig, ConfigLoader, Invariants};
+use apex_core::config::{AgentConfig, ConfigLoader, Invariants};
 use apex_core::domain::{ToolCall, ToolDef, ToolLoading, ToolResult, ToolSchema};
 use apex_core::error::ToolError;
 use apex_core::ports::ToolRegistry;
@@ -111,7 +111,7 @@ impl ConfigToolRegistry {
         let merged_config = AgentConfig::from_toml(&merged_toml)
             .map_err(|e| ToolError::Execution(format!("invalid config after merge: {e}")))?;
 
-        let report = validate_against_invariants(&merged_config, &self.invariants);
+        let report = ConfigLoader::validate_against_invariants(&merged_config, &self.invariants);
         if !report.is_ok() {
             return err_result(
                 call,

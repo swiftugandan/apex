@@ -9,4 +9,4 @@ pub use agent::{
 };
 pub use invariants::Invariants;
 pub use loader::ConfigLoader;
-pub use validate::{validate_against_invariants, validate_full, ValidationIssue, ValidationReport};
+pub use validate::{ValidationIssue, ValidationReport};

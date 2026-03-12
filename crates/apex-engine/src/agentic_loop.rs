@@ -46,6 +46,8 @@ pub struct LoopConfig<'a> {
     pub estimator: &'a Arc<Mutex<TokenEstimator>>,
     pub max_tool_result_bytes: usize,
     pub max_output_tokens: u32,
+    /// Reserved token budget for model reasoning/thinking; subtracted from usable context.
+    pub reserved_reasoning_tokens: u32,
     pub scratchpad: Option<&'a Arc<Mutex<apex_core::domain::Scratchpad>>>,
     pub memory: Option<&'a dyn WorkingMemory>,
     /// Optional cancellation token — checked before each turn.
@@ -85,24 +87,34 @@ fn spill_to_disk(dir: &Path, messages: &[ChatMessage]) -> Result<PathBuf, String
     Ok(path)
 }
 
-/// Automatically compact conversation history when estimated prompt tokens
-/// reach ≥ 80% of the LLM context window. Returns `true` if compaction occurred.
-async fn maybe_compact(messages: &mut Vec<ChatMessage>, config: &LoopConfig<'_>) -> bool {
-    let context_window = config.llm.context_window();
-    let threshold = (context_window as f64 * 0.8) as u32;
-
+/// Estimate prompt tokens for the current message history.
+async fn estimate_prompt_tokens(
+    messages: &[ChatMessage],
+    estimator: &Arc<Mutex<TokenEstimator>>,
+) -> u32 {
     let prompt_text: String = messages
         .iter()
         .map(|m| m.text())
         .collect::<Vec<_>>()
         .join("\n");
-    let estimated_tokens = {
-        let est = config.estimator.lock().await;
-        est.estimate(&prompt_text)
-    };
+    let est = estimator.lock().await;
+    est.estimate(&prompt_text)
+}
 
-    if estimated_tokens < threshold {
-        return false;
+/// Automatically compact conversation history when estimated prompt tokens
+/// reach ≥ 80% of usable input capacity (context window minus reserve and max output).
+/// Returns the estimated prompt tokens (post-compaction if compaction occurred).
+async fn maybe_compact(messages: &mut Vec<ChatMessage>, config: &LoopConfig<'_>) -> u32 {
+    let context_window = config.llm.context_window() as u32;
+    let usable_input = context_window
+        .saturating_sub(config.reserved_reasoning_tokens)
+        .saturating_sub(config.max_output_tokens);
+    let threshold = ((usable_input as f64) * 0.8).ceil() as u32;
+
+    let estimated_tokens = estimate_prompt_tokens(messages, config.estimator).await;
+
+    if threshold == 0 || estimated_tokens < threshold {
+        return estimated_tokens;
     }
 
     // Spill full conversation history to disk before compaction (Principle 5 & 6).
@@ -161,7 +173,8 @@ async fn maybe_compact(messages: &mut Vec<ChatMessage>, config: &LoopConfig<'_>)
             )
             .await;
             *messages = compacted;
-            true
+            // Re-estimate after compaction since messages changed
+            estimate_prompt_tokens(messages, config.estimator).await
         }
         Err(reason) => {
             dispatch_log(
@@ -176,7 +189,7 @@ async fn maybe_compact(messages: &mut Vec<ChatMessage>, config: &LoopConfig<'_>)
                 &format!("  auto-compaction skipped: {reason}"),
             )
             .await;
-            false
+            estimated_tokens
         }
     }
 }
@@ -240,15 +253,26 @@ pub async fn run_agentic_loop(
         }
 
         // ── auto-compaction ──
-        maybe_compact(&mut messages, config).await;
+        let estimated_prompt_tokens = maybe_compact(&mut messages, config).await;
 
         // Per-turn schema extraction: picks up newly loaded deferred tools
         let schemas = config.tools.schemas();
 
+        // Cap max_tokens so prompt + reserve + output never exceed context window
+        let context_window = config.llm.context_window() as u32;
+        let effective_max_tokens = config
+            .max_output_tokens
+            .min(
+                context_window
+                    .saturating_sub(estimated_prompt_tokens)
+                    .saturating_sub(config.reserved_reasoning_tokens),
+            )
+            .max(1);
+
         let req = CompletionRequest {
             system_blocks: &system_blocks,
             messages: &messages,
-            max_tokens: config.max_output_tokens,
+            max_tokens: effective_max_tokens,
             temperature: Some(0.2),
             cache_tools: config.prompt_caching,
         };
@@ -288,10 +312,11 @@ pub async fn run_agentic_loop(
             let output_toks = resp.usage.output_tokens;
             let cache_create = resp.usage.cache_creation_input_tokens;
             let cache_read = resp.usage.cache_read_input_tokens;
+            let output_details = resp.usage.output_tokens_details;
             dispatch_log(
                 config.hooks,
                 || {
-                    serde_json::json!({
+                    let mut payload = serde_json::json!({
                         "level": "info",
                         "event": "turn_summary",
                         "turn": turn_num + 1,
@@ -300,7 +325,15 @@ pub async fn run_agentic_loop(
                         "output_tokens": output_toks,
                         "cache_creation_input_tokens": cache_create,
                         "cache_read_input_tokens": cache_read,
-                    })
+                    });
+                    if let Some(d) = output_details {
+                        if d.reasoning_tokens.is_some() {
+                            payload["output_tokens_details"] = serde_json::json!({
+                                "reasoning_tokens": d.reasoning_tokens,
+                            });
+                        }
+                    }
+                    payload
                 },
                 &msg,
             )
@@ -316,6 +349,30 @@ pub async fn run_agentic_loop(
                 .join("\n");
             let mut est = config.estimator.lock().await;
             est.calibrate(&prompt_text, resp.usage.input_tokens);
+            est.calibrate_output(&resp.usage);
+        }
+
+        // Warn when output approaches or exceeds reserved reasoning budget
+        if config.reserved_reasoning_tokens > 0
+            && resp.usage.output_tokens as f64 >= 0.9 * config.reserved_reasoning_tokens as f64
+        {
+            dispatch_log(
+                config.hooks,
+                || {
+                    serde_json::json!({
+                        "level": "warn",
+                        "event": "token_reserve_warning",
+                        "turn": turn_num + 1,
+                        "output_tokens": resp.usage.output_tokens,
+                        "reserved_reasoning_tokens": config.reserved_reasoning_tokens,
+                    })
+                },
+                &format!(
+                    "  token reserve near exhausted: {} output tokens (reserve {})",
+                    resp.usage.output_tokens, config.reserved_reasoning_tokens,
+                ),
+            )
+            .await;
         }
 
         messages.push(resp.message.clone());
@@ -610,6 +667,7 @@ mod tests {
             estimator,
             max_tool_result_bytes: 10_000,
             max_output_tokens: 4096,
+            reserved_reasoning_tokens: 4096,
             scratchpad: None,
             memory: None,
             cancel: None,
@@ -787,6 +845,8 @@ mod tests {
     }
 
     /// Helper to build a `LoopConfig` suitable for `maybe_compact` tests.
+    /// Uses small reserve and max_output so that with a 200-token context window
+    /// the usable-input threshold is positive and compaction can trigger.
     fn compact_test_config<'a>(
         llm: &'a dyn LlmProvider,
         tools: &'a dyn ToolRegistry,
@@ -798,6 +858,8 @@ mod tests {
             persona: "",
             compaction,
             scratch_dir,
+            reserved_reasoning_tokens: 0,
+            max_output_tokens: 10,
             ..test_loop_config(llm, tools, estimator)
         }
     }
@@ -828,12 +890,11 @@ mod tests {
         let mut msgs = messages.clone();
         let original_len = msgs.len();
 
-        let compacted = maybe_compact(&mut msgs, &cfg).await;
+        let _estimated = maybe_compact(&mut msgs, &cfg).await;
 
-        assert!(compacted, "should have triggered compaction");
         assert!(
             msgs.len() < original_len,
-            "compacted messages should be shorter"
+            "should have triggered compaction"
         );
         assert_eq!(msgs[0].text(), "Original task description");
         assert_eq!(msgs[1].role, MessageRole::Assistant);
@@ -866,10 +927,13 @@ mod tests {
         ];
         let original_len = msgs.len();
 
-        let compacted = maybe_compact(&mut msgs, &cfg).await;
+        let _estimated = maybe_compact(&mut msgs, &cfg).await;
 
-        assert!(!compacted, "should NOT have triggered compaction");
-        assert_eq!(msgs.len(), original_len, "messages should be unchanged");
+        assert_eq!(
+            msgs.len(),
+            original_len,
+            "should NOT have triggered compaction"
+        );
     }
 
     #[tokio::test]
@@ -900,9 +964,12 @@ mod tests {
         let cfg = compact_test_config(&llm, &tools, &estimator, compaction, None);
 
         let mut msgs = messages.clone();
-        let compacted = maybe_compact(&mut msgs, &cfg).await;
+        let _estimated = maybe_compact(&mut msgs, &cfg).await;
 
-        assert!(compacted);
+        assert!(
+            msgs.len() < messages.len(),
+            "should have triggered compaction"
+        );
         let compacted_tail = &msgs[2..];
         let original_tail = &messages[messages.len() - compacted_tail.len()..];
         assert!(
@@ -1027,10 +1094,12 @@ mod tests {
         let mut msgs = messages.clone();
         let original_len = msgs.len();
 
-        let compacted = maybe_compact(&mut msgs, &cfg).await;
+        let _estimated = maybe_compact(&mut msgs, &cfg).await;
 
-        assert!(compacted, "should have triggered compaction");
-        assert!(msgs.len() < original_len);
+        assert!(
+            msgs.len() < original_len,
+            "should have triggered compaction"
+        );
 
         // Verify a compaction-*.json file was written
         let entries: Vec<_> = std::fs::read_dir(tmp.path())

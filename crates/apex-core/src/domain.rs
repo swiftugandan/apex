@@ -67,6 +67,15 @@ pub struct ToolResult {
     pub duration_ms: u64,
 }
 
+/// Optional breakdown of output token usage (e.g. reasoning vs content).
+/// Populated when the provider returns details (e.g. OpenAI completion_tokens_details).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct OutputTokensDetails {
+    /// Tokens used for reasoning/thinking (e.g. o1/o3, extended thinking).
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
+}
+
 /// Token usage from an LLM response.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
@@ -76,6 +85,9 @@ pub struct TokenUsage {
     pub cache_creation_input_tokens: u32,
     #[serde(default)]
     pub cache_read_input_tokens: u32,
+    /// Optional breakdown (e.g. reasoning_tokens); set when provider supplies it.
+    #[serde(default)]
+    pub output_tokens_details: Option<OutputTokensDetails>,
 }
 
 /// Hint for providers about block cacheability.
@@ -111,6 +123,12 @@ pub struct CalibrationData {
     pub chars_per_token_code: f32,
     pub chars_per_token_mixed: f32,
     pub sample_count: u32,
+    /// EMA of reasoning tokens per turn (when output_tokens_details is present).
+    #[serde(default)]
+    pub reasoning_tokens_ema: Option<f32>,
+    /// Number of samples used for reasoning EMA.
+    #[serde(default)]
+    pub reasoning_sample_count: u32,
 }
 
 impl Default for CalibrationData {
@@ -120,6 +138,8 @@ impl Default for CalibrationData {
             chars_per_token_code: 3.0,
             chars_per_token_mixed: 3.5,
             sample_count: 0,
+            reasoning_tokens_ema: None,
+            reasoning_sample_count: 0,
         }
     }
 }

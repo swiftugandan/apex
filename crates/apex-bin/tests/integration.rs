@@ -267,6 +267,7 @@ async fn single_task_roundtrip() {
             max_retries: 3,
             max_tool_result_bytes: 10_000,
             max_output_tokens: 4096,
+            reserved_reasoning_tokens: 4096,
             max_turns: 32,
             max_empty_cycles: 300,
             max_tool_input_bytes: 40_000,

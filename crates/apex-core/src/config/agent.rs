@@ -80,6 +80,10 @@ pub struct AgentSection {
     #[serde(default = "default_true")]
     pub prompt_caching: bool,
 
+    /// Reserved token budget for model reasoning/thinking. When None, derived from model id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_reasoning_tokens: Option<u32>,
+
     /// Enabled tool names (empty = all available).
     #[serde(default)]
     pub tools: Vec<String>,
@@ -236,6 +240,18 @@ fn default_max_retries() -> u32 {
 fn default_max_output_tokens() -> u32 {
     16_384
 }
+
+/// Default reserved reasoning tokens from model id (used when config omits reserved_reasoning_tokens).
+pub(crate) fn default_reserved_reasoning_tokens(model_id: &str) -> u32 {
+    let id = model_id.to_lowercase();
+    if id.contains("o1") || id.contains("o3") {
+        65_536
+    } else if id.contains("o4") || id.contains("gpt-4") || id.starts_with("claude-") {
+        8_192
+    } else {
+        4_096
+    }
+}
 fn default_max_turns() -> usize {
     32
 }
@@ -347,6 +363,7 @@ impl Default for AgentSection {
             max_tool_calls_per_turn: default_max_tool_calls_per_turn(),
             max_total_tool_calls: default_max_total_tool_calls(),
             prompt_caching: true,
+            reserved_reasoning_tokens: None,
             tools: vec![],
         }
     }
@@ -427,5 +444,35 @@ max_depth = 5
         assert_eq!(config.agent.max_concurrent, 1); // default
         assert_eq!(config.agent.max_retries, 3); // default
         assert!(config.roles.is_empty()); // default
+    }
+
+    #[test]
+    fn default_reserved_reasoning_tokens_o1_large() {
+        assert_eq!(default_reserved_reasoning_tokens("o1"), 65_536);
+        assert_eq!(default_reserved_reasoning_tokens("o1-2024"), 65_536);
+    }
+
+    #[test]
+    fn default_reserved_reasoning_tokens_o3_large() {
+        assert_eq!(default_reserved_reasoning_tokens("o3"), 65_536);
+    }
+
+    #[test]
+    fn default_reserved_reasoning_tokens_gpt4_moderate() {
+        assert_eq!(default_reserved_reasoning_tokens("gpt-4"), 8_192);
+        assert_eq!(default_reserved_reasoning_tokens("gpt-4-turbo"), 8_192);
+    }
+
+    #[test]
+    fn default_reserved_reasoning_tokens_claude_moderate() {
+        assert_eq!(
+            default_reserved_reasoning_tokens("claude-sonnet-4-20250514"),
+            8_192
+        );
+    }
+
+    #[test]
+    fn default_reserved_reasoning_tokens_unknown_fallback() {
+        assert_eq!(default_reserved_reasoning_tokens("unknown-model"), 4_096);
     }
 }
