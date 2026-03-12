@@ -238,6 +238,16 @@ impl MemoryStore for SqliteMemoryStore {
                 tags,
             });
         }
+        // Re-sort by decayed confidence only for the empty-query path where the
+        // SQL ordering used raw confidence. FTS results keep their BM25 relevance
+        // order — decay is applied for display but doesn't override text relevance.
+        if query.is_empty() {
+            facts.sort_by(|a, b| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
         Ok(facts)
     }
 

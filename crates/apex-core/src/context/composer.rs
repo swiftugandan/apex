@@ -278,6 +278,34 @@ impl MessageComposer {
         out
     }
 
+    /// Format a slice of facts into a markdown section, capping total size by `max_tokens`.
+    /// Each fact is budgeted to 200 tokens; facts are included in order until the section
+    /// would exceed `max_tokens`. Used for JIT retrieval at claim start.
+    pub fn format_facts_section(&self, facts: &[Fact], max_tokens: u32) -> String {
+        const PER_FACT_TOKENS: u32 = 200;
+        let header = "## Relevant facts (from long-term memory)\n\n";
+        let header_tokens = self.estimator.estimate(header);
+        let mut remaining_tokens = max_tokens.saturating_sub(header_tokens);
+        let mut out = String::from(header);
+        for fact in facts {
+            let line = format!(
+                "- [confidence: {:.2}] {}\n",
+                fact.confidence,
+                self.estimator.budget(&fact.content, PER_FACT_TOKENS)
+            );
+            let line_tokens = self.estimator.estimate(&line);
+            if line_tokens > remaining_tokens {
+                break;
+            }
+            remaining_tokens -= line_tokens;
+            out.push_str(&line);
+        }
+        if out.len() == header.len() {
+            return String::new();
+        }
+        out
+    }
+
     /// Compose a continuation message body that triggers result assembly.
     pub fn compose_continuation(
         correlation_id: &str,
@@ -357,7 +385,8 @@ impl MessageComposer {
 mod tests {
     use super::*;
     use crate::domain::{
-        AttemptOutcome, AttemptRecord, Scratchpad, TokenUsage, ToolCallRecord, TurnRecord,
+        AttemptOutcome, AttemptRecord, Fact, FactId, Scratchpad, TokenUsage, ToolCallRecord,
+        TurnRecord,
     };
 
     fn make_tool_call(name: &str, is_error: bool) -> ToolCallRecord {
@@ -542,5 +571,70 @@ mod tests {
         assert!(result.contains("# Result: Deploy"));
         assert!(result.contains("### id-1"));
         assert!(result.contains("### id-2"));
+    }
+
+    #[test]
+    fn format_facts_section_empty_returns_empty() {
+        let c = composer();
+        let result = c.format_facts_section(&[], 800);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn format_facts_section_includes_facts_within_budget() {
+        let c = composer();
+        let facts = vec![
+            Fact {
+                id: FactId("f1".into()),
+                content: "Rust uses Cargo for builds".into(),
+                source_job: "job-1".into(),
+                confidence: 0.9,
+                created_at: String::new(),
+                last_verified: String::new(),
+                tags: vec![],
+            },
+            Fact {
+                id: FactId("f2".into()),
+                content: "Tests live in the tests module".into(),
+                source_job: "job-2".into(),
+                confidence: 0.8,
+                created_at: String::new(),
+                last_verified: String::new(),
+                tags: vec![],
+            },
+        ];
+        let result = c.format_facts_section(&facts, 800);
+        assert!(result.contains("## Relevant facts (from long-term memory)"));
+        assert!(result.contains("Rust uses Cargo"));
+        assert!(result.contains("Tests live"));
+        assert!(result.contains("0.90"));
+        assert!(result.contains("0.80"));
+        let est = crate::context::TokenEstimator::default();
+        assert!(est.estimate(&result) <= 800);
+    }
+
+    #[test]
+    fn format_facts_section_respects_token_budget() {
+        let c = composer();
+        let long_content = "word ".repeat(200);
+        let facts = vec![
+            Fact {
+                id: FactId("f1".into()),
+                content: long_content.clone(),
+                source_job: "j1".into(),
+                confidence: 1.0,
+                created_at: String::new(),
+                last_verified: String::new(),
+                tags: vec![],
+            };
+            5
+        ];
+        let result = c.format_facts_section(&facts, 50);
+        let est = crate::context::TokenEstimator::default();
+        let tokens = est.estimate(&result);
+        assert!(
+            tokens <= 50,
+            "section should fit in 50 tokens, got {tokens}"
+        );
     }
 }

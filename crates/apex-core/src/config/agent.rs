@@ -175,6 +175,18 @@ pub struct ConsolidationSection {
     /// Whether to extract/update strategies from task results.
     #[serde(default = "default_true")]
     pub extract_strategies: bool,
+
+    /// Whether to inject relevant long-term facts at the start of each claim (JIT retrieval).
+    #[serde(default = "default_true")]
+    pub retrieval_at_start: bool,
+
+    /// Maximum tokens for the JIT-injected facts section at claim start.
+    #[serde(default = "default_retrieval_max_tokens")]
+    pub retrieval_max_tokens: u32,
+
+    /// Maximum number of facts to request from the store before token trimming.
+    #[serde(default = "default_retrieval_max_facts")]
+    pub retrieval_max_facts: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -291,6 +303,12 @@ fn default_compaction_preserve_turns() -> usize {
 fn default_compaction_max_summary_tokens() -> u32 {
     1024
 }
+fn default_retrieval_max_tokens() -> u32 {
+    800
+}
+fn default_retrieval_max_facts() -> usize {
+    15
+}
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -386,6 +404,9 @@ impl Default for ConsolidationSection {
             extract_facts: true,
             extract_skills: true,
             extract_strategies: true,
+            retrieval_at_start: true,
+            retrieval_max_tokens: default_retrieval_max_tokens(),
+            retrieval_max_facts: default_retrieval_max_facts(),
         }
     }
 }

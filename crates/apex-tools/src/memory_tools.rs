@@ -118,7 +118,7 @@ impl ToolRegistry for MemoryToolRegistry {
             }),
             ToolDef::eager(ToolSchema {
                     name: "memory_query_facts".into(),
-                    description: "Query long-term memory for facts matching a search query. Returns facts with decayed confidence scores.".into(),
+                    description: "Query long-term memory for facts matching a search query. Returns facts with decayed confidence scores. Relevant facts may also be pre-loaded at task start; use this tool for on-demand lookup during the run.".into(),
                     input_schema: json!({
                         "type": "object",
                         "properties": {

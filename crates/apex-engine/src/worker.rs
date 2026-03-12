@@ -13,6 +13,7 @@ use apex_core::ports::{HookRegistry, LlmProvider, MemoryStore, Queue, SkillStore
 use crate::agentic_loop::{run_agentic_loop, LoopConfig, LoopOutcome};
 use crate::claim_tool_factory::{ClaimContext, ClaimToolFactory};
 use crate::consolidation::consolidate_learnings;
+use crate::jit_retrieval;
 use crate::log::dispatch_log;
 use crate::util::{composer_from_estimator, extract_title, now_unix_ts};
 
@@ -227,6 +228,31 @@ async fn execute_claim(
         for outcome in outcomes {
             if let HookOutcome::Inject(content) = outcome {
                 initial_body = format!("{initial_body}\n\n---\n{content}");
+            }
+        }
+    }
+
+    // ── JIT retrieval: inject relevant long-term facts at claim start ──
+    // Skip on continuations when scratchpad already has rich context (notes/subtasks)
+    // to avoid re-injecting facts the agent already consolidated.
+    let skip_jit = claimed.headers.message_type == MessageType::Continuation
+        && (!scratchpad.notes.is_empty() || !scratchpad.subtasks.is_empty());
+    if ctx.consolidation.retrieval_at_start && !skip_jit {
+        let query = jit_retrieval::derive_query(&claimed.body, &scratchpad.goal);
+        if !query.is_empty() {
+            // Clone the estimator to avoid holding the mutex across the async store query.
+            let est = ctx.estimator.lock().await.clone();
+            let section = jit_retrieval::retrieve_facts_section(
+                ctx.long_term.as_ref(),
+                est,
+                &query,
+                ctx.consolidation.retrieval_max_facts,
+                ctx.consolidation.retrieval_max_tokens,
+            )
+            .await;
+            if !section.is_empty() {
+                initial_body.push_str("\n\n---\n");
+                initial_body.push_str(&section);
             }
         }
     }
