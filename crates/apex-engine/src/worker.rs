@@ -247,8 +247,7 @@ async fn execute_claim(
         memory: Some(ctx.memory.as_ref()),
         cancel: None,
         timeout: None,
-        compaction_preserve_turns: ctx.compaction.preserve_turns,
-        compaction_max_summary_tokens: ctx.compaction.max_summary_tokens,
+        compaction: ctx.compaction.clone(),
         max_turns: ctx.limits.max_turns,
         hooks: ctx.hooks.as_deref(),
         max_tool_input_bytes: ctx.limits.max_tool_input_bytes,
@@ -642,6 +641,7 @@ mod tests {
             compaction: CompactionSection {
                 preserve_turns: 3,
                 max_summary_tokens: 1024,
+                spill_history: false,
             },
             consolidation: ConsolidationSection::default(),
             hooks: None,

@@ -1,10 +1,12 @@
 use futures::future::join_all;
-use std::path::PathBuf;
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use apex_core::config::CompactionSection;
 use apex_core::context::TokenEstimator;
 use apex_core::domain::{
     ChatMessage, CompletionRequest, ContentBlock, HookEvent, HookOutcome, LogEntry, MessageRole,
@@ -48,8 +50,6 @@ pub struct LoopConfig<'a> {
     pub cancel: Option<&'a CancellationToken>,
     /// Optional wall-clock timeout for the entire loop.
     pub timeout: Option<Duration>,
-    pub compaction_preserve_turns: usize,
-    pub compaction_max_summary_tokens: u32,
     /// Maximum number of LLM turns in this loop.
     pub max_turns: usize,
     /// Optional lifecycle hook registry.
@@ -58,19 +58,29 @@ pub struct LoopConfig<'a> {
     pub max_tool_input_bytes: usize,
     /// Scratch directory for spilling original tool inputs.
     pub scratch_dir: Option<PathBuf>,
+    /// Compaction settings (preserve_turns, max_summary_tokens, spill_history).
+    pub compaction: CompactionSection,
+}
+
+/// Serialize `messages` as pretty-printed JSON directly to a file under `dir`,
+/// avoiding intermediate string allocation via `BufWriter`.
+fn spill_to_disk(dir: &Path, messages: &[ChatMessage]) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("mkdir: {e}"))?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = dir.join(format!("compaction-{ts}.json"));
+    let file = std::fs::File::create(&path).map_err(|e| format!("create: {e}"))?;
+    let writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(writer, messages).map_err(|e| format!("serialize: {e}"))?;
+    Ok(path)
 }
 
 /// Automatically compact conversation history when estimated prompt tokens
 /// reach ≥ 80% of the LLM context window. Returns `true` if compaction occurred.
-async fn maybe_compact(
-    messages: &mut Vec<ChatMessage>,
-    llm: &dyn LlmProvider,
-    estimator: &Arc<Mutex<TokenEstimator>>,
-    hooks: Option<&dyn HookRegistry>,
-    preserve_turns: usize,
-    max_summary_tokens: u32,
-) -> bool {
-    let context_window = llm.context_window();
+async fn maybe_compact(messages: &mut Vec<ChatMessage>, config: &LoopConfig<'_>) -> bool {
+    let context_window = config.llm.context_window();
     let threshold = (context_window as f64 * 0.8) as u32;
 
     let prompt_text: String = messages
@@ -79,7 +89,7 @@ async fn maybe_compact(
         .collect::<Vec<_>>()
         .join("\n");
     let estimated_tokens = {
-        let est = estimator.lock().await;
+        let est = config.estimator.lock().await;
         est.estimate(&prompt_text)
     };
 
@@ -87,10 +97,44 @@ async fn maybe_compact(
         return false;
     }
 
-    match compact_messages(messages, llm, preserve_turns, max_summary_tokens).await {
+    // Spill full conversation history to disk before compaction (Principle 5 & 6)
+    if config.compaction.spill_history {
+        match config.scratch_dir.as_deref() {
+            Some(dir) => match spill_to_disk(dir, messages) {
+                Ok(path) => {
+                    let msg_count = messages.len();
+                    let p = path.display();
+                    dispatch_log(
+                        config.hooks,
+                        || serde_json::json!({
+                            "level": "info",
+                            "event": "compaction_spill",
+                            "messages": msg_count,
+                            "path": p.to_string(),
+                        }),
+                        &format!("  spilled {msg_count} messages to {p}"),
+                    )
+                    .await;
+                }
+                Err(e) => eprintln!("  compaction spill failed ({e})"),
+            },
+            None => {
+                eprintln!("  spill_history enabled but no scratch_dir configured, skipping spill");
+            }
+        }
+    }
+
+    match compact_messages(
+        messages,
+        config.llm,
+        config.compaction.preserve_turns,
+        config.compaction.max_summary_tokens,
+    )
+    .await
+    {
         Ok((compacted, count)) => {
             dispatch_log(
-                hooks,
+                config.hooks,
                 || serde_json::json!({
                     "level": "info",
                     "event": "conversation_compacted",
@@ -106,7 +150,7 @@ async fn maybe_compact(
         }
         Err(reason) => {
             dispatch_log(
-                hooks,
+                config.hooks,
                 || {
                     serde_json::json!({
                         "level": "warn",
@@ -173,15 +217,7 @@ pub async fn run_agentic_loop(
         }
 
         // ── auto-compaction ──
-        maybe_compact(
-            &mut messages,
-            config.llm,
-            config.estimator,
-            config.hooks,
-            config.compaction_preserve_turns,
-            config.compaction_max_summary_tokens,
-        )
-        .await;
+        maybe_compact(&mut messages, config).await;
 
         let req = CompletionRequest {
             system_prompt: &system_prompt,
@@ -474,6 +510,14 @@ mod tests {
         Arc::new(Mutex::new(TokenEstimator::default()))
     }
 
+    fn test_compaction() -> CompactionSection {
+        CompactionSection {
+            preserve_turns: 3,
+            max_summary_tokens: 1024,
+            spill_history: false,
+        }
+    }
+
     #[tokio::test]
     async fn loop_returns_on_end_turn() {
         let llm = MockLlmProvider::text_only("Hello, world!");
@@ -491,12 +535,11 @@ mod tests {
             memory: None,
             cancel: None,
             timeout: None,
-            compaction_preserve_turns: 3,
-            compaction_max_summary_tokens: 1024,
             max_turns: 32,
             hooks: None,
             max_tool_input_bytes: 40_000,
             scratch_dir: None,
+            compaction: test_compaction(),
         };
 
         let messages = vec![ChatMessage::user_text("Hi")];
@@ -529,12 +572,11 @@ mod tests {
             memory: None,
             cancel: None,
             timeout: None,
-            compaction_preserve_turns: 3,
-            compaction_max_summary_tokens: 1024,
             max_turns: 32,
             hooks: None,
             max_tool_input_bytes: 40_000,
             scratch_dir: None,
+            compaction: test_compaction(),
         };
 
         let messages = vec![ChatMessage::user_text("Do something")];
@@ -569,12 +611,11 @@ mod tests {
             memory: None,
             cancel: None,
             timeout: None,
-            compaction_preserve_turns: 3,
-            compaction_max_summary_tokens: 1024,
             max_turns: 32,
             hooks: None,
             max_tool_input_bytes: 40_000,
             scratch_dir: None,
+            compaction: test_compaction(),
         };
 
         let messages = vec![ChatMessage::user_text("Hi")];
@@ -608,12 +649,11 @@ mod tests {
             memory: None,
             cancel: None,
             timeout: None,
-            compaction_preserve_turns: 3,
-            compaction_max_summary_tokens: 1024,
             max_turns: 32,
             hooks: None,
             max_tool_input_bytes: 40_000,
             scratch_dir: None,
+            compaction: test_compaction(),
         };
 
         let messages = vec![ChatMessage::user_text("Do something")];
@@ -645,12 +685,11 @@ mod tests {
             memory: None,
             cancel: Some(&cancel),
             timeout: None,
-            compaction_preserve_turns: 3,
-            compaction_max_summary_tokens: 1024,
             max_turns: 32,
             hooks: None,
             max_tool_input_bytes: 40_000,
             scratch_dir: None,
+            compaction: test_compaction(),
         };
 
         let messages = vec![ChatMessage::user_text("Hi")];
@@ -677,12 +716,11 @@ mod tests {
             memory: None,
             cancel: None,
             timeout: Some(Duration::from_secs(0)), // Already expired
-            compaction_preserve_turns: 3,
-            compaction_max_summary_tokens: 1024,
             max_turns: 32,
             hooks: None,
             max_tool_input_bytes: 40_000,
             scratch_dir: None,
+            compaction: test_compaction(),
         };
 
         let messages = vec![ChatMessage::user_text("Hi")];
@@ -715,12 +753,11 @@ mod tests {
             memory: None,
             cancel: None,
             timeout: None,
-            compaction_preserve_turns: 3,
-            compaction_max_summary_tokens: 1024,
             max_turns,
             hooks: None,
             max_tool_input_bytes: 40_000,
             scratch_dir: None,
+            compaction: test_compaction(),
         };
 
         let messages = vec![ChatMessage::user_text("Do something")];
@@ -731,12 +768,8 @@ mod tests {
     }
 
     // ── maybe_compact tests ─────────────────────────────
-    //
-    // Verify auto-compaction triggers when estimated tokens ≥ 80% of
-    // the context window and that it preserves recent turns.
 
     /// Build a message set large enough to exceed a given token threshold.
-    /// Each pair adds ~30 chars of text content ≈ 7-8 tokens at default ratio.
     fn make_long_conversation(pairs: usize) -> Vec<ChatMessage> {
         let mut messages = vec![ChatMessage::user_text("Original task description")];
         for i in 0..pairs {
@@ -753,15 +786,36 @@ mod tests {
         messages
     }
 
+    /// Helper to build a `LoopConfig` suitable for `maybe_compact` tests.
+    fn compact_test_config<'a>(
+        llm: &'a dyn LlmProvider,
+        tools: &'a dyn ToolRegistry,
+        estimator: &'a Arc<Mutex<TokenEstimator>>,
+        compaction: CompactionSection,
+        scratch_dir: Option<PathBuf>,
+    ) -> LoopConfig<'a> {
+        LoopConfig {
+            persona: "",
+            llm,
+            tools,
+            estimator,
+            max_tool_result_bytes: 10_000,
+            max_output_tokens: 4096,
+            scratchpad: None,
+            memory: None,
+            cancel: None,
+            timeout: None,
+            max_turns: 32,
+            hooks: None,
+            max_tool_input_bytes: 40_000,
+            scratch_dir,
+            compaction,
+        }
+    }
+
     #[tokio::test]
     async fn maybe_compact_triggers_above_threshold() {
-        // Use a tiny context window so a modest conversation exceeds 80%.
-        // Default TokenEstimator ratio ≈ 4 chars/token.
-        // 20 pairs ≈ 41 messages ≈ ~250 tokens at default ratio.
-        // context_window=200 → threshold = 160 tokens.
         let messages = make_long_conversation(20);
-
-        // The mock needs a `complete()` response for the summarization call.
         let summary_response = Ok(apex_core::domain::ToolCompletionResponse {
             message: ChatMessage {
                 role: MessageRole::Assistant,
@@ -770,64 +824,47 @@ mod tests {
                 }],
             },
             tool_calls: vec![],
-            usage: apex_core::domain::TokenUsage {
-                input_tokens: 100,
-                output_tokens: 30,
-            },
+            usage: apex_core::domain::TokenUsage { input_tokens: 100, output_tokens: 30 },
             stop_reason: apex_core::domain::StopReason::EndTurn,
         });
         let llm = MockLlmProvider::new(vec![summary_response]).with_context_window(200);
+        let tools = MockToolRegistry::echo("t");
         let estimator = default_estimator();
+        let cfg = compact_test_config(&llm, &tools, &estimator, test_compaction(), None);
 
         let mut msgs = messages.clone();
         let original_len = msgs.len();
 
-        let compacted = maybe_compact(
-            &mut msgs, &llm, &estimator, None, // no hooks
-            3,    // preserve_turns
-            1024, // max_summary_tokens
-        )
-        .await;
+        let compacted = maybe_compact(&mut msgs, &cfg).await;
 
         assert!(compacted, "should have triggered compaction");
-        assert!(
-            msgs.len() < original_len,
-            "compacted messages should be shorter"
-        );
-        // First message is preserved
+        assert!(msgs.len() < original_len, "compacted messages should be shorter");
         assert_eq!(msgs[0].text(), "Original task description");
-        // Second message is the summary
         assert_eq!(msgs[1].role, MessageRole::Assistant);
         assert!(msgs[1].text().contains("compacted"));
-        // Alternation maintained
         for i in 1..msgs.len() {
-            assert_ne!(
-                msgs[i].role,
-                msgs[i - 1].role,
-                "alternation violated at index {i}"
-            );
+            assert_ne!(msgs[i].role, msgs[i - 1].role, "alternation violated at index {i}");
         }
     }
 
     #[tokio::test]
     async fn maybe_compact_skips_below_threshold() {
-        // Large context window — small conversation won't hit 80%.
         let llm = MockLlmProvider::text_only("should not be called").with_context_window(1_000_000);
+        let tools = MockToolRegistry::echo("t");
         let estimator = default_estimator();
+        let cfg = compact_test_config(&llm, &tools, &estimator, test_compaction(), None);
 
         let mut msgs = vec![
             ChatMessage::user_text("Hi"),
             ChatMessage {
                 role: MessageRole::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: "Hello".into(),
-                }],
+                content: vec![ContentBlock::Text { text: "Hello".into() }],
             },
             ChatMessage::user_text("How are you?"),
         ];
         let original_len = msgs.len();
 
-        let compacted = maybe_compact(&mut msgs, &llm, &estimator, None, 3, 1024).await;
+        let compacted = maybe_compact(&mut msgs, &cfg).await;
 
         assert!(!compacted, "should NOT have triggered compaction");
         assert_eq!(msgs.len(), original_len, "messages should be unchanged");
@@ -835,9 +872,7 @@ mod tests {
 
     #[tokio::test]
     async fn maybe_compact_preserves_recent_turns() {
-        let preserve_turns = 2;
         let messages = make_long_conversation(15);
-
         let summary_response = Ok(apex_core::domain::ToolCompletionResponse {
             message: ChatMessage {
                 role: MessageRole::Assistant,
@@ -846,31 +881,22 @@ mod tests {
                 }],
             },
             tool_calls: vec![],
-            usage: apex_core::domain::TokenUsage {
-                input_tokens: 80,
-                output_tokens: 20,
-            },
+            usage: apex_core::domain::TokenUsage { input_tokens: 80, output_tokens: 20 },
             stop_reason: apex_core::domain::StopReason::EndTurn,
         });
         let llm = MockLlmProvider::new(vec![summary_response]).with_context_window(200);
+        let tools = MockToolRegistry::echo("t");
         let estimator = default_estimator();
+        let compaction = CompactionSection { preserve_turns: 2, ..test_compaction() };
+        let cfg = compact_test_config(&llm, &tools, &estimator, compaction, None);
 
         let mut msgs = messages.clone();
-
-        let compacted =
-            maybe_compact(&mut msgs, &llm, &estimator, None, preserve_turns, 1024).await;
+        let compacted = maybe_compact(&mut msgs, &cfg).await;
 
         assert!(compacted);
-
-        // The compacted result is: [original_task, summary, ...preserved_tail].
-        // The preserved tail must be an exact suffix of the original messages.
-        let compacted_tail = &msgs[2..]; // skip original + summary
+        let compacted_tail = &msgs[2..];
         let original_tail = &messages[messages.len() - compacted_tail.len()..];
-
-        assert!(
-            !compacted_tail.is_empty(),
-            "should have preserved at least some recent turns"
-        );
+        assert!(!compacted_tail.is_empty(), "should have preserved at least some recent turns");
         for (i, (orig, comp)) in original_tail.iter().zip(compacted_tail.iter()).enumerate() {
             assert_eq!(orig.role, comp.role, "tail message {i} role mismatch");
             assert_eq!(orig.text(), comp.text(), "tail message {i} text mismatch");
@@ -888,44 +914,30 @@ mod tests {
         let tools = MockToolRegistry::large_output("big_tool", 100_000);
         let estimator = default_estimator();
 
-        let max_result_bytes = 1_000;
         let config = LoopConfig {
             persona: "You are helpful.",
             llm: &llm,
             tools: &tools,
             estimator: &estimator,
-            max_tool_result_bytes: max_result_bytes,
+            max_tool_result_bytes: 1_000,
             max_output_tokens: 4096,
             scratchpad: None,
             memory: None,
             cancel: None,
             timeout: None,
-            compaction_preserve_turns: 3,
-            compaction_max_summary_tokens: 1024,
             max_turns: 32,
             hooks: None,
             max_tool_input_bytes: 40_000,
             scratch_dir: None,
+            compaction: test_compaction(),
         };
 
         let messages = vec![ChatMessage::user_text("Get data")];
         let (_turns, _final_text, msgs) = run_agentic_loop(messages, &config).await;
 
-        // Find the tool result message and check it was truncated
-        let tool_result_msg = msgs.iter().find(|m| {
-            m.content
-                .iter()
-                .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
-        });
-        assert!(
-            tool_result_msg.is_some(),
-            "should have a tool result message"
-        );
-
-        let tool_result_content = tool_result_msg
-            .unwrap()
-            .content
+        let tool_result_content = msgs
             .iter()
+            .flat_map(|m| &m.content)
             .find_map(|b| {
                 if let ContentBlock::ToolResult { content, .. } = b {
                     Some(content.clone())
@@ -933,12 +945,125 @@ mod tests {
                     None
                 }
             })
-            .unwrap();
+            .expect("should have a tool result message");
 
         assert!(
             tool_result_content.contains("[truncated:"),
             "output should contain truncation marker, got len={}",
             tool_result_content.len()
         );
+    }
+
+    /// Build a conversation with tool-use and tool-result blocks for richer roundtrip testing.
+    fn make_conversation_with_tool_use(pairs: usize) -> Vec<ChatMessage> {
+        let mut messages = vec![ChatMessage::user_text("Original task description")];
+        for i in 0..pairs {
+            if i % 3 == 1 {
+                messages.push(ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: format!("call-{i}"),
+                        name: "test_tool".into(),
+                        input: serde_json::json!({ "query": format!("lookup {i}") }),
+                    }],
+                });
+                messages.push(ChatMessage {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: format!("call-{i}"),
+                        content: format!("result for lookup {i}"),
+                        is_error: false,
+                    }],
+                });
+            } else {
+                messages.push(ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: format!("Assistant response number {i} with some extra context"),
+                    }],
+                });
+                messages.push(ChatMessage::user_text(format!(
+                    "User follow-up number {i} with additional detail"
+                )));
+            }
+        }
+        messages
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_spills_before_compaction() {
+        let messages = make_conversation_with_tool_use(20);
+        let summary_response = Ok(apex_core::domain::ToolCompletionResponse {
+            message: ChatMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "Summary of conversation so far".to_string(),
+                }],
+            },
+            tool_calls: vec![],
+            usage: apex_core::domain::TokenUsage { input_tokens: 100, output_tokens: 30 },
+            stop_reason: apex_core::domain::StopReason::EndTurn,
+        });
+        let llm = MockLlmProvider::new(vec![summary_response]).with_context_window(200);
+        let tools = MockToolRegistry::echo("t");
+        let estimator = default_estimator();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let compaction = CompactionSection { spill_history: true, ..test_compaction() };
+        let cfg = compact_test_config(
+            &llm, &tools, &estimator, compaction, Some(tmp.path().to_path_buf()),
+        );
+
+        let mut msgs = messages.clone();
+        let original_len = msgs.len();
+
+        let compacted = maybe_compact(&mut msgs, &cfg).await;
+
+        assert!(compacted, "should have triggered compaction");
+        assert!(msgs.len() < original_len);
+
+        // Verify a compaction-*.json file was written
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("compaction-"))
+            .collect();
+        assert_eq!(entries.len(), 1, "expected exactly one spill file");
+
+        // Verify it deserializes back to the original messages (including tool-use blocks)
+        let content = std::fs::read_to_string(entries[0].path()).unwrap();
+        let deserialized: Vec<ChatMessage> = serde_json::from_str(&content).unwrap();
+        assert_eq!(deserialized.len(), original_len);
+        for (i, (orig, spilled)) in messages.iter().zip(deserialized.iter()).enumerate() {
+            assert_eq!(orig.role, spilled.role, "role mismatch at index {i}");
+            assert_eq!(
+                orig.content.len(), spilled.content.len(),
+                "content block count mismatch at index {i}"
+            );
+            for (j, (ob, sb)) in orig.content.iter().zip(spilled.content.iter()).enumerate() {
+                match (ob, sb) {
+                    (ContentBlock::Text { text: a }, ContentBlock::Text { text: b }) => {
+                        assert_eq!(a, b, "text mismatch at msg {i} block {j}");
+                    }
+                    (
+                        ContentBlock::ToolUse { id: a_id, name: a_name, input: a_input },
+                        ContentBlock::ToolUse { id: b_id, name: b_name, input: b_input },
+                    ) => {
+                        assert_eq!(a_id, b_id, "tool_use id mismatch at msg {i} block {j}");
+                        assert_eq!(a_name, b_name, "tool_use name mismatch at msg {i} block {j}");
+                        assert_eq!(a_input, b_input, "tool_use input mismatch at msg {i} block {j}");
+                    }
+                    (
+                        ContentBlock::ToolResult { tool_use_id: a_id, content: a_c, is_error: a_e },
+                        ContentBlock::ToolResult { tool_use_id: b_id, content: b_c, is_error: b_e },
+                    ) => {
+                        assert_eq!(a_id, b_id, "tool_result id mismatch at msg {i} block {j}");
+                        assert_eq!(a_c, b_c, "tool_result content mismatch at msg {i} block {j}");
+                        assert_eq!(a_e, b_e, "tool_result is_error mismatch at msg {i} block {j}");
+                    }
+                    _ => panic!("content block variant mismatch at msg {i} block {j}"),
+                }
+            }
+        }
     }
 }

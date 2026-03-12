@@ -270,6 +270,7 @@ async fn single_task_roundtrip() {
         compaction: CompactionSection {
             preserve_turns: 3,
             max_summary_tokens: 1024,
+            spill_history: false,
         },
         consolidation: ConsolidationSection::default(),
         hooks: None,

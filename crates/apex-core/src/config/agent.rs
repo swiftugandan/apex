@@ -165,6 +165,10 @@ pub struct CompactionSection {
     /// Maximum tokens for the LLM-generated compaction summary.
     #[serde(default = "default_compaction_max_summary_tokens")]
     pub max_summary_tokens: u32,
+
+    /// Whether to spill full conversation history to disk before compaction.
+    #[serde(default = "default_true")]
+    pub spill_history: bool,
 }
 
 // ── Defaults ─────────────────────────────────────────────────────
@@ -321,6 +325,7 @@ impl Default for CompactionSection {
         Self {
             preserve_turns: default_compaction_preserve_turns(),
             max_summary_tokens: default_compaction_max_summary_tokens(),
+            spill_history: true,
         }
     }
 }
