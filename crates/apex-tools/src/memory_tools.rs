@@ -4,36 +4,27 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use apex_core::domain::{
-    list_skill_resources, slugify, Fact, FactId, Skill, SkillId, SkillStatus, SubtaskEntry,
-    SubtaskStatus, ToolCall, ToolDef, ToolResult, ToolSchema,
+    Fact, FactId, SubtaskEntry, SubtaskStatus, ToolCall, ToolDef, ToolResult, ToolSchema,
 };
 use apex_core::error::ToolError;
-use apex_core::ports::{MemoryStore, SkillStore, ToolRegistry, WorkingMemory};
+use apex_core::ports::{MemoryStore, ToolRegistry, WorkingMemory};
 
-/// Unified memory tool registry providing both working memory (scratchpad) and
-/// long-term memory (facts, skills, strategies) tools.
+/// Memory tool registry providing working memory (scratchpad) and
+/// long-term memory (facts) tools.
 ///
-/// 6 tools total:
+/// 4 tools total:
 /// - working_memory_read, working_memory_update (working memory / scratchpad)
 /// - memory_store_fact, memory_query_facts (long-term facts)
-/// - memory_store_skill, memory_query_skill (long-term skills)
+///
+/// Skill tools (list_skills, use_skill, store_skill) are in SkillToolRegistry.
 pub struct MemoryToolRegistry {
     memory: Arc<dyn WorkingMemory>,
     store: Arc<dyn MemoryStore>,
-    skill_store: Arc<dyn SkillStore>,
 }
 
 impl MemoryToolRegistry {
-    pub fn new(
-        memory: Arc<dyn WorkingMemory>,
-        store: Arc<dyn MemoryStore>,
-        skill_store: Arc<dyn SkillStore>,
-    ) -> Self {
-        Self {
-            memory,
-            store,
-            skill_store,
-        }
+    pub fn new(memory: Arc<dyn WorkingMemory>, store: Arc<dyn MemoryStore>) -> Self {
+        Self { memory, store }
     }
 }
 
@@ -151,56 +142,6 @@ impl ToolRegistry for MemoryToolRegistry {
                     }),
                 },
             },
-            // ── Long-Term Memory: Skills ────────────────────────────
-            ToolDef {
-                schema: ToolSchema {
-                    name: "memory_store_skill".into(),
-                    description: "Store or update a skill (successful approach for a task pattern) in long-term memory. If a skill with the same task_pattern exists, it is updated.".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "task_pattern": {
-                                "type": "string",
-                                "description": "Pattern describing what kind of task this skill applies to"
-                            },
-                            "name": {
-                                "type": "string",
-                                "description": "Slug name for the skill (e.g. 'install-package'). Derived from task_pattern if omitted."
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Human-readable one-liner describing the skill. Defaults to task_pattern if omitted."
-                            },
-                            "approach": {
-                                "type": "string",
-                                "description": "Description of the approach/strategy used"
-                            },
-                            "tools_used": {
-                                "type": "array",
-                                "items": { "type": "string" },
-                                "description": "List of tools used in this approach"
-                            },
-                        },
-                        "required": ["task_pattern", "approach"]
-                    }),
-                },
-            },
-            ToolDef {
-                schema: ToolSchema {
-                    name: "memory_query_skill".into(),
-                    description: "Find the best matching skill for a task pattern. Returns the highest-fitness non-retired skill.".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "task_pattern": {
-                                "type": "string",
-                                "description": "Task pattern to search for"
-                            }
-                        },
-                        "required": ["task_pattern"]
-                    }),
-                },
-            },
         ]
     }
 
@@ -212,8 +153,6 @@ impl ToolRegistry for MemoryToolRegistry {
             // Long-term memory
             "memory_store_fact" => self.exec_store_fact(call).await,
             "memory_query_facts" => self.exec_query_facts(call).await,
-            "memory_store_skill" => self.exec_store_skill(call).await,
-            "memory_query_skill" => self.exec_query_skill(call).await,
             _ => Err(ToolError::UnknownTool(call.name.clone())),
         }
     }
@@ -406,123 +345,12 @@ impl MemoryToolRegistry {
             ..Default::default()
         })
     }
-
-    async fn exec_store_skill(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let task_pattern = call.input["task_pattern"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidInput("missing task_pattern".into()))?;
-        let approach = call.input["approach"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidInput("missing approach".into()))?;
-        let tools_used: Vec<String> = call
-            .input
-            .get("tools_used")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let name = call
-            .input
-            .get("name")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_else(|| slugify(task_pattern));
-        let description = call
-            .input
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .unwrap_or_else(|| task_pattern.to_string());
-
-        let skill = Skill {
-            id: SkillId(String::new()),
-            name,
-            description,
-            license: None,
-            compatibility: None,
-            allowed_tools: None,
-            extra_metadata: Default::default(),
-            task_pattern: task_pattern.to_string(),
-            approach: approach.to_string(),
-            tools_used,
-            success_count: 0,
-            failure_count: 0,
-            fitness: 0.5,
-            min_samples: 3,
-            last_used: String::new(),
-            status: SkillStatus::Active,
-            skill_dir: None,
-        };
-
-        let id = self
-            .skill_store
-            .store_skill(skill)
-            .await
-            .map_err(|e| ToolError::Execution(e.to_string()))?;
-
-        Ok(ToolResult {
-            tool_use_id: call.id.clone(),
-            name: call.name.clone(),
-            output: json!({ "id": id.0, "status": "stored" }),
-            is_error: false,
-            ..Default::default()
-        })
-    }
-
-    async fn exec_query_skill(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        let task_pattern = call.input["task_pattern"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidInput("missing task_pattern".into()))?;
-
-        let skill = self
-            .skill_store
-            .find_skill(task_pattern)
-            .await
-            .map_err(|e| ToolError::Execution(e.to_string()))?;
-
-        let output = match skill {
-            Some(s) => {
-                let resources = s
-                    .skill_dir
-                    .as_ref()
-                    .map(|dir| list_skill_resources(dir))
-                    .unwrap_or_default();
-                json!({
-                    "found": true,
-                    "id": s.id.0,
-                    "name": s.name,
-                    "description": s.description,
-                    "task_pattern": s.task_pattern,
-                    "approach": s.approach,
-                    "tools_used": s.tools_used,
-                    "fitness": format!("{:.2}", s.fitness),
-                    "success_count": s.success_count,
-                    "failure_count": s.failure_count,
-                    "license": s.license,
-                    "compatibility": s.compatibility,
-                    "resources": resources,
-                })
-            }
-            None => json!({ "found": false }),
-        };
-
-        Ok(ToolResult {
-            tool_use_id: call.id.clone(),
-            name: call.name.clone(),
-            output,
-            is_error: false,
-            ..Default::default()
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apex_core::domain::{CalibrationData, Fact, FactId, Scratchpad, Skill, SkillId};
+    use apex_core::domain::{CalibrationData, Fact, FactId, Scratchpad};
     use apex_core::error::MemoryError;
     use std::collections::HashMap;
     use tokio::sync::Mutex;
@@ -618,77 +446,22 @@ mod tests {
         }
     }
 
-    struct MockSkillStore {
-        skills: Mutex<Vec<Skill>>,
-    }
-
-    impl MockSkillStore {
-        fn new() -> Self {
-            Self {
-                skills: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl SkillStore for MockSkillStore {
-        async fn store_skill(&self, skill: Skill) -> Result<SkillId, MemoryError> {
-            let id = if skill.id.0.is_empty() {
-                SkillId(format!("skill-{}", self.skills.lock().await.len()))
-            } else {
-                skill.id.clone()
-            };
-            self.skills.lock().await.push(Skill {
-                id: id.clone(),
-                ..skill
-            });
-            Ok(id)
-        }
-        async fn find_skill(&self, task_pattern: &str) -> Result<Option<Skill>, MemoryError> {
-            let skills = self.skills.lock().await;
-            Ok(skills
-                .iter()
-                .find(|s| s.task_pattern.contains(task_pattern))
-                .cloned())
-        }
-        async fn list_skills(&self, limit: usize) -> Result<Vec<Skill>, MemoryError> {
-            Ok(self
-                .skills
-                .lock()
-                .await
-                .iter()
-                .take(limit)
-                .cloned()
-                .collect())
-        }
-        async fn update_skill_fitness(
-            &self,
-            _id: &SkillId,
-            _success: bool,
-        ) -> Result<(), MemoryError> {
-            Ok(())
-        }
-    }
-
     fn setup() -> MemoryToolRegistry {
         let wm: Arc<dyn WorkingMemory> = Arc::new(MockWorkingMemory::new());
         let lt: Arc<dyn MemoryStore> = Arc::new(MockMemoryStore::new());
-        let skills: Arc<dyn SkillStore> = Arc::new(MockSkillStore::new());
-        MemoryToolRegistry::new(wm, lt, skills)
+        MemoryToolRegistry::new(wm, lt)
     }
 
     #[test]
-    fn definitions_returns_6_tools() {
+    fn definitions_returns_4_tools() {
         let reg = setup();
         let defs = reg.definitions();
-        assert_eq!(defs.len(), 6);
+        assert_eq!(defs.len(), 4);
         let names: Vec<&str> = defs.iter().map(|d| d.schema.name.as_str()).collect();
         assert!(names.contains(&"working_memory_read"));
         assert!(names.contains(&"working_memory_update"));
         assert!(names.contains(&"memory_store_fact"));
         assert!(names.contains(&"memory_query_facts"));
-        assert!(names.contains(&"memory_store_skill"));
-        assert!(names.contains(&"memory_query_skill"));
     }
 
     #[tokio::test]

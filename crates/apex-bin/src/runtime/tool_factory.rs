@@ -69,11 +69,7 @@ impl ClaimToolFactory for CliClaimToolFactory {
         ));
 
         // 2. Memory tools wired to the session adapter.
-        let memory_tools = MemoryToolRegistry::new(
-            session_memory,
-            Arc::clone(&ctx.long_term),
-            Arc::clone(&ctx.skills),
-        );
+        let memory_tools = MemoryToolRegistry::new(session_memory, Arc::clone(&ctx.long_term));
 
         // 3. Queue tools for decompose_goal / queue_read_done.
         let composer = composer_from_estimator(&self.estimator).await;

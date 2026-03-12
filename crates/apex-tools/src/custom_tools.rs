@@ -416,6 +416,7 @@ impl CustomToolRegistry {
                     min_samples: 3,
                     last_used: now_iso(),
                     status: SkillStatus::Active,
+                    version: "1.0.0".to_string(),
                     skill_dir: None,
                 };
                 let _ = skill_store.store_skill(skill).await;

@@ -10,8 +10,8 @@ use tokio::sync::Mutex;
 use apex_core::domain::{
     CalibrationData, ChatMessage, ClaimedTask, CompletionRequest, CompletionResponse, ContentBlock,
     Fact, FactId, MessageRole, QueueDepth, QueueMessage, QueueMessageMeta, ReapResult, Scratchpad,
-    Skill, SkillId, StopReason, TokenUsage, ToolCall, ToolCompletionResponse, ToolDef, ToolResult,
-    ToolSchema,
+    Skill, SkillId, SkillManifest, StopReason, TokenUsage, ToolCall, ToolCompletionResponse,
+    ToolDef, ToolResult, ToolSchema,
 };
 use apex_core::error::{LlmError, MemoryError, QueueError, ToolError};
 use apex_core::ports::{LlmProvider, MemoryStore, Queue, SkillStore, ToolRegistry, WorkingMemory};
@@ -563,6 +563,28 @@ impl MockSkillStore {
 
 #[async_trait]
 impl SkillStore for MockSkillStore {
+    async fn list_manifests(&self) -> Result<Vec<SkillManifest>, MemoryError> {
+        let skills = self.skills.lock().await;
+        Ok(skills.iter().map(|s| s.to_manifest()).collect())
+    }
+
+    async fn load_skill(&self, name: &str, version: &str) -> Result<Option<Skill>, MemoryError> {
+        let skills = self.skills.lock().await;
+        Ok(skills
+            .iter()
+            .find(|s| s.name == name && (version == "latest" || s.version == version))
+            .cloned())
+    }
+
+    async fn validate_manifest(&self, manifest: &SkillManifest) -> Result<(), MemoryError> {
+        let skills = self.skills.lock().await;
+        if skills.iter().any(|s| s.name == manifest.name) {
+            Ok(())
+        } else {
+            Err(MemoryError::NotFound(manifest.name.clone()))
+        }
+    }
+
     async fn store_skill(&self, skill: Skill) -> Result<SkillId, MemoryError> {
         let id = if skill.id.0.is_empty() {
             SkillId(apex_core::generate_id("skill"))
@@ -574,19 +596,6 @@ impl SkillStore for MockSkillStore {
             ..skill
         });
         Ok(id)
-    }
-
-    async fn find_skill(&self, task_pattern: &str) -> Result<Option<Skill>, MemoryError> {
-        let skills = self.skills.lock().await;
-        Ok(skills
-            .iter()
-            .find(|s| s.task_pattern.contains(task_pattern))
-            .cloned())
-    }
-
-    async fn list_skills(&self, limit: usize) -> Result<Vec<Skill>, MemoryError> {
-        let skills = self.skills.lock().await;
-        Ok(skills.iter().take(limit).cloned().collect())
     }
 
     async fn update_skill_fitness(&self, id: &SkillId, success: bool) -> Result<(), MemoryError> {

@@ -4,7 +4,8 @@ use crate::config::RoleProfile;
 use crate::domain::{
     CalibrationData, ClaimedTask, CompletionRequest, CompletionResponse, Fact, FactId, HookDef,
     HookEvent, HookOutcome, QueueDepth, QueueMessage, QueueMessageMeta, ReapResult, Scratchpad,
-    Skill, SkillId, ToolCall, ToolCompletionResponse, ToolDef, ToolResult, ToolSchema,
+    Skill, SkillId, SkillManifest, ToolCall, ToolCompletionResponse, ToolDef, ToolResult,
+    ToolSchema,
 };
 use crate::error::{LlmError, MemoryError, QueueError, ToolError};
 use serde_json::Value;
@@ -92,9 +93,15 @@ pub trait MemoryStore: Send + Sync {
 
 #[async_trait]
 pub trait SkillStore: Send + Sync {
+    /// List all skill manifests (lightweight, no body loading).
+    async fn list_manifests(&self) -> Result<Vec<SkillManifest>, MemoryError>;
+    /// Load a specific skill by name + version. Returns full Skill with body.
+    async fn load_skill(&self, name: &str, version: &str) -> Result<Option<Skill>, MemoryError>;
+    /// Validate a manifest against available skills.
+    async fn validate_manifest(&self, manifest: &SkillManifest) -> Result<(), MemoryError>;
+    /// Store or upsert a skill (used by consolidation).
     async fn store_skill(&self, skill: Skill) -> Result<SkillId, MemoryError>;
-    async fn find_skill(&self, task_pattern: &str) -> Result<Option<Skill>, MemoryError>;
-    async fn list_skills(&self, limit: usize) -> Result<Vec<Skill>, MemoryError>;
+    /// Update fitness after use.
     async fn update_skill_fitness(&self, id: &SkillId, success: bool) -> Result<(), MemoryError>;
 }
 

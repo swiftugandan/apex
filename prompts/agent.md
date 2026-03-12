@@ -150,14 +150,21 @@ You can decompose complex goals into independent subtasks that run in parallel.
 - **When NOT to decompose:** The task is atomic, sequential, or simple enough to do directly.
 - **Depth limits:** If told max depth is reached, handle the task directly.
 
+## Skills
+
+You have access to reusable skills — versioned bundles of approach, tools, and metadata.
+
+- Use `list_skills` to discover available skills (lightweight manifests, no body loaded).
+- Use `use_skill(name="...")` to load a skill by name. Returns the full approach, resources, and metadata. The skill is registered as active for this session.
+- Use `store_skill(task_pattern="...", approach="...")` to save a successful approach as a new skill.
+- If your message includes an "Available Skills" section, use `use_skill` to load any skill before attempting the task it covers.
+
 ## Long-Term Memory
 
 You have persistent memory that survives across jobs.
 
 - Use `memory_store_fact` to record discovered facts (project structure, conventions, tool versions).
 - Use `memory_query_facts` to search for previously stored facts before starting unfamiliar tasks.
-- Use `memory_store_skill` to record a successful approach for a task pattern.
-- Use `memory_query_skill` to find the best known approach before attempting a task.
 
 ## Error Handling
 

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use apex_core::config::{MemoryMode, RoleProfile};
-use apex_core::domain::{ToolCall, ToolDef, ToolResult, ToolSchema};
+use apex_core::domain::{SkillManifest, ToolCall, ToolDef, ToolResult, ToolSchema};
 use apex_core::error::ToolError;
 use apex_core::ports::{SubAgentSpawner, ToolRegistry};
 use async_trait::async_trait;
@@ -97,6 +97,17 @@ impl DelegateToolRegistry {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
+            let skills: Vec<SkillManifest> = call
+                .input
+                .get("skills")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| serde_json::from_value::<SkillManifest>(v.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+
             let role = RoleProfile {
                 name: "ad-hoc".to_string(),
                 persona: None,
@@ -107,6 +118,7 @@ impl DelegateToolRegistry {
                 max_concurrent: 1,
                 memory: MemoryMode::Shared,
                 can_delegate,
+                skills,
             };
 
             Ok((role, system_prompt))
@@ -156,6 +168,18 @@ impl ToolRegistry for DelegateToolRegistry {
                         "can_delegate": {
                             "type": "boolean",
                             "description": "Whether the ad-hoc sub-agent can further delegate (default: false). Only used with 'system_prompt'."
+                        },
+                        "skills": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "version": { "type": "string" }
+                                },
+                                "required": ["name"]
+                            },
+                            "description": "Skills to attach to the sub-agent. Each entry is a manifest with at least a 'name'. Only used with 'system_prompt'."
                         }
                     },
                     "required": ["task"]
@@ -280,6 +304,7 @@ mod tests {
             max_concurrent: 1,
             memory: MemoryMode::Shared,
             can_delegate: false,
+            skills: vec![],
         }])
     }
 

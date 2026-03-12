@@ -219,6 +219,8 @@ pub struct MessageHeaders {
     pub depth: u32,
     pub retry_count: u32,
     pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<SkillManifest>,
 }
 
 /// A queue message with headers and markdown body.
@@ -338,13 +340,76 @@ pub struct Skill {
     pub last_used: String,
     #[serde(default = "default_skill_status")]
     pub status: SkillStatus,
+    /// Semver version string (default "1.0.0").
+    #[serde(default = "default_skill_version")]
+    pub version: String,
     /// Path to the skill directory (set on load, not serialized).
     #[serde(skip)]
     pub skill_dir: Option<PathBuf>,
 }
 
+fn default_skill_version() -> String {
+    "1.0.0".to_string()
+}
+
 fn default_skill_status() -> SkillStatus {
     SkillStatus::Active
+}
+
+fn default_manifest_version() -> String {
+    "latest".to_string()
+}
+
+/// Lightweight reference handle for a skill — enough for validation and routing,
+/// without loading the full approach body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillManifest {
+    pub name: String,
+    #[serde(default = "default_manifest_version")]
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+/// A skill that has been fully loaded into memory for use.
+#[derive(Debug, Clone)]
+pub struct LoadedSkill {
+    pub manifest: SkillManifest,
+    pub skill: Skill,
+}
+
+/// Parse a comma-separated string into a `Vec<String>`, trimming whitespace
+/// and filtering empty entries.
+pub fn parse_comma_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+impl Skill {
+    /// Build a lightweight `SkillManifest` from this skill.
+    pub fn to_manifest(&self) -> SkillManifest {
+        let allowed_tools = self
+            .allowed_tools
+            .as_deref()
+            .map(parse_comma_list)
+            .unwrap_or_default();
+        SkillManifest {
+            name: self.name.clone(),
+            version: self.version.clone(),
+            allowed_tools,
+            hooks: vec![],
+            prompt: None,
+            digest: None,
+        }
+    }
 }
 
 /// Convert a string into an agentskills.io spec-compliant name.
@@ -420,6 +485,7 @@ impl Skill {
         metadata.insert("apex-min-samples".to_string(), self.min_samples.to_string());
         metadata.insert("apex-last-used".to_string(), self.last_used.clone());
         metadata.insert("apex-status".to_string(), self.status.to_string());
+        metadata.insert("apex-version".to_string(), self.version.clone());
 
         let frontmatter = SkillFrontmatter {
             name,
@@ -475,6 +541,7 @@ impl Skill {
             last_used,
             status,
             extra_metadata,
+            version,
         ) = Self::extract_from_spec_frontmatter(fm);
 
         // Body is freeform markdown per agentskills.io spec
@@ -505,6 +572,7 @@ impl Skill {
             min_samples,
             last_used,
             status,
+            version,
             skill_dir: None,
         })
     }
@@ -529,6 +597,7 @@ impl Skill {
         String,
         SkillStatus,
         BTreeMap<String, String>,
+        String,
     ) {
         let id = fm.metadata.get("apex-id").cloned().unwrap_or_default();
         let task_pattern = fm
@@ -539,12 +608,7 @@ impl Skill {
         let tools_used = fm
             .metadata
             .get("apex-tools-used")
-            .map(|v| {
-                v.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
+            .map(|v| parse_comma_list(v))
             .unwrap_or_default();
         let success_count = fm
             .metadata
@@ -575,6 +639,11 @@ impl Skill {
             Some("retired") => SkillStatus::Retired,
             _ => SkillStatus::Active,
         };
+        let version = fm
+            .metadata
+            .get("apex-version")
+            .cloned()
+            .unwrap_or_else(default_skill_version);
 
         // Preserve non-apex metadata keys
         let extra_metadata: BTreeMap<String, String> = fm
@@ -599,6 +668,7 @@ impl Skill {
             last_used,
             status,
             extra_metadata,
+            version,
         )
     }
 }
@@ -1580,6 +1650,7 @@ mod tests {
             min_samples: 3,
             last_used: "1707123456".to_string(),
             status: SkillStatus::Active,
+            version: "1.0.0".to_string(),
             skill_dir: None,
         };
 
@@ -1629,6 +1700,7 @@ mod tests {
             min_samples: 3,
             last_used: String::new(),
             status: SkillStatus::Active,
+            version: "1.0.0".to_string(),
             skill_dir: None,
         };
 

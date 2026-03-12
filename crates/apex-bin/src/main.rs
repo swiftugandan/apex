@@ -166,6 +166,7 @@ async fn cmd_run(task: String) -> Result<()> {
             depth: 0,
             retry_count: 0,
             depends_on: vec![],
+            skills: vec![],
         },
         body,
     };
@@ -555,10 +556,17 @@ async fn cmd_memory_skills() -> Result<()> {
         ],
         paths.skills_dir.clone(),
     );
-    let skills = skill_store
-        .list_skills(100)
+    let manifests = skill_store
+        .list_manifests()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Load full skills for display
+    let mut skills = Vec::new();
+    for m in &manifests {
+        if let Ok(Some(s)) = skill_store.load_skill(&m.name, "latest").await {
+            skills.push(s);
+        }
+    }
     let rows: Vec<Vec<String>> = skills
         .iter()
         .map(|s| {

@@ -8,8 +8,8 @@ use apex_core::config::{CompactionSection, ConsolidationSection};
 use apex_core::context::TokenEstimator;
 use apex_core::domain::{
     CalibrationData, ChatMessage, CompletionRequest, CompletionResponse, ContentBlock, Fact,
-    FactId, MessageRole, QueueMessage, Scratchpad, Skill, SkillId, StopReason, TokenUsage,
-    ToolCompletionResponse, ToolSchema,
+    FactId, MessageRole, QueueMessage, Scratchpad, Skill, SkillId, SkillManifest, StopReason,
+    TokenUsage, ToolCompletionResponse, ToolSchema,
 };
 use apex_core::error::{LlmError, MemoryError};
 use apex_core::ports::{LlmProvider, MemoryStore, Queue, SkillStore, ToolRegistry, WorkingMemory};
@@ -166,14 +166,17 @@ struct InMemorySkillStore;
 
 #[async_trait]
 impl SkillStore for InMemorySkillStore {
-    async fn store_skill(&self, _skill: Skill) -> Result<SkillId, MemoryError> {
-        Ok(SkillId(apex_core::generate_id("skill")))
+    async fn list_manifests(&self) -> Result<Vec<SkillManifest>, MemoryError> {
+        Ok(vec![])
     }
-    async fn find_skill(&self, _pattern: &str) -> Result<Option<Skill>, MemoryError> {
+    async fn load_skill(&self, _name: &str, _version: &str) -> Result<Option<Skill>, MemoryError> {
         Ok(None)
     }
-    async fn list_skills(&self, _limit: usize) -> Result<Vec<Skill>, MemoryError> {
-        Ok(vec![])
+    async fn validate_manifest(&self, _manifest: &SkillManifest) -> Result<(), MemoryError> {
+        Ok(())
+    }
+    async fn store_skill(&self, _skill: Skill) -> Result<SkillId, MemoryError> {
+        Ok(SkillId(apex_core::generate_id("skill")))
     }
     async fn update_skill_fitness(&self, _id: &SkillId, _success: bool) -> Result<(), MemoryError> {
         Ok(())
@@ -232,6 +235,7 @@ async fn single_task_roundtrip() {
             depth: 0,
             retry_count: 0,
             depends_on: vec![],
+            skills: vec![],
         },
         body: "# Task: Say hello\n\nRespond with 'Hello, World!'".into(),
     };

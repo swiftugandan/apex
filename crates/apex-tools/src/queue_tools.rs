@@ -205,11 +205,8 @@ impl QueueToolRegistry {
                 };
                 let skill_fut = async {
                     if let Some(ref skill_store) = self.skill_store {
-                        skill_store
-                            .find_skill(&info.description)
-                            .await
-                            .ok()
-                            .flatten()
+                        let name = apex_core::domain::slugify(&info.description);
+                        skill_store.load_skill(&name, "latest").await.ok().flatten()
                     } else {
                         None
                     }
@@ -250,6 +247,7 @@ impl QueueToolRegistry {
                     depth: self.current_depth + 1,
                     retry_count: 0,
                     depends_on,
+                    skills: vec![],
                 },
                 body,
             };
@@ -278,6 +276,7 @@ impl QueueToolRegistry {
                 depth: self.current_depth,
                 retry_count: 0,
                 depends_on: subtask_ids.clone(),
+                skills: vec![],
             },
             body: continuation_body,
         };

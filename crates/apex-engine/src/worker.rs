@@ -202,8 +202,18 @@ async fn execute_claim(
         }
     };
 
-    // ── after_claim hooks ──
+    // ── Inject skill references ──
     let mut initial_body = initial_body;
+    if !claimed.headers.skills.is_empty() {
+        let mut skill_section = String::from("\n\n---\n## Available Skills\n");
+        for s in &claimed.headers.skills {
+            skill_section.push_str(&format!("- {} v{}\n", s.name, s.version));
+        }
+        skill_section.push_str("Use `use_skill(name=\"...\")` to load any of these.\n");
+        initial_body.push_str(&skill_section);
+    }
+
+    // ── after_claim hooks ──
     if let Some(ref hooks) = ctx.hooks {
         let hook_ctx = serde_json::json!({
             "job_id": job_id,
@@ -528,6 +538,7 @@ mod tests {
                 depth: 0,
                 retry_count,
                 depends_on: vec![],
+                skills: vec![],
             },
             body: "test body".to_string(),
         }

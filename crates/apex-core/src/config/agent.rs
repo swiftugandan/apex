@@ -1,3 +1,4 @@
+use crate::domain::SkillManifest;
 use serde::{Deserialize, Serialize};
 
 /// The full agent configuration file (agent.toml).
@@ -106,6 +107,10 @@ pub struct RoleProfile {
     /// Whether this role can spawn further sub-agents via delegate.
     #[serde(default = "default_true")]
     pub can_delegate: bool,
+
+    /// Skill manifests attached to this role (lazy-loaded on demand).
+    #[serde(default)]
+    pub skills: Vec<SkillManifest>,
 }
 
 /// Controls how a sub-agent's long-term memory relates to the parent's.
@@ -269,6 +274,7 @@ fn default_roles() -> Vec<RoleProfile> {
             max_concurrent: 1,
             memory: MemoryMode::Shared,
             can_delegate: false,
+            skills: vec![],
         },
         RoleProfile {
             name: "reviewer".into(),
@@ -284,6 +290,7 @@ fn default_roles() -> Vec<RoleProfile> {
             max_concurrent: 1,
             memory: MemoryMode::Shared,
             can_delegate: false,
+            skills: vec![],
         },
     ]
 }

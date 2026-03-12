@@ -299,6 +299,7 @@ impl SubAgentSpawner for InProcessSpawner {
                 depth: 0,
                 retry_count: 0,
                 depends_on: vec![],
+                skills: role.skills.clone(),
             },
             body,
         };

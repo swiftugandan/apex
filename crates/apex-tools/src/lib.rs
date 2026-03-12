@@ -12,6 +12,7 @@ mod hooks_tool;
 mod memory_tools;
 mod queue_tools;
 mod shell_exec;
+mod skill_tools;
 pub mod spill;
 pub mod tool_result_helpers;
 
@@ -24,3 +25,4 @@ pub use hooks::FsHookRegistry;
 pub use hooks_tool::HooksToolRegistry;
 pub use memory_tools::MemoryToolRegistry;
 pub use queue_tools::QueueToolRegistry;
+pub use skill_tools::SkillToolRegistry;

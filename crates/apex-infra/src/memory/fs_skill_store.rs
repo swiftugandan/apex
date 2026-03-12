@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use apex_core::domain::{slugify, Skill, SkillId, SkillStatus};
+use apex_core::domain::{slugify, Skill, SkillId, SkillManifest, SkillStatus};
 use apex_core::error::MemoryError;
 use apex_core::ports::SkillStore;
 
@@ -150,6 +150,34 @@ impl FsSkillStore {
 
 #[async_trait]
 impl SkillStore for FsSkillStore {
+    async fn list_manifests(&self) -> Result<Vec<SkillManifest>, MemoryError> {
+        let all = self.load_all()?;
+        Ok(all.iter().map(|s| s.to_manifest()).collect())
+    }
+
+    async fn load_skill(&self, name: &str, version: &str) -> Result<Option<Skill>, MemoryError> {
+        let all = self.load_all()?;
+        let found = all
+            .iter()
+            .find(|s| s.name == name && (version == "latest" || s.version == version));
+        Ok(found.cloned())
+    }
+
+    async fn validate_manifest(&self, manifest: &SkillManifest) -> Result<(), MemoryError> {
+        let all = self.load_all()?;
+        let found = all.iter().any(|s| {
+            s.name == manifest.name
+                && (manifest.version == "latest" || s.version == manifest.version)
+        });
+        if !found {
+            return Err(MemoryError::NotFound(format!(
+                "skill {} v{}",
+                manifest.name, manifest.version
+            )));
+        }
+        Ok(())
+    }
+
     async fn store_skill(&self, mut skill: Skill) -> Result<SkillId, MemoryError> {
         let all = self.load_all()?;
 
@@ -171,44 +199,6 @@ impl SkillStore for FsSkillStore {
 
         self.write_skill(&skill)?;
         Ok(skill.id)
-    }
-
-    async fn find_skill(&self, task_pattern: &str) -> Result<Option<Skill>, MemoryError> {
-        let all = self.load_all()?;
-        let pattern_lower = task_pattern.to_lowercase();
-
-        let mut best: Option<&Skill> = None;
-        for skill in all.iter() {
-            if skill.status == SkillStatus::Retired {
-                continue;
-            }
-            // Auto-retire check
-            let total = skill.success_count + skill.failure_count;
-            if total >= skill.min_samples && skill.fitness < self.auto_retire_below {
-                continue;
-            }
-            if !skill.task_pattern.to_lowercase().contains(&pattern_lower) {
-                continue;
-            }
-            if best.is_none() || skill.fitness > best.unwrap().fitness {
-                best = Some(skill);
-            }
-        }
-
-        Ok(best.cloned())
-    }
-
-    async fn list_skills(&self, limit: usize) -> Result<Vec<Skill>, MemoryError> {
-        let all = self.load_all()?;
-        let mut sorted: Vec<Skill> = all.as_ref().clone();
-        // Sort by fitness descending
-        sorted.sort_by(|a, b| {
-            b.fitness
-                .partial_cmp(&a.fitness)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        sorted.truncate(limit);
-        Ok(sorted)
     }
 
     async fn update_skill_fitness(&self, id: &SkillId, success: bool) -> Result<(), MemoryError> {
@@ -273,18 +263,20 @@ mod tests {
             min_samples: 3,
             last_used: String::new(),
             status: SkillStatus::Active,
+            version: "1.0.0".to_string(),
             skill_dir: None,
         }
     }
 
     #[tokio::test]
-    async fn store_and_find_skill() {
+    async fn store_and_load_skill() {
         let (_dir, store) = temp_skill_store();
         let skill = make_skill("install package");
         let id = store.store_skill(skill).await.unwrap();
         assert!(id.0.starts_with("skill-"));
 
-        let found = store.find_skill("install").await.unwrap();
+        // load_skill uses the slugified name
+        let found = store.load_skill("install-package", "latest").await.unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().task_pattern, "install package");
     }
@@ -305,13 +297,17 @@ mod tests {
         let id2 = store.store_skill(skill2).await.unwrap();
 
         assert_eq!(id1.0, id2.0);
-        let found = store.find_skill("build").await.unwrap().unwrap();
+        let found = store
+            .load_skill("build-project", "latest")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.approach, "Updated approach");
         assert_eq!(found.success_count, 2);
     }
 
     #[tokio::test]
-    async fn list_skills_sorted() {
+    async fn list_manifests_returns_all() {
         let (_dir, store) = temp_skill_store();
 
         let mut s1 = make_skill("task alpha");
@@ -324,13 +320,15 @@ mod tests {
         s2.id = SkillId("skill-b".to_string());
         store.store_skill(s2).await.unwrap();
 
-        let skills = store.list_skills(10).await.unwrap();
-        assert_eq!(skills.len(), 2);
-        assert!(skills[0].fitness >= skills[1].fitness);
+        let manifests = store.list_manifests().await.unwrap();
+        assert_eq!(manifests.len(), 2);
+        let names: Vec<&str> = manifests.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"task-alpha"));
+        assert!(names.contains(&"task-beta"));
     }
 
     #[tokio::test]
-    async fn auto_retire_filters_bad_skills() {
+    async fn auto_retire_hides_from_load() {
         let (_dir, store) = temp_skill_store();
         let skill = Skill {
             id: SkillId("s-bad".to_string()),
@@ -349,6 +347,7 @@ mod tests {
             min_samples: 3,
             last_used: String::new(),
             status: SkillStatus::Active,
+            version: "1.0.0".to_string(),
             skill_dir: None,
         };
         store.store_skill(skill).await.unwrap();
@@ -366,8 +365,12 @@ mod tests {
             .await
             .unwrap();
 
-        let found = store.find_skill("flaky").await.unwrap();
-        assert!(found.is_none(), "retired skill should be filtered out");
+        // Retired skill is still loadable but marked retired
+        let loaded = store.load_skill("flaky-task", "latest").await.unwrap();
+        assert!(
+            loaded.is_some_and(|s| s.status == SkillStatus::Retired),
+            "retired skill should still be loadable but marked retired"
+        );
     }
 
     #[tokio::test]
@@ -412,11 +415,17 @@ mod tests {
             learned_dir,
         );
 
-        let skills = store.list_skills(10).await.unwrap();
-        assert_eq!(skills.len(), 1);
+        let manifests = store.list_manifests().await.unwrap();
+        assert_eq!(manifests.len(), 1);
         // Authored skill wins (higher precedence directory)
-        assert_eq!(skills[0].description, "An authored skill");
-        assert_eq!(skills[0].fitness, 1.0); // authored skill default
+        assert_eq!(manifests[0].name, "my-skill");
+        let skill = store
+            .load_skill("my-skill", "latest")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(skill.description, "An authored skill");
+        assert_eq!(skill.fitness, 1.0); // authored skill default
     }
 
     #[tokio::test]
@@ -431,9 +440,15 @@ mod tests {
         .unwrap();
 
         let store = FsSkillStore::new(skills_dir);
-        let skills = store.list_skills(10).await.unwrap();
-        assert_eq!(skills.len(), 1);
-        let s = &skills[0];
+        let manifests = store.list_manifests().await.unwrap();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].name, "test-skill");
+
+        let s = store
+            .load_skill("test-skill", "latest")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(s.id.0, "skill-test-skill");
         assert_eq!(s.fitness, 1.0);
         assert_eq!(s.task_pattern, "A test skill");

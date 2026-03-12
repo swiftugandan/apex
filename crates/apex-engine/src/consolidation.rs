@@ -78,7 +78,8 @@ pub async fn consolidate_learnings(
     if config.extract_skills {
         let title = &scratchpad.goal;
         if !title.is_empty() {
-            match skill_store.find_skill(title).await {
+            let skill_name = slugify(title);
+            match skill_store.load_skill(&skill_name, "latest").await {
                 Ok(Some(skill)) => {
                     if let Err(e) = skill_store
                         .update_skill_fitness(&skill.id, record.outcome == AttemptOutcome::Success)
@@ -128,6 +129,7 @@ pub async fn consolidate_learnings(
                             min_samples: 3,
                             last_used: String::new(),
                             status: SkillStatus::Active,
+                            version: "1.0.0".to_string(),
                             skill_dir: None,
                         };
                         if let Err(e) = skill_store.store_skill(skill).await {
@@ -152,8 +154,8 @@ pub async fn consolidate_learnings(
             .collect::<Vec<_>>()
             .join("\n");
 
-        let pattern = format!("decompose: {}", scratchpad.goal);
-        match skill_store.find_skill(&pattern).await {
+        let decompose_name = slugify(&format!("decompose-{}", scratchpad.goal));
+        match skill_store.load_skill(&decompose_name, "latest").await {
             Ok(Some(skill)) => {
                 let success = scratchpad
                     .subtasks
@@ -181,7 +183,7 @@ pub async fn consolidate_learnings(
                     compatibility: None,
                     allowed_tools: None,
                     extra_metadata,
-                    task_pattern: pattern,
+                    task_pattern: format!("decompose: {}", scratchpad.goal),
                     approach: decomposition,
                     tools_used: vec![],
                     success_count: if record.outcome == AttemptOutcome::Success {
@@ -198,6 +200,7 @@ pub async fn consolidate_learnings(
                     min_samples: 3,
                     last_used: String::new(),
                     status: SkillStatus::Active,
+                    version: "1.0.0".to_string(),
                     skill_dir: None,
                 };
                 if let Err(e) = skill_store.store_skill(skill).await {

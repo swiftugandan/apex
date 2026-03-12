@@ -415,6 +415,7 @@ fn custom_to_headers(
         depth,
         retry_count,
         depends_on: vec![],
+        skills: vec![],
     }
 }
 
@@ -431,6 +432,7 @@ mod tests {
                 depth: 0,
                 retry_count: 0,
                 depends_on: vec![],
+                skills: vec![],
             },
             body: body.to_string(),
         }
@@ -565,6 +567,7 @@ mod tests {
             depth: 3,
             retry_count: 1,
             depends_on: vec![],
+            skills: vec![],
         };
 
         let custom = headers_to_custom(&headers);
