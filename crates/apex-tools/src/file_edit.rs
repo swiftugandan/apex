@@ -148,6 +148,48 @@ async fn execute_insert(call: &ToolCall, path: &str) -> Result<ToolResult, ToolE
     )
 }
 
+/// Post-execution input rewriter: compresses bulky `old_string`/`new_string` fields.
+pub fn rewrite_input(
+    call: &ToolCall,
+    _result: &ToolResult,
+    max_bytes: usize,
+) -> Option<serde_json::Value> {
+    if serde_json::to_string(&call.input)
+        .map(|s| s.len())
+        .unwrap_or(0)
+        <= max_bytes
+    {
+        return None;
+    }
+    // Only rewrite if at least one compressible field exists
+    let has_old = call
+        .input
+        .get("old_string")
+        .and_then(|v| v.as_str())
+        .is_some();
+    let has_new = call
+        .input
+        .get("new_string")
+        .and_then(|v| v.as_str())
+        .is_some();
+    if !has_old && !has_new {
+        return None;
+    }
+    let mut rw = call.input.clone();
+    let path = call
+        .input
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    if let Some(old) = call.input.get("old_string").and_then(|v| v.as_str()) {
+        rw["old_string"] = json!(format!("[matched {} chars in {path}]", old.len()));
+    }
+    if let Some(new) = call.input.get("new_string").and_then(|v| v.as_str()) {
+        rw["new_string"] = json!(format!("[replaced with {} lines]", new.lines().count()));
+    }
+    Some(rw)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,5 +492,44 @@ mod tests {
         assert!(err.contains("exceeds file length"));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn dummy_result() -> ToolResult {
+        ToolResult {
+            tool_use_id: "test-id".into(),
+            name: "file_edit".into(),
+            output: json!({"path": "/tmp/f.txt", "command": "str_replace", "replacements": 1}),
+            is_error: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rewrite_input_returns_none_when_small() {
+        let call = make_call(json!({
+            "path": "/tmp/f.txt",
+            "old_string": "x",
+            "new_string": "y"
+        }));
+        assert!(rewrite_input(&call, &dummy_result(), 10_000).is_none());
+    }
+
+    #[test]
+    fn rewrite_input_compresses_large_strings() {
+        let big_old = "a".repeat(5000);
+        let big_new = "line\n".repeat(200);
+        let call = make_call(json!({
+            "path": "/tmp/f.txt",
+            "old_string": big_old,
+            "new_string": big_new
+        }));
+        let rw = rewrite_input(&call, &dummy_result(), 100).unwrap();
+        let old = rw["old_string"].as_str().unwrap();
+        let new = rw["new_string"].as_str().unwrap();
+        assert!(old.contains("5000 chars"));
+        assert!(old.contains("/tmp/f.txt"));
+        assert!(new.contains("200 lines"));
+        // path preserved
+        assert_eq!(rw["path"], "/tmp/f.txt");
     }
 }

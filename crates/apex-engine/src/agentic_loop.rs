@@ -1,4 +1,5 @@
 use futures::future::join_all;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -53,6 +54,10 @@ pub struct LoopConfig<'a> {
     pub max_turns: usize,
     /// Optional lifecycle hook registry.
     pub hooks: Option<&'a dyn HookRegistry>,
+    /// Maximum tool input size in bytes before rewriting in history.
+    pub max_tool_input_bytes: usize,
+    /// Scratch directory for spilling original tool inputs.
+    pub scratch_dir: Option<PathBuf>,
 }
 
 /// Automatically compact conversation history when estimated prompt tokens
@@ -340,6 +345,42 @@ pub async fn run_agentic_loop(
                 duration_ms,
             });
 
+            // Post-execution: rewrite bulky tool inputs in history (Principle 5)
+            if !result.is_error {
+                if let Some(mut rewritten) =
+                    config
+                        .tools
+                        .rewrite_input(call, &result, config.max_tool_input_bytes)
+                {
+                    // Principle 6: spill original input to scratch for debuggability
+                    if let Some(scratch) = &config.scratch_dir {
+                        let spill_path = scratch.join(format!("tool-input-{}.json", call.id));
+                        let _ = std::fs::create_dir_all(scratch);
+                        let _ = std::fs::write(
+                            &spill_path,
+                            serde_json::to_string_pretty(&call.input).unwrap_or_default(),
+                        );
+                        rewritten["_spilled"] =
+                            serde_json::json!(spill_path.to_string_lossy().into_owned());
+                    }
+                    // Mutate the ToolUse block in the stored assistant message
+                    if let Some(last_assistant) = messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| m.role == MessageRole::Assistant)
+                    {
+                        for block in &mut last_assistant.content {
+                            if let ContentBlock::ToolUse { id, input, .. } = block {
+                                if *id == call.id {
+                                    *input = rewritten;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let raw_content =
                 serde_json::to_string(&result.output).unwrap_or_else(|_| "{}".to_string());
 
@@ -454,6 +495,8 @@ mod tests {
             compaction_max_summary_tokens: 1024,
             max_turns: 32,
             hooks: None,
+            max_tool_input_bytes: 40_000,
+            scratch_dir: None,
         };
 
         let messages = vec![ChatMessage::user_text("Hi")];
@@ -490,6 +533,8 @@ mod tests {
             compaction_max_summary_tokens: 1024,
             max_turns: 32,
             hooks: None,
+            max_tool_input_bytes: 40_000,
+            scratch_dir: None,
         };
 
         let messages = vec![ChatMessage::user_text("Do something")];
@@ -528,6 +573,8 @@ mod tests {
             compaction_max_summary_tokens: 1024,
             max_turns: 32,
             hooks: None,
+            max_tool_input_bytes: 40_000,
+            scratch_dir: None,
         };
 
         let messages = vec![ChatMessage::user_text("Hi")];
@@ -565,6 +612,8 @@ mod tests {
             compaction_max_summary_tokens: 1024,
             max_turns: 32,
             hooks: None,
+            max_tool_input_bytes: 40_000,
+            scratch_dir: None,
         };
 
         let messages = vec![ChatMessage::user_text("Do something")];
@@ -600,6 +649,8 @@ mod tests {
             compaction_max_summary_tokens: 1024,
             max_turns: 32,
             hooks: None,
+            max_tool_input_bytes: 40_000,
+            scratch_dir: None,
         };
 
         let messages = vec![ChatMessage::user_text("Hi")];
@@ -630,6 +681,8 @@ mod tests {
             compaction_max_summary_tokens: 1024,
             max_turns: 32,
             hooks: None,
+            max_tool_input_bytes: 40_000,
+            scratch_dir: None,
         };
 
         let messages = vec![ChatMessage::user_text("Hi")];
@@ -666,6 +719,8 @@ mod tests {
             compaction_max_summary_tokens: 1024,
             max_turns,
             hooks: None,
+            max_tool_input_bytes: 40_000,
+            scratch_dir: None,
         };
 
         let messages = vec![ChatMessage::user_text("Do something")];
@@ -849,6 +904,8 @@ mod tests {
             compaction_max_summary_tokens: 1024,
             max_turns: 32,
             hooks: None,
+            max_tool_input_bytes: 40_000,
+            scratch_dir: None,
         };
 
         let messages = vec![ChatMessage::user_text("Get data")];

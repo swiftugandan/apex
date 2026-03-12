@@ -7,6 +7,7 @@ use crate::domain::{
     Skill, SkillId, ToolCall, ToolCompletionResponse, ToolDef, ToolResult, ToolSchema,
 };
 use crate::error::{LlmError, MemoryError, QueueError, ToolError};
+use serde_json::Value;
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -32,6 +33,19 @@ pub trait ToolRegistry: Send + Sync {
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError>;
+
+    /// Post-execution input rewriter. Returns `Some(rewritten)` if the tool
+    /// input should be compressed in conversation history, `None` to keep as-is.
+    /// Only called after successful execution; the original input is spilled
+    /// to scratch before rewriting.
+    fn rewrite_input(
+        &self,
+        _call: &ToolCall,
+        _result: &ToolResult,
+        _max_bytes: usize,
+    ) -> Option<Value> {
+        None
+    }
 }
 
 #[async_trait]

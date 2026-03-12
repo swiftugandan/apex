@@ -120,6 +120,10 @@ pub struct ContextBudgetSection {
     /// Maximum tokens for tool results before spilling.
     #[serde(default = "default_max_tool_result_tokens")]
     pub max_tool_result_tokens: usize,
+
+    /// Maximum tokens for tool inputs before rewriting in history.
+    #[serde(default = "default_max_tool_input_tokens")]
+    pub max_tool_input_tokens: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -193,6 +197,9 @@ fn default_max_body_tokens() -> usize {
     50_000
 }
 fn default_max_tool_result_tokens() -> usize {
+    10_000
+}
+fn default_max_tool_input_tokens() -> usize {
     10_000
 }
 fn default_true() -> bool {
@@ -284,6 +291,7 @@ impl Default for ContextBudgetSection {
         Self {
             max_body_tokens: default_max_body_tokens(),
             max_tool_result_tokens: default_max_tool_result_tokens(),
+            max_tool_input_tokens: default_max_tool_input_tokens(),
         }
     }
 }

@@ -15,6 +15,7 @@ use apex_core::ports::{
     HookRegistry, LlmProvider, MemoryStore, Queue, SkillStore, SubAgentResult, SubAgentSpawner,
     ToolRegistry, WorkingMemory,
 };
+use serde_json::Value;
 
 use apex_engine::{
     worker_loop, ClaimContext, ClaimToolFactory, ProjectPaths, WorkerContext, WorkerLimits,
@@ -76,6 +77,19 @@ impl ToolRegistry for FilteredToolRegistryBox {
         }
         self.inner.execute(call).await
     }
+
+    fn rewrite_input(
+        &self,
+        call: &ToolCall,
+        result: &ToolResult,
+        max_bytes: usize,
+    ) -> Option<Value> {
+        if self.allowed.contains(&call.name) {
+            self.inner.rewrite_input(call, result, max_bytes)
+        } else {
+            None
+        }
+    }
 }
 
 // ── FilteredClaimToolFactory ────────────────────────────────────────
@@ -107,6 +121,7 @@ pub struct SpawnerConfig {
     pub invariants: Arc<Invariants>,
     pub roles: Arc<[RoleProfile]>,
     pub max_tool_result_bytes: usize,
+    pub max_tool_input_bytes: usize,
     pub max_output_tokens: u32,
     pub remaining_delegate_depth: u32,
     pub max_turns: usize,
@@ -209,6 +224,7 @@ impl SubAgentSpawner for InProcessSpawner {
                 invariants: Arc::clone(&self.config.invariants),
                 roles: Arc::clone(&self.config.roles),
                 max_tool_result_bytes: self.config.max_tool_result_bytes,
+                max_tool_input_bytes: self.config.max_tool_input_bytes,
                 max_output_tokens: self.config.max_output_tokens,
                 remaining_delegate_depth: sub_depth,
                 max_turns: self.config.max_turns,
@@ -303,11 +319,13 @@ impl SubAgentSpawner for InProcessSpawner {
                 max_output_tokens: self.config.max_output_tokens,
                 max_turns: self.config.max_turns,
                 max_empty_cycles: self.config.max_empty_cycles,
+                max_tool_input_bytes: self.config.max_tool_input_bytes,
             },
             estimator: Arc::clone(&self.estimator),
             compaction: self.config.compaction.clone(),
             consolidation: self.config.consolidation.clone(),
             hooks: sub_hooks,
+            scratch_dir: Some(self.project_paths.scratch_dir.clone()),
         };
 
         let num_workers = role.max_concurrent.max(1);

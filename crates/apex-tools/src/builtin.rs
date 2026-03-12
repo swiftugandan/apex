@@ -4,6 +4,7 @@ use apex_core::domain::{ToolCall, ToolDef, ToolResult};
 use apex_core::error::ToolError;
 use apex_core::ports::ToolRegistry;
 use async_trait::async_trait;
+use serde_json::Value;
 
 use crate::file_edit;
 use crate::file_read;
@@ -53,6 +54,20 @@ impl ToolRegistry for BuiltinToolRegistry {
             "glob" => glob_tool::execute(call).await,
             "grep" => grep_tool::execute(call).await,
             _ => Err(ToolError::UnknownTool(call.name.clone())),
+        }
+    }
+
+    fn rewrite_input(
+        &self,
+        call: &ToolCall,
+        result: &ToolResult,
+        max_bytes: usize,
+    ) -> Option<Value> {
+        match call.name.as_str() {
+            "file_write" => file_write::rewrite_input(call, result, max_bytes),
+            "file_edit" => file_edit::rewrite_input(call, result, max_bytes),
+            "shell_exec" => shell_exec::rewrite_input(call, result, max_bytes),
+            _ => None,
         }
     }
 }

@@ -75,6 +75,31 @@ pub async fn execute(call: &ToolCall) -> Result<ToolResult, ToolError> {
     }
 }
 
+/// Post-execution input rewriter: compresses bulky `content` field.
+pub fn rewrite_input(
+    call: &ToolCall,
+    _result: &ToolResult,
+    max_bytes: usize,
+) -> Option<serde_json::Value> {
+    if serde_json::to_string(&call.input)
+        .map(|s| s.len())
+        .unwrap_or(0)
+        <= max_bytes
+    {
+        return None;
+    }
+    let content = call.input.get("content").and_then(|v| v.as_str())?;
+    let mut rw = call.input.clone();
+    let lines = content.lines().count();
+    let path = call
+        .input
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    rw["content"] = json!(format!("[wrote {lines} lines to {path}]"));
+    Some(rw)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +190,40 @@ mod tests {
         let call = make_call(json!({"path": "/tmp/whatever.txt"}));
         let err = execute(&call).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    fn dummy_result() -> ToolResult {
+        ToolResult {
+            tool_use_id: "test-id".into(),
+            name: "file_write".into(),
+            output: json!({"path": "/tmp/f.txt", "bytes_written": 100}),
+            is_error: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rewrite_input_returns_none_when_small() {
+        let call = make_call(json!({
+            "path": "/tmp/f.txt",
+            "content": "short"
+        }));
+        assert!(rewrite_input(&call, &dummy_result(), 10_000).is_none());
+    }
+
+    #[test]
+    fn rewrite_input_compresses_large_content() {
+        let big = "line\n".repeat(5000);
+        let call = make_call(json!({
+            "path": "/tmp/f.txt",
+            "content": big
+        }));
+        let rw = rewrite_input(&call, &dummy_result(), 100).unwrap();
+        let content = rw["content"].as_str().unwrap();
+        assert!(content.starts_with("[wrote "));
+        assert!(content.contains("5000 lines"));
+        assert!(content.contains("/tmp/f.txt"));
+        // path preserved
+        assert_eq!(rw["path"], "/tmp/f.txt");
     }
 }

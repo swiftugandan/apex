@@ -211,6 +211,31 @@ pub async fn execute(call: &ToolCall, spill: &SpillManager) -> Result<ToolResult
     }
 }
 
+/// Post-execution input rewriter: compresses bulky `command` field.
+pub fn rewrite_input(
+    call: &ToolCall,
+    result: &ToolResult,
+    max_bytes: usize,
+) -> Option<serde_json::Value> {
+    if serde_json::to_string(&call.input)
+        .map(|s| s.len())
+        .unwrap_or(0)
+        <= max_bytes
+    {
+        return None;
+    }
+    let cmd = call.input.get("command").and_then(|v| v.as_str())?;
+    let mut rw = call.input.clone();
+    let lines = cmd.lines().count();
+    let exit = result
+        .output
+        .get("exit_code")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    rw["command"] = json!(format!("[executed {lines}-line script, exit {exit}]"));
+    Some(rw)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +382,37 @@ mod tests {
         let result = execute(&call, &spill).await.unwrap();
         assert!(result.is_error);
         assert_eq!(result.output["timed_out"], true);
+    }
+
+    #[test]
+    fn rewrite_input_returns_none_when_small() {
+        use apex_core::domain::ToolResult;
+        let call = make_call(json!({"command": "echo hi"}));
+        let result = ToolResult {
+            tool_use_id: "test-id".into(),
+            name: "shell_exec".into(),
+            output: json!({"exit_code": 0, "stdout": "hi\n"}),
+            is_error: false,
+            ..Default::default()
+        };
+        assert!(rewrite_input(&call, &result, 10_000).is_none());
+    }
+
+    #[test]
+    fn rewrite_input_compresses_large_command() {
+        use apex_core::domain::ToolResult;
+        let big_cmd = "echo line\n".repeat(500);
+        let call = make_call(json!({"command": big_cmd}));
+        let result = ToolResult {
+            tool_use_id: "test-id".into(),
+            name: "shell_exec".into(),
+            output: json!({"exit_code": 42, "stdout": ""}),
+            is_error: false,
+            ..Default::default()
+        };
+        let rw = rewrite_input(&call, &result, 100).unwrap();
+        let cmd = rw["command"].as_str().unwrap();
+        assert!(cmd.contains("500-line script"));
+        assert!(cmd.contains("exit 42"));
     }
 }

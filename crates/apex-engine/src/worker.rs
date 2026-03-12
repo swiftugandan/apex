@@ -27,6 +27,7 @@ pub struct WorkerLimits {
     pub max_output_tokens: u32,
     pub max_turns: usize,
     pub max_empty_cycles: u32,
+    pub max_tool_input_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -43,6 +44,8 @@ pub struct WorkerContext {
     pub compaction: CompactionSection,
     pub consolidation: ConsolidationSection,
     pub hooks: Option<Arc<dyn HookRegistry>>,
+    /// Scratch directory for spilling original tool inputs before rewriting.
+    pub scratch_dir: Option<std::path::PathBuf>,
 }
 
 // ── Worker loop ─────────────────────────────────────────────────────
@@ -248,6 +251,8 @@ async fn execute_claim(
         compaction_max_summary_tokens: ctx.compaction.max_summary_tokens,
         max_turns: ctx.limits.max_turns,
         hooks: ctx.hooks.as_deref(),
+        max_tool_input_bytes: ctx.limits.max_tool_input_bytes,
+        scratch_dir: ctx.scratch_dir.clone(),
     };
     let (turns, loop_outcome, _messages) = run_agentic_loop(messages, &loop_config).await;
 
@@ -631,6 +636,7 @@ mod tests {
                 max_output_tokens: 4096,
                 max_turns: 32,
                 max_empty_cycles: 300,
+                max_tool_input_bytes: 40_000,
             },
             estimator: Arc::new(Mutex::new(TokenEstimator::default())),
             compaction: CompactionSection {
@@ -639,6 +645,7 @@ mod tests {
             },
             consolidation: ConsolidationSection::default(),
             hooks: None,
+            scratch_dir: None,
         };
 
         let result = worker_loop(ctx, 0).await;

@@ -7,6 +7,7 @@ use apex_core::context::TokenEstimator;
 use apex_core::domain::{ToolCall, ToolDef, ToolResult};
 use apex_core::error::ToolError;
 use apex_core::ports::ToolRegistry;
+use serde_json::Value;
 
 use apex_engine::util::composer_from_estimator;
 use apex_engine::{ClaimContext, ClaimToolFactory, CompositeToolRegistry};
@@ -28,6 +29,15 @@ impl ToolRegistry for SharedToolRegistry {
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
         self.0.execute(call).await
+    }
+
+    fn rewrite_input(
+        &self,
+        call: &ToolCall,
+        result: &ToolResult,
+        max_bytes: usize,
+    ) -> Option<Value> {
+        self.0.rewrite_input(call, result, max_bytes)
     }
 }
 

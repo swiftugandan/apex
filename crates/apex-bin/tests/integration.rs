@@ -264,6 +264,7 @@ async fn single_task_roundtrip() {
             max_output_tokens: 4096,
             max_turns: 32,
             max_empty_cycles: 300,
+            max_tool_input_bytes: 40_000,
         },
         estimator,
         compaction: CompactionSection {
@@ -272,6 +273,7 @@ async fn single_task_roundtrip() {
         },
         consolidation: ConsolidationSection::default(),
         hooks: None,
+        scratch_dir: None,
     };
 
     // Run the worker loop — it should process the one message and exit

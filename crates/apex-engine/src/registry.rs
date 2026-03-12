@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use apex_core::domain::{ToolCall, ToolDef, ToolResult};
 use apex_core::error::ToolError;
 use apex_core::ports::ToolRegistry;
+use serde_json::Value;
 
 // ── CompositeToolRegistry ──────────────────────────────────────────
 
@@ -47,6 +48,17 @@ impl ToolRegistry for CompositeToolRegistry {
             Err(ToolError::UnknownTool(call.name.clone()))
         }
     }
+
+    fn rewrite_input(
+        &self,
+        call: &ToolCall,
+        result: &ToolResult,
+        max_bytes: usize,
+    ) -> Option<Value> {
+        self.by_name
+            .get(&call.name)
+            .and_then(|&idx| self.registries[idx].rewrite_input(call, result, max_bytes))
+    }
 }
 
 /// Owned filtered view of a ToolRegistry — filters by allowed tool names.
@@ -76,5 +88,18 @@ impl ToolRegistry for OwnedFilteredToolRegistry {
             return Err(ToolError::UnknownTool(call.name.clone()));
         }
         self.inner.execute(call).await
+    }
+
+    fn rewrite_input(
+        &self,
+        call: &ToolCall,
+        result: &ToolResult,
+        max_bytes: usize,
+    ) -> Option<Value> {
+        if self.allowed.contains(&call.name) {
+            self.inner.rewrite_input(call, result, max_bytes)
+        } else {
+            None
+        }
     }
 }
