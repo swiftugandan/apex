@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 use apex_core::config::CompactionSection;
 use apex_core::context::TokenEstimator;
 use apex_core::domain::{
-    ChatMessage, CompletionRequest, ContentBlock, HookEvent, HookOutcome, LogEntry, MessageRole,
-    ToolCallRecord, TurnRecord,
+    CacheHint, ChatMessage, CompletionRequest, ContentBlock, HookEvent, HookOutcome, LogEntry,
+    MessageRole, SystemBlock, ToolCallRecord, TurnRecord,
 };
 use apex_core::ports::{HookRegistry, LlmProvider, ToolRegistry, WorkingMemory};
 
@@ -66,6 +66,8 @@ pub struct LoopConfig<'a> {
     pub max_tool_calls_per_turn: usize,
     /// Maximum total tool calls across all turns.
     pub max_total_tool_calls: usize,
+    /// Enable prompt caching hints for static system prompt and tool blocks.
+    pub prompt_caching: bool,
 }
 
 /// Serialize `messages` as pretty-printed JSON directly to a file under `dir`,
@@ -186,7 +188,15 @@ pub async fn run_agentic_loop(
     let mut total_tool_calls: usize = 0;
     let deadline = config.timeout.map(|d| Instant::now() + d);
     let schemas = config.tools.schemas();
-    let system_prompt = config.persona.to_string();
+    let cache_hint = if config.prompt_caching {
+        CacheHint::Static
+    } else {
+        CacheHint::Dynamic
+    };
+    let system_blocks = vec![SystemBlock {
+        text: config.persona.to_string(),
+        cache_hint,
+    }];
 
     for turn_num in 0..config.max_turns {
         // Check cancellation and timeout before each turn
@@ -229,10 +239,11 @@ pub async fn run_agentic_loop(
         maybe_compact(&mut messages, config).await;
 
         let req = CompletionRequest {
-            system_prompt: &system_prompt,
+            system_blocks: &system_blocks,
             messages: &messages,
             max_tokens: config.max_output_tokens,
             temperature: Some(0.2),
+            cache_tools: config.prompt_caching,
         };
 
         let resp = match config.llm.complete_with_tools(req, &schemas).await {
@@ -244,16 +255,32 @@ pub async fn run_agentic_loop(
         };
 
         {
-            let msg = format!(
-                "  turn {}: {} tool call(s), {} input / {} output tokens",
-                turn_num + 1,
-                resp.tool_calls.len(),
-                resp.usage.input_tokens,
-                resp.usage.output_tokens,
-            );
+            let has_cache = resp.usage.cache_creation_input_tokens > 0
+                || resp.usage.cache_read_input_tokens > 0;
+            let msg = if has_cache {
+                format!(
+                    "  turn {}: {} tool call(s), {} input / {} output tokens (cache: {} created, {} read)",
+                    turn_num + 1,
+                    resp.tool_calls.len(),
+                    resp.usage.input_tokens,
+                    resp.usage.output_tokens,
+                    resp.usage.cache_creation_input_tokens,
+                    resp.usage.cache_read_input_tokens,
+                )
+            } else {
+                format!(
+                    "  turn {}: {} tool call(s), {} input / {} output tokens",
+                    turn_num + 1,
+                    resp.tool_calls.len(),
+                    resp.usage.input_tokens,
+                    resp.usage.output_tokens,
+                )
+            };
             let tool_count = resp.tool_calls.len();
             let input_toks = resp.usage.input_tokens;
             let output_toks = resp.usage.output_tokens;
+            let cache_create = resp.usage.cache_creation_input_tokens;
+            let cache_read = resp.usage.cache_read_input_tokens;
             dispatch_log(
                 config.hooks,
                 || {
@@ -264,6 +291,8 @@ pub async fn run_agentic_loop(
                         "tool_calls": tool_count,
                         "input_tokens": input_toks,
                         "output_tokens": output_toks,
+                        "cache_creation_input_tokens": cache_create,
+                        "cache_read_input_tokens": cache_read,
                     })
                 },
                 &msg,
@@ -585,6 +614,7 @@ mod tests {
             compaction: test_compaction(),
             max_tool_calls_per_turn: 64,
             max_total_tool_calls: 512,
+            prompt_caching: false,
         }
     }
 
@@ -779,6 +809,7 @@ mod tests {
             usage: apex_core::domain::TokenUsage {
                 input_tokens: 100,
                 output_tokens: 30,
+                ..Default::default()
             },
             stop_reason: apex_core::domain::StopReason::EndTurn,
         });
@@ -848,6 +879,7 @@ mod tests {
             usage: apex_core::domain::TokenUsage {
                 input_tokens: 80,
                 output_tokens: 20,
+                ..Default::default()
             },
             stop_reason: apex_core::domain::StopReason::EndTurn,
         });
@@ -964,6 +996,7 @@ mod tests {
             usage: apex_core::domain::TokenUsage {
                 input_tokens: 100,
                 output_tokens: 30,
+                ..Default::default()
             },
             stop_reason: apex_core::domain::StopReason::EndTurn,
         });

@@ -42,6 +42,7 @@ impl IntegrationLlm {
                     usage: TokenUsage {
                         input_tokens: 100,
                         output_tokens: 50,
+                        ..Default::default()
                     },
                     stop_reason: StopReason::EndTurn,
                 })]
@@ -271,6 +272,7 @@ async fn single_task_roundtrip() {
             max_tool_input_bytes: 40_000,
             max_tool_calls_per_turn: 64,
             max_total_tool_calls: 512,
+            prompt_caching: true,
         },
         estimator,
         compaction: CompactionSection {

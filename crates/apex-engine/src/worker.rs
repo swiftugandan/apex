@@ -30,6 +30,7 @@ pub struct WorkerLimits {
     pub max_tool_input_bytes: usize,
     pub max_tool_calls_per_turn: usize,
     pub max_total_tool_calls: usize,
+    pub prompt_caching: bool,
 }
 
 #[derive(Clone)]
@@ -266,6 +267,7 @@ async fn execute_claim(
         scratch_dir: ctx.scratch_dir.clone(),
         max_tool_calls_per_turn: ctx.limits.max_tool_calls_per_turn,
         max_total_tool_calls: ctx.limits.max_total_tool_calls,
+        prompt_caching: ctx.limits.prompt_caching,
     };
     let (turns, loop_outcome, _messages) = run_agentic_loop(messages, &loop_config).await;
 
@@ -654,6 +656,7 @@ mod tests {
                 max_tool_input_bytes: 40_000,
                 max_tool_calls_per_turn: 64,
                 max_total_tool_calls: 512,
+                prompt_caching: true,
             },
             estimator: Arc::new(Mutex::new(TokenEstimator::default())),
             compaction: CompactionSection {

@@ -75,6 +75,7 @@ impl MockLlmProvider {
             usage: TokenUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                ..Default::default()
             },
             stop_reason: StopReason::EndTurn,
         })])
@@ -111,6 +112,7 @@ impl MockLlmProvider {
                 usage: TokenUsage {
                     input_tokens: 100,
                     output_tokens: 50,
+                    ..Default::default()
                 },
                 stop_reason: StopReason::ToolUse,
             }),
@@ -123,6 +125,7 @@ impl MockLlmProvider {
                 usage: TokenUsage {
                     input_tokens: 150,
                     output_tokens: 30,
+                    ..Default::default()
                 },
                 stop_reason: StopReason::EndTurn,
             }),
@@ -155,6 +158,7 @@ impl MockLlmProvider {
                     usage: TokenUsage {
                         input_tokens: 100,
                         output_tokens: 50,
+                        ..Default::default()
                     },
                     stop_reason: StopReason::ToolUse,
                 })

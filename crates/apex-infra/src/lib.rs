@@ -3,6 +3,7 @@ pub mod memory;
 pub mod queue;
 
 pub use llm::anthropic::AnthropicProvider;
+pub use llm::openai::OpenAiProvider;
 pub use memory::fs_skill_store::FsSkillStore;
 pub use memory::sqlite_store::SqliteMemoryStore;
 pub use memory::store::FsScratchpadStore;

@@ -13,7 +13,8 @@ use apex_core::ports::HookRegistry;
 use apex_core::ports::{MemoryStore, Queue, SkillStore, WorkingMemory};
 use apex_engine::{worker_loop, ClaimToolFactory, ProjectPaths, WorkerContext, WorkerLimits};
 use apex_infra::{
-    AnthropicProvider, FsScratchpadStore, FsSkillStore, RfbmqAdapter, SqliteMemoryStore,
+    AnthropicProvider, FsScratchpadStore, FsSkillStore, OpenAiProvider, RfbmqAdapter,
+    SqliteMemoryStore,
 };
 use apex_tools::spill::SpillManager;
 use apex_tools::FsHookRegistry;
@@ -342,10 +343,22 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
     let remaining_delegate_depth = invariants.limits.max_sub_agent_depth;
     let roles: Arc<[apex_core::config::RoleProfile]> = agent_config.roles.clone().into();
 
-    let llm: Arc<dyn apex_core::ports::LlmProvider> = Arc::new(
-        AnthropicProvider::from_env_with_model(&agent_config.agent.model)
-            .context("failed to create LLM provider")?,
-    );
+    let provider_name =
+        std::env::var("APEX_PROVIDER").unwrap_or_else(|_| agent_config.agent.provider.clone());
+
+    let llm: Arc<dyn apex_core::ports::LlmProvider> = match provider_name.as_str() {
+        "openai" | "openrouter" => Arc::new(
+            OpenAiProvider::from_env_with_config(
+                &agent_config.agent.model,
+                agent_config.agent.base_url.as_deref(),
+            )
+            .context("failed to create OpenAI provider")?,
+        ),
+        _ => Arc::new(
+            AnthropicProvider::from_env_with_model(&agent_config.agent.model)
+                .context("failed to create Anthropic provider")?,
+        ),
+    };
 
     let memory: Arc<dyn WorkingMemory> =
         Arc::new(FsScratchpadStore::new(paths.working_memory.clone()));
@@ -393,6 +406,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
             consolidation: agent_config.consolidation.clone(),
             max_tool_calls_per_turn: agent_config.agent.max_tool_calls_per_turn,
             max_total_tool_calls: agent_config.agent.max_total_tool_calls,
+            prompt_caching: agent_config.agent.prompt_caching,
         },
         runtime: sub_runtime,
         hooks: Some(Arc::clone(&hooks)),
@@ -434,6 +448,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
             max_tool_input_bytes,
             max_tool_calls_per_turn: agent_config.agent.max_tool_calls_per_turn,
             max_total_tool_calls: agent_config.agent.max_total_tool_calls,
+            prompt_caching: agent_config.agent.prompt_caching,
         },
         estimator,
         compaction: agent_config.compaction.clone(),

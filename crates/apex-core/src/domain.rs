@@ -49,6 +49,27 @@ pub struct ToolResult {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
+}
+
+/// Hint for providers about block cacheability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheHint {
+    /// Block is stable across turns — providers may cache it.
+    Static,
+    /// Block changes between requests — should not be cached.
+    Dynamic,
+}
+
+/// A block of the system prompt, with a cache hint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemBlock {
+    pub text: String,
+    pub cache_hint: CacheHint,
 }
 
 /// Content type for token estimation calibration.
@@ -99,10 +120,12 @@ pub enum SpillStrategy {
 /// Request to the LLM. Borrows system prompt and messages to avoid O(n²) cloning per turn.
 #[derive(Debug)]
 pub struct CompletionRequest<'a> {
-    pub system_prompt: &'a str,
+    pub system_blocks: &'a [SystemBlock],
     pub messages: &'a [ChatMessage],
     pub max_tokens: u32,
     pub temperature: Option<f32>,
+    /// Hint to providers: tool schemas are stable and may be cached.
+    pub cache_tools: bool,
 }
 
 /// Response from the LLM (no tools).
@@ -1491,6 +1514,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 20,
+                ..Default::default()
             },
             stop_reason: StopReason::ToolUse,
         };

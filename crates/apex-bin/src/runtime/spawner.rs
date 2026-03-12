@@ -130,6 +130,7 @@ pub struct SpawnerConfig {
     pub consolidation: ConsolidationSection,
     pub max_tool_calls_per_turn: usize,
     pub max_total_tool_calls: usize,
+    pub prompt_caching: bool,
 }
 
 // ── InProcessSpawner ────────────────────────────────────────────────
@@ -235,6 +236,7 @@ impl SubAgentSpawner for InProcessSpawner {
                 consolidation: self.config.consolidation.clone(),
                 max_tool_calls_per_turn: self.config.max_tool_calls_per_turn,
                 max_total_tool_calls: self.config.max_total_tool_calls,
+                prompt_caching: self.config.prompt_caching,
             },
             runtime: Arc::clone(&self.runtime),
             hooks: sub_hooks.clone(),
@@ -327,6 +329,7 @@ impl SubAgentSpawner for InProcessSpawner {
                 max_tool_input_bytes: self.config.max_tool_input_bytes,
                 max_tool_calls_per_turn: self.config.max_tool_calls_per_turn,
                 max_total_tool_calls: self.config.max_total_tool_calls,
+                prompt_caching: self.config.prompt_caching,
             },
             estimator: Arc::clone(&self.estimator),
             compaction: self.config.compaction.clone(),

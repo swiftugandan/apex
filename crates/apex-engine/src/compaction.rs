@@ -1,4 +1,6 @@
-use apex_core::domain::{ChatMessage, CompletionRequest, ContentBlock, MessageRole};
+use apex_core::domain::{
+    CacheHint, ChatMessage, CompletionRequest, ContentBlock, MessageRole, SystemBlock,
+};
 use apex_core::ports::LlmProvider;
 use apex_core::truncate_str;
 
@@ -79,11 +81,16 @@ pub(crate) async fn compact_messages(
     );
 
     let summary_messages = vec![ChatMessage::user_text(&prompt)];
+    let system_blocks = [SystemBlock {
+        text: SUMMARIZATION_SYSTEM_PROMPT.to_string(),
+        cache_hint: CacheHint::Dynamic,
+    }];
     let req = CompletionRequest {
-        system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
+        system_blocks: &system_blocks,
         messages: &summary_messages,
         max_tokens: max_summary_tokens,
         temperature: Some(0.0),
+        cache_tools: false,
     };
 
     let summary_text = match llm.complete(req).await {
@@ -176,6 +183,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 100,
                         output_tokens: 50,
+                        ..Default::default()
                     },
                     stop_reason: StopReason::EndTurn,
                 }),

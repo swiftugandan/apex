@@ -25,9 +25,17 @@ pub struct AgentConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentSection {
+    /// LLM provider name ("anthropic", "openai", "openrouter").
+    #[serde(default = "default_provider")]
+    pub provider: String,
+
     /// LLM model identifier.
     #[serde(default = "default_model")]
     pub model: String,
+
+    /// Custom base URL for the LLM API (e.g. OpenRouter endpoint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 
     /// Maximum concurrent workers.
     #[serde(default = "default_max_concurrent")]
@@ -64,6 +72,10 @@ pub struct AgentSection {
     /// Maximum total tool calls across all turns in a single agentic loop.
     #[serde(default = "default_max_total_tool_calls")]
     pub max_total_tool_calls: usize,
+
+    /// Enable prompt caching hints for static system prompt and tool blocks.
+    #[serde(default = "default_true")]
+    pub prompt_caching: bool,
 
     /// Enabled tool names (empty = all available).
     #[serde(default)]
@@ -186,6 +198,9 @@ pub struct CompactionSection {
 
 // ── Defaults ─────────────────────────────────────────────────────
 
+fn default_provider() -> String {
+    "anthropic".to_string()
+}
 fn default_model() -> String {
     "claude-sonnet-4-20250514".to_string()
 }
@@ -298,7 +313,9 @@ fn default_roles() -> Vec<RoleProfile> {
 impl Default for AgentSection {
     fn default() -> Self {
         Self {
+            provider: default_provider(),
             model: default_model(),
+            base_url: None,
             max_concurrent: default_max_concurrent(),
             max_depth: default_max_depth(),
             max_retries: default_max_retries(),
@@ -308,6 +325,7 @@ impl Default for AgentSection {
             scratchpad_retention_days: default_scratchpad_retention_days(),
             max_tool_calls_per_turn: default_max_tool_calls_per_turn(),
             max_total_tool_calls: default_max_total_tool_calls(),
+            prompt_caching: true,
             tools: vec![],
         }
     }

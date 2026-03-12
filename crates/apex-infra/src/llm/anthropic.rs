@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use apex_core::domain::{
-    ChatMessage, CompletionRequest, CompletionResponse, ContentBlock, MessageRole, StopReason,
-    TokenUsage, ToolCall, ToolCompletionResponse, ToolSchema,
+    CacheHint, ChatMessage, CompletionRequest, CompletionResponse, ContentBlock, MessageRole,
+    StopReason, SystemBlock, TokenUsage, ToolCall, ToolCompletionResponse, ToolSchema,
 };
 use apex_core::error::LlmError;
 use apex_core::ports::LlmProvider;
@@ -60,13 +60,19 @@ impl AnthropicProvider {
         Ok(Self::new(api_key, model, context_window))
     }
 
-    async fn send_request(&self, body: Value) -> Result<ApiResponse, LlmError> {
-        let response = self
+    async fn send_request(&self, body: Value, use_cache: bool) -> Result<ApiResponse, LlmError> {
+        let mut request = self
             .client
             .post(API_URL)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+
+        if use_cache {
+            request = request.header("anthropic-beta", "prompt-caching-2024-07-31");
+        }
+
+        let response = request
             .json(&body)
             .send()
             .await
@@ -91,13 +97,40 @@ impl AnthropicProvider {
         messages.iter().map(ApiMessage::from_domain).collect()
     }
 
-    fn build_tools(tools: &[ToolSchema]) -> Vec<ApiTool> {
+    fn build_system(blocks: &[SystemBlock]) -> Value {
+        if blocks.len() == 1 && blocks[0].cache_hint == CacheHint::Dynamic {
+            serde_json::json!(blocks[0].text)
+        } else {
+            serde_json::json!(blocks
+                .iter()
+                .map(|b| {
+                    let mut obj = serde_json::json!({ "type": "text", "text": b.text });
+                    if b.cache_hint == CacheHint::Static {
+                        obj["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+                    }
+                    obj
+                })
+                .collect::<Vec<_>>())
+        }
+    }
+
+    fn build_tools(tools: &[ToolSchema], cache: bool) -> Vec<ApiTool> {
+        let len = tools.len();
         tools
             .iter()
-            .map(|t| ApiTool {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                input_schema: t.input_schema.clone(),
+            .enumerate()
+            .map(|(i, t)| {
+                let cache_control = if cache && i == len - 1 {
+                    Some(serde_json::json!({ "type": "ephemeral" }))
+                } else {
+                    None
+                };
+                ApiTool {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    input_schema: t.input_schema.clone(),
+                    cache_control,
+                }
             })
             .collect()
     }
@@ -151,14 +184,18 @@ impl AnthropicProvider {
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
     async fn complete(&self, req: CompletionRequest<'_>) -> Result<CompletionResponse, LlmError> {
+        let use_cache = req
+            .system_blocks
+            .iter()
+            .any(|b| b.cache_hint == CacheHint::Static);
         let body = serde_json::json!({
             "model": self.model,
             "max_tokens": req.max_tokens,
-            "system": req.system_prompt,
+            "system": Self::build_system(req.system_blocks),
             "messages": Self::build_messages(req.messages),
         });
 
-        let response = self.send_request(body).await?;
+        let response = self.send_request(body, use_cache).await?;
         let message = Self::parse_response_message(&response);
         let stop_reason = Self::parse_stop_reason(&response.stop_reason);
 
@@ -167,6 +204,8 @@ impl LlmProvider for AnthropicProvider {
             usage: TokenUsage {
                 input_tokens: response.usage.input_tokens,
                 output_tokens: response.usage.output_tokens,
+                cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
+                cache_read_input_tokens: response.usage.cache_read_input_tokens,
             },
             stop_reason,
         })
@@ -177,16 +216,21 @@ impl LlmProvider for AnthropicProvider {
         req: CompletionRequest<'_>,
         tools: &[ToolSchema],
     ) -> Result<ToolCompletionResponse, LlmError> {
+        let use_cache = req
+            .system_blocks
+            .iter()
+            .any(|b| b.cache_hint == CacheHint::Static)
+            || req.cache_tools;
         let body = serde_json::json!({
             "model": self.model,
             "max_tokens": req.max_tokens,
-            "system": req.system_prompt,
+            "system": Self::build_system(req.system_blocks),
             "messages": Self::build_messages(req.messages),
-            "tools": Self::build_tools(tools),
+            "tools": Self::build_tools(tools, req.cache_tools),
             "tool_choice": { "type": "auto" },
         });
 
-        let response = self.send_request(body).await?;
+        let response = self.send_request(body, use_cache).await?;
         let message = Self::parse_response_message(&response);
         let tool_calls = Self::parse_tool_calls(&response);
         let stop_reason = Self::parse_stop_reason(&response.stop_reason);
@@ -197,6 +241,8 @@ impl LlmProvider for AnthropicProvider {
             usage: TokenUsage {
                 input_tokens: response.usage.input_tokens,
                 output_tokens: response.usage.output_tokens,
+                cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
+                cache_read_input_tokens: response.usage.cache_read_input_tokens,
             },
             stop_reason,
         })
@@ -284,6 +330,8 @@ struct ApiTool {
     name: String,
     description: String,
     input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,10 +354,14 @@ enum ApiContentBlock {
     },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct ApiUsage {
     input_tokens: u32,
     output_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
 }
 
 #[cfg(test)]
@@ -385,6 +437,7 @@ mod tests {
             usage: ApiUsage {
                 input_tokens: 1,
                 output_tokens: 2,
+                ..Default::default()
             },
         };
 
@@ -428,6 +481,7 @@ mod tests {
             usage: ApiUsage {
                 input_tokens: 5,
                 output_tokens: 10,
+                ..Default::default()
             },
         };
 
@@ -551,7 +605,7 @@ mod tests {
             },
         ];
 
-        let api_tools = AnthropicProvider::build_tools(&schemas);
+        let api_tools = AnthropicProvider::build_tools(&schemas, false);
         let serialized = serde_json::to_value(&api_tools).unwrap();
         let arr = serialized.as_array().unwrap();
 
