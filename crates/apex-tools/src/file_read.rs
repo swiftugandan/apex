@@ -3,8 +3,7 @@ use apex_core::error::ToolError;
 use serde_json::json;
 
 pub fn definition() -> ToolDef {
-    ToolDef {
-        schema: ToolSchema {
+    ToolDef::eager(ToolSchema {
             name: "file_read".into(),
             description: "Read the contents of a file. Supports line-based offset and limit for reading specific ranges without loading the entire file.".into(),
             input_schema: json!({
@@ -17,8 +16,7 @@ pub fn definition() -> ToolDef {
                 },
                 "required": ["path"]
             }),
-        },
-    }
+    })
 }
 
 pub async fn execute(call: &ToolCall) -> Result<ToolResult, ToolError> {

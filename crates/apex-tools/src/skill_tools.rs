@@ -35,79 +35,73 @@ impl SkillToolRegistry {
 impl ToolRegistry for SkillToolRegistry {
     fn definitions(&self) -> Vec<ToolDef> {
         vec![
-            ToolDef {
-                schema: ToolSchema {
-                    name: "list_skills".into(),
-                    description: "List all available skills. Returns lightweight manifests \
+            ToolDef::eager(ToolSchema {
+                name: "list_skills".into(),
+                description: "List all available skills. Returns lightweight manifests \
                         (name, version) without loading full skill bodies. Use this for discovery."
-                        .into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {},
-                    }),
-                },
-            },
-            ToolDef {
-                schema: ToolSchema {
-                    name: "use_skill".into(),
-                    description: "Load a skill by name. Returns the full approach, resources, \
+                    .into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                }),
+            }),
+            ToolDef::eager(ToolSchema {
+                name: "use_skill".into(),
+                description: "Load a skill by name. Returns the full approach, resources, \
                         and metadata. The skill is registered as active for this session."
-                        .into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "Skill name (slug format, e.g. 'code-review')"
-                            },
-                            "version": {
-                                "type": "string",
-                                "description": "Skill version (default: 'latest')"
-                            }
+                    .into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Skill name (slug format, e.g. 'code-review')"
                         },
-                        "required": ["name"]
-                    }),
-                },
-            },
-            ToolDef {
-                schema: ToolSchema {
-                    name: "store_skill".into(),
-                    description: "Store or update a skill (successful approach for a task). \
+                        "version": {
+                            "type": "string",
+                            "description": "Skill version (default: 'latest')"
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            }),
+            ToolDef::eager(ToolSchema {
+                name: "store_skill".into(),
+                description: "Store or update a skill (successful approach for a task). \
                         If a skill with the same task_pattern exists, it is updated."
-                        .into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "Slug name for the skill (e.g. 'install-package'). Derived from task_pattern if omitted."
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Human-readable one-liner describing the skill. Defaults to task_pattern if omitted."
-                            },
-                            "task_pattern": {
-                                "type": "string",
-                                "description": "Pattern describing what kind of task this skill applies to"
-                            },
-                            "approach": {
-                                "type": "string",
-                                "description": "Description of the approach/strategy used"
-                            },
-                            "tools_used": {
-                                "type": "array",
-                                "items": { "type": "string" },
-                                "description": "List of tools used in this approach"
-                            },
-                            "version": {
-                                "type": "string",
-                                "description": "Skill version (default: '1.0.0')"
-                            }
+                    .into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Slug name for the skill (e.g. 'install-package'). Derived from task_pattern if omitted."
                         },
-                        "required": ["task_pattern", "approach"]
-                    }),
-                },
-            },
+                        "description": {
+                            "type": "string",
+                            "description": "Human-readable one-liner describing the skill. Defaults to task_pattern if omitted."
+                        },
+                        "task_pattern": {
+                            "type": "string",
+                            "description": "Pattern describing what kind of task this skill applies to"
+                        },
+                        "approach": {
+                            "type": "string",
+                            "description": "Description of the approach/strategy used"
+                        },
+                        "tools_used": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "List of tools used in this approach"
+                        },
+                        "version": {
+                            "type": "string",
+                            "description": "Skill version (default: '1.0.0')"
+                        }
+                    },
+                    "required": ["task_pattern", "approach"]
+                }),
+            }),
         ]
     }
 

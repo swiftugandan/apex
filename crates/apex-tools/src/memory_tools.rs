@@ -33,8 +33,7 @@ impl ToolRegistry for MemoryToolRegistry {
     fn definitions(&self) -> Vec<ToolDef> {
         vec![
             // ── Working Memory ──────────────────────────────────────
-            ToolDef {
-                schema: ToolSchema {
+            ToolDef::eager(ToolSchema {
                     name: "working_memory_read".into(),
                     description: "Read the working memory scratchpad for a job. Returns the current decomposition state, notes, and status.".into(),
                     input_schema: json!({
@@ -47,10 +46,8 @@ impl ToolRegistry for MemoryToolRegistry {
                         },
                         "required": ["job_id"]
                     }),
-                },
-            },
-            ToolDef {
-                schema: ToolSchema {
+            }),
+            ToolDef::eager(ToolSchema {
                     name: "working_memory_update".into(),
                     description: "Update the working memory scratchpad for a job. Apply structured changes to goal, subtasks, notes, or status.".into(),
                     input_schema: json!({
@@ -94,11 +91,9 @@ impl ToolRegistry for MemoryToolRegistry {
                         },
                         "required": ["job_id"]
                     }),
-                },
-            },
+            }),
             // ── Long-Term Memory: Facts ─────────────────────────────
-            ToolDef {
-                schema: ToolSchema {
+            ToolDef::eager(ToolSchema {
                     name: "memory_store_fact".into(),
                     description: "Store a discovered fact in long-term memory for future reference. Facts persist across jobs and are retrieved when relevant to new tasks.".into(),
                     input_schema: json!({
@@ -120,10 +115,8 @@ impl ToolRegistry for MemoryToolRegistry {
                         },
                         "required": ["content"]
                     }),
-                },
-            },
-            ToolDef {
-                schema: ToolSchema {
+            }),
+            ToolDef::eager(ToolSchema {
                     name: "memory_query_facts".into(),
                     description: "Query long-term memory for facts matching a search query. Returns facts with decayed confidence scores.".into(),
                     input_schema: json!({
@@ -140,8 +133,7 @@ impl ToolRegistry for MemoryToolRegistry {
                         },
                         "required": ["query"]
                     }),
-                },
-            },
+            }),
         ]
     }
 

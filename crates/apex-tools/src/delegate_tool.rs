@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use apex_core::config::{MemoryMode, RoleProfile};
-use apex_core::domain::{SkillManifest, ToolCall, ToolDef, ToolResult, ToolSchema};
+use apex_core::domain::{SkillManifest, ToolCall, ToolDef, ToolLoading, ToolResult, ToolSchema};
 use apex_core::error::ToolError;
 use apex_core::ports::{SubAgentSpawner, ToolRegistry};
 use async_trait::async_trait;
@@ -185,6 +185,7 @@ impl ToolRegistry for DelegateToolRegistry {
                     "required": ["task"]
                 }),
             },
+            loading: ToolLoading::Deferred,
         }]
     }
 

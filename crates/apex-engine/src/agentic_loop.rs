@@ -187,7 +187,6 @@ pub async fn run_agentic_loop(
     let mut outcome: Option<LoopOutcome> = None;
     let mut total_tool_calls: usize = 0;
     let deadline = config.timeout.map(|d| Instant::now() + d);
-    let schemas = config.tools.schemas();
     let cache_hint = if config.prompt_caching {
         CacheHint::Static
     } else {
@@ -237,6 +236,9 @@ pub async fn run_agentic_loop(
 
         // ── auto-compaction ──
         maybe_compact(&mut messages, config).await;
+
+        // Per-turn schema extraction: picks up newly loaded deferred tools
+        let schemas = config.tools.schemas();
 
         let req = CompletionRequest {
             system_blocks: &system_blocks,

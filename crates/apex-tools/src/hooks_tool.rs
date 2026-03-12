@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use apex_core::domain::{
     HookAction, HookActionType, HookDef, HookEvent, HookFilter, HookMeta, OnFailureBehavior,
-    ToolCall, ToolDef, ToolResult, ToolSchema,
+    ToolCall, ToolDef, ToolLoading, ToolResult, ToolSchema,
 };
 use apex_core::error::ToolError;
 use apex_core::ports::{HookRegistry, ToolRegistry};
@@ -425,6 +425,7 @@ impl ToolRegistry for HooksToolRegistry {
                     "required": ["action"]
                 }),
             },
+            loading: ToolLoading::Deferred,
         }]
     }
 

@@ -225,13 +225,11 @@ impl MockToolRegistry {
 
     /// Create a registry with a single tool that always succeeds.
     pub fn echo(name: &str) -> Self {
-        let def = ToolDef {
-            schema: ToolSchema {
-                name: name.to_string(),
-                description: "mock tool".to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            },
-        };
+        let def = ToolDef::eager(ToolSchema {
+            name: name.to_string(),
+            description: "mock tool".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        });
         // Queue up many success responses
         let responses: Vec<_> = (0..100)
             .map(|_| {
@@ -249,26 +247,22 @@ impl MockToolRegistry {
 
     /// Create a registry with a single tool that returns an error.
     pub fn failing(name: &str, error_msg: &str) -> Self {
-        let def = ToolDef {
-            schema: ToolSchema {
-                name: name.to_string(),
-                description: "mock tool".to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            },
-        };
+        let def = ToolDef::eager(ToolSchema {
+            name: name.to_string(),
+            description: "mock tool".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        });
         let responses = vec![Err(ToolError::Execution(error_msg.to_string()))];
         Self::new(vec![def], responses)
     }
 
     /// Create a registry that returns a large output.
     pub fn large_output(name: &str, size_bytes: usize) -> Self {
-        let def = ToolDef {
-            schema: ToolSchema {
-                name: name.to_string(),
-                description: "mock tool".to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            },
-        };
+        let def = ToolDef::eager(ToolSchema {
+            name: name.to_string(),
+            description: "mock tool".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        });
         let large = "x".repeat(size_bytes);
         let responses = vec![Ok(ToolResult {
             tool_use_id: String::new(),

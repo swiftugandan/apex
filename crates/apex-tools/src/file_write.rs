@@ -5,21 +5,19 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 pub fn definition() -> ToolDef {
-    ToolDef {
-        schema: ToolSchema {
-            name: "file_write".into(),
-            description: "Write content to a file".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Path to the file to write" },
-                    "content": { "type": "string", "description": "Content to write" },
-                    "append": { "type": "boolean", "description": "Append instead of overwrite (default false)" }
-                },
-                "required": ["path", "content"]
-            }),
-        },
-    }
+    ToolDef::eager(ToolSchema {
+        name: "file_write".into(),
+        description: "Write content to a file".into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Path to the file to write" },
+                "content": { "type": "string", "description": "Content to write" },
+                "append": { "type": "boolean", "description": "Append instead of overwrite (default false)" }
+            },
+            "required": ["path", "content"]
+        }),
+    })
 }
 
 pub async fn execute(call: &ToolCall) -> Result<ToolResult, ToolError> {

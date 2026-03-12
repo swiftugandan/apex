@@ -8,8 +8,7 @@ use serde_json::json;
 use crate::tool_result_helpers::ok_result;
 
 pub fn definition() -> ToolDef {
-    ToolDef {
-        schema: ToolSchema {
+    ToolDef::eager(ToolSchema {
             name: "grep".into(),
             description: "Search file contents using regex. Three output modes: 'files_with_matches' returns just file paths (default, fast), 'content' returns matching lines with optional context, 'count' returns match counts per file. Use the glob parameter to filter which files to search.".into(),
             input_schema: json!({
@@ -25,8 +24,7 @@ pub fn definition() -> ToolDef {
                 },
                 "required": ["pattern"]
             }),
-        },
-    }
+    })
 }
 
 pub async fn execute(call: &ToolCall) -> Result<ToolResult, ToolError> {

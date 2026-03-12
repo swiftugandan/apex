@@ -21,6 +21,9 @@ pub struct AgentConfig {
 
     #[serde(default)]
     pub compaction: CompactionSection,
+
+    #[serde(default)]
+    pub tool_loading: ToolLoadingSection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -196,6 +199,23 @@ pub struct CompactionSection {
     pub spill_history: bool,
 }
 
+/// Controls which tools are loaded eagerly vs. deferred.
+/// Override lists take precedence over per-registry defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ToolLoadingSection {
+    /// Tool names forced to eager loading (overrides registry default).
+    #[serde(default)]
+    pub eager: Vec<String>,
+
+    /// Tool names forced to deferred loading (overrides registry default).
+    #[serde(default)]
+    pub deferred: Vec<String>,
+
+    /// If true, disable deferred loading entirely (all tools are eager).
+    #[serde(default)]
+    pub disable_deferred: bool,
+}
+
 // ── Defaults ─────────────────────────────────────────────────────
 
 fn default_provider() -> String {
@@ -265,6 +285,7 @@ impl Default for AgentConfig {
             consolidation: ConsolidationSection::default(),
             fitness: FitnessSection::default(),
             compaction: CompactionSection::default(),
+            tool_loading: ToolLoadingSection::default(),
         }
     }
 }

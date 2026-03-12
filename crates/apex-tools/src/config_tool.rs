@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use apex_core::config::{validate_against_invariants, AgentConfig, ConfigLoader, Invariants};
-use apex_core::domain::{ToolCall, ToolDef, ToolResult, ToolSchema};
+use apex_core::domain::{ToolCall, ToolDef, ToolLoading, ToolResult, ToolSchema};
 use apex_core::error::ToolError;
 use apex_core::ports::ToolRegistry;
 use async_trait::async_trait;
@@ -46,6 +46,7 @@ impl ToolRegistry for ConfigToolRegistry {
                     "required": ["action"]
                 }),
             },
+            loading: ToolLoading::Deferred,
         }]
     }
 

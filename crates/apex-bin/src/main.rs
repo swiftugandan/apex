@@ -407,6 +407,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
             max_tool_calls_per_turn: agent_config.agent.max_tool_calls_per_turn,
             max_total_tool_calls: agent_config.agent.max_total_tool_calls,
             prompt_caching: agent_config.agent.prompt_caching,
+            tool_loading: agent_config.tool_loading.clone(),
         },
         runtime: sub_runtime,
         hooks: Some(Arc::clone(&hooks)),
@@ -421,6 +422,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         spawner,
         roles,
         remaining_delegate_depth,
+        &agent_config.tool_loading,
     );
 
     let claim_factory: Arc<dyn ClaimToolFactory> = Arc::new(runtime::CliClaimToolFactory {

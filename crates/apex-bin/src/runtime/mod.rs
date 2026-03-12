@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use apex_core::config::{Invariants, RoleProfile};
+use apex_core::config::{Invariants, RoleProfile, ToolLoadingSection};
 use apex_core::ports::{MemoryStore, SkillStore, SubAgentSpawner, WorkingMemory};
 
 use apex_engine::{CompositeToolRegistry, ProjectPaths};
@@ -29,6 +29,7 @@ pub fn build_static_tools(
     spawner: Arc<dyn SubAgentSpawner>,
     roles: Arc<[RoleProfile]>,
     remaining_delegate_depth: u32,
+    tool_loading: &ToolLoadingSection,
 ) -> Arc<CompositeToolRegistry> {
     let memory_tools = MemoryToolRegistry::new(memory, long_term.clone());
     let custom_spill = SpillManager::new(paths.scratch_dir.clone());
@@ -43,13 +44,16 @@ pub fn build_static_tools(
     );
     let hooks_tools = HooksToolRegistry::new(paths.hooks_dir.clone());
     let skill_tools = SkillToolRegistry::new(skills);
-    Arc::new(CompositeToolRegistry::new(vec![
-        Box::new(BuiltinToolRegistry::new(paths.scratch_dir.clone())),
-        Box::new(memory_tools),
-        Box::new(custom_tools),
-        Box::new(config_tools),
-        Box::new(delegate_tools),
-        Box::new(hooks_tools),
-        Box::new(skill_tools),
-    ]))
+    Arc::new(CompositeToolRegistry::with_config(
+        vec![
+            Box::new(BuiltinToolRegistry::new(paths.scratch_dir.clone())),
+            Box::new(memory_tools),
+            Box::new(custom_tools),
+            Box::new(config_tools),
+            Box::new(delegate_tools),
+            Box::new(hooks_tools),
+            Box::new(skill_tools),
+        ],
+        tool_loading,
+    ))
 }

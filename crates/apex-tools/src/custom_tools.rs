@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use apex_core::domain::{Skill, SkillId, SkillStatus, ToolCall, ToolDef, ToolResult, ToolSchema};
+use apex_core::domain::{
+    Skill, SkillId, SkillStatus, ToolCall, ToolDef, ToolLoading, ToolResult, ToolSchema,
+};
 use apex_core::error::ToolError;
 use apex_core::ports::{SkillStore, ToolRegistry};
 use async_trait::async_trait;
@@ -162,6 +164,7 @@ fn create_tool_definition() -> ToolDef {
                 "required": ["name", "description", "implementation", "input_schema", "test_script"]
             }),
         },
+        loading: ToolLoading::Deferred,
     }
 }
 
@@ -187,6 +190,7 @@ impl ToolRegistry for CustomToolRegistry {
                                 description: entry.description.clone(),
                                 input_schema,
                             },
+                            loading: ToolLoading::Deferred,
                         });
                     }
                 }

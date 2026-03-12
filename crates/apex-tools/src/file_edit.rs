@@ -5,8 +5,7 @@ use serde_json::json;
 use crate::tool_result_helpers::{err_result, ok_result};
 
 pub fn definition() -> ToolDef {
-    ToolDef {
-        schema: ToolSchema {
+    ToolDef::eager(ToolSchema {
             name: "file_edit".into(),
             description: "Edit a file using exact string replacement (str_replace) or line insertion (insert). For str_replace: provide old_string and new_string — old_string must match exactly one location in the file unless replace_all is true. For insert: provide insert_line and new_string to insert text after a specific line. Use file_read first to see the current content before editing.".into(),
             input_schema: json!({
@@ -21,8 +20,7 @@ pub fn definition() -> ToolDef {
                 },
                 "required": ["path"]
             }),
-        },
-    }
+    })
 }
 
 pub async fn execute(call: &ToolCall) -> Result<ToolResult, ToolError> {

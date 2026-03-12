@@ -13,8 +13,7 @@ use crate::spill::{
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
 pub fn definition() -> ToolDef {
-    ToolDef {
-        schema: ToolSchema {
+    ToolDef::eager(ToolSchema {
             name: "shell_exec".into(),
             description: "Run a shell command via /bin/sh -c. Output beyond 16KB is automatically spilled to a scratch file — you receive a head/tail summary with the scratch path. Use file_read with offset/limit to read spilled sections.".into(),
             input_schema: json!({
@@ -30,8 +29,7 @@ pub fn definition() -> ToolDef {
                 },
                 "required": ["command"]
             }),
-        },
-    }
+    })
 }
 
 pub async fn execute(call: &ToolCall, spill: &SpillManager) -> Result<ToolResult, ToolError> {

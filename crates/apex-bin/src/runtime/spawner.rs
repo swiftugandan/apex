@@ -7,6 +7,7 @@ use async_trait::async_trait;
 
 use apex_core::config::{
     CompactionSection, ConsolidationSection, Invariants, MemoryMode, RoleProfile,
+    ToolLoadingSection,
 };
 use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{MessageHeaders, MessageType, QueueMessage, ToolCall, ToolDef, ToolResult};
@@ -131,6 +132,7 @@ pub struct SpawnerConfig {
     pub max_tool_calls_per_turn: usize,
     pub max_total_tool_calls: usize,
     pub prompt_caching: bool,
+    pub tool_loading: ToolLoadingSection,
 }
 
 // ── InProcessSpawner ────────────────────────────────────────────────
@@ -237,6 +239,7 @@ impl SubAgentSpawner for InProcessSpawner {
                 max_tool_calls_per_turn: self.config.max_tool_calls_per_turn,
                 max_total_tool_calls: self.config.max_total_tool_calls,
                 prompt_caching: self.config.prompt_caching,
+                tool_loading: self.config.tool_loading.clone(),
             },
             runtime: Arc::clone(&self.runtime),
             hooks: sub_hooks.clone(),
@@ -252,6 +255,7 @@ impl SubAgentSpawner for InProcessSpawner {
             sub_spawner,
             Arc::clone(&self.config.roles),
             sub_depth,
+            &self.config.tool_loading,
         );
 
         // 7. Build claim tool factory, with role-based filtering if needed.

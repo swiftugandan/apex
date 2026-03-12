@@ -8,8 +8,7 @@ use serde_json::json;
 use crate::tool_result_helpers::ok_result;
 
 pub fn definition() -> ToolDef {
-    ToolDef {
-        schema: ToolSchema {
+    ToolDef::eager(ToolSchema {
             name: "glob".into(),
             description: "Find files matching a glob pattern. Returns file paths sorted by modification time (most recent first). Use this to discover files by name pattern before reading or editing them.".into(),
             input_schema: json!({
@@ -21,8 +20,7 @@ pub fn definition() -> ToolDef {
                 },
                 "required": ["pattern"]
             }),
-        },
-    }
+    })
 }
 
 pub async fn execute(call: &ToolCall) -> Result<ToolResult, ToolError> {

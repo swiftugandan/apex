@@ -371,8 +371,7 @@ impl QueueToolRegistry {
 impl ToolRegistry for QueueToolRegistry {
     fn definitions(&self) -> Vec<ToolDef> {
         vec![
-            ToolDef {
-                schema: ToolSchema {
+            ToolDef::eager(ToolSchema {
                     name: "decompose_goal".to_string(),
                     description: "Decompose a complex goal into subtasks that will be executed independently and in parallel where possible. Use this when a task has 2 or more independent steps. Each subtask becomes a separate queue message processed by an agent instance. Write acceptance_criteria in plain natural language describing what 'done' looks like — an LLM judge with tool access will verify completion.".to_string(),
                     input_schema: json!({
@@ -404,10 +403,8 @@ impl ToolRegistry for QueueToolRegistry {
                         },
                         "required": ["subtasks"]
                     }),
-                },
-            },
-            ToolDef {
-                schema: ToolSchema {
+            }),
+            ToolDef::eager(ToolSchema {
                     name: "queue_read_done".to_string(),
                     description: "Read completed subtask results from the queue. Use this in continuation messages to collect results from all completed subtasks before assembling the final deliverable.".to_string(),
                     input_schema: json!({
@@ -419,8 +416,7 @@ impl ToolRegistry for QueueToolRegistry {
                             }
                         }
                     }),
-                },
-            },
+            }),
         ]
     }
 

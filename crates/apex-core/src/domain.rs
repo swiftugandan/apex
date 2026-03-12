@@ -12,10 +12,33 @@ pub struct ToolSchema {
     pub input_schema: Value,
 }
 
+/// Controls whether a tool's full schema is sent eagerly or loaded on demand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolLoading {
+    /// Full schema sent to the LLM every turn.
+    #[default]
+    Eager,
+    /// Only name + description sent; full schema loaded via `load_tool_definitions`.
+    Deferred,
+}
+
 /// A tool definition (schema + metadata).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDef {
     pub schema: ToolSchema,
+    #[serde(default)]
+    pub loading: ToolLoading,
+}
+
+impl ToolDef {
+    /// Create an eager tool definition (full schema sent every turn).
+    pub fn eager(schema: ToolSchema) -> Self {
+        Self {
+            schema,
+            loading: ToolLoading::Eager,
+        }
+    }
 }
 
 /// A tool invocation requested by the LLM.
