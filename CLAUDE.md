@@ -32,7 +32,7 @@ apex-tools  → apex-core only
 apex-infra  → apex-core only
 ```
 
-**Critical invariant:** `apex-engine` must never depend on `apex-tools`, `apex-infra`, or `rfbmq-core`. Verify with `cargo tree -p apex-engine`.
+**Critical invariant:** `apex-engine` must never depend on `apex-tools`, `apex-infra`, or `rfbmq-core`. These invariants are enforced by `apex-arch-tests` — always run `cargo test -p apex-arch-tests` alongside other tests (it is included in `cargo test --workspace`).
 
 ### Key Abstractions (apex-core/src/ports.rs)
 

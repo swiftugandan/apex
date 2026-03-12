@@ -1,0 +1,8 @@
+[package]
+name = "apex-arch-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dev-dependencies]
+cargo_metadata = "0.19"

@@ -6,6 +6,7 @@ members = [
     "crates/apex-engine",
     "crates/apex-infra",
     "crates/apex-bin",
+    "crates/apex-arch-tests",
 ]
 default-members = ["crates/apex-bin"]
 
