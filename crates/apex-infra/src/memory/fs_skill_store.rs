@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 
 use apex_core::domain::{slugify, Skill, SkillId, SkillManifest, SkillStatus};
 use apex_core::error::MemoryError;
@@ -57,9 +58,7 @@ impl FsSkillStore {
     }
 
     fn invalidate_cache(&self) {
-        if let Ok(mut cache) = self.cache.lock() {
-            *cache = None;
-        }
+        *self.cache.lock() = None;
     }
 
     /// Scan a single directory for skills.
@@ -99,31 +98,40 @@ impl FsSkillStore {
         results
     }
 
-    fn load_all(&self) -> Result<Arc<Vec<Skill>>, MemoryError> {
-        // Check cache first
-        if let Ok(cache) = self.cache.lock() {
-            if let Some(ref cached) = *cache {
+    /// Load all skills, using cache when possible. Runs sync filesystem scan in
+    /// spawn_blocking so it does not block the async executor. Cache uses parking_lot::Mutex
+    /// so lock is brief and invalidate_cache can be called from sync write_skill.
+    async fn load_all_async(&self) -> Result<Arc<Vec<Skill>>, MemoryError> {
+        // Check cache first (brief sync lock)
+        {
+            let guard = self.cache.lock();
+            if let Some(ref cached) = *guard {
                 return Ok(Arc::clone(cached));
             }
         }
 
-        self.ensure_write_dir()?;
-
-        let mut results = Vec::new();
-        let mut seen_names = HashSet::new();
-
-        // Scan directories in precedence order; first-found wins on name collision
-        for dir in &self.scan_dirs {
-            for skill in Self::scan_dir(dir) {
-                if seen_names.insert(skill.name.clone()) {
-                    results.push(skill);
+        let scan_dirs = self.scan_dirs.clone();
+        let write_dir = self.write_dir.clone();
+        let results = tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&write_dir)
+                .map_err(|e| MemoryError::Database(format!("failed to create skills dir: {e}")))?;
+            let mut results = Vec::new();
+            let mut seen_names = HashSet::new();
+            for dir in &scan_dirs {
+                for skill in Self::scan_dir(dir) {
+                    if seen_names.insert(skill.name.clone()) {
+                        results.push(skill);
+                    }
                 }
             }
-        }
+            Ok::<_, MemoryError>(Arc::new(results))
+        })
+        .await
+        .map_err(|e| MemoryError::Database(format!("spawn_blocking: {e}")))??;
 
-        let results = Arc::new(results);
-        if let Ok(mut cache) = self.cache.lock() {
-            *cache = Some(Arc::clone(&results));
+        {
+            let mut guard = self.cache.lock();
+            *guard = Some(Arc::clone(&results));
         }
 
         Ok(results)
@@ -151,12 +159,12 @@ impl FsSkillStore {
 #[async_trait]
 impl SkillStore for FsSkillStore {
     async fn list_manifests(&self) -> Result<Vec<SkillManifest>, MemoryError> {
-        let all = self.load_all()?;
+        let all = self.load_all_async().await?;
         Ok(all.iter().map(|s| s.to_manifest()).collect())
     }
 
     async fn load_skill(&self, name: &str, version: &str) -> Result<Option<Skill>, MemoryError> {
-        let all = self.load_all()?;
+        let all = self.load_all_async().await?;
         let found = all
             .iter()
             .find(|s| s.name == name && (version == "latest" || s.version == version));
@@ -164,7 +172,7 @@ impl SkillStore for FsSkillStore {
     }
 
     async fn validate_manifest(&self, manifest: &SkillManifest) -> Result<(), MemoryError> {
-        let all = self.load_all()?;
+        let all = self.load_all_async().await?;
         let found = all.iter().any(|s| {
             s.name == manifest.name
                 && (manifest.version == "latest" || s.version == manifest.version)
@@ -179,7 +187,7 @@ impl SkillStore for FsSkillStore {
     }
 
     async fn store_skill(&self, mut skill: Skill) -> Result<SkillId, MemoryError> {
-        let all = self.load_all()?;
+        let all = self.load_all_async().await?;
 
         // Check for existing skill with same task_pattern
         if let Some(existing) = all.iter().find(|s| s.task_pattern == skill.task_pattern) {
@@ -202,7 +210,7 @@ impl SkillStore for FsSkillStore {
     }
 
     async fn update_skill_fitness(&self, id: &SkillId, success: bool) -> Result<(), MemoryError> {
-        let all = self.load_all()?;
+        let all = self.load_all_async().await?;
 
         let mut skill = all
             .iter()

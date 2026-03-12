@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use parking_lot::RwLock;
 
 use apex_core::config::ToolLoadingSection;
 use apex_core::domain::{ToolCall, ToolDef, ToolLoading, ToolResult, ToolSchema};
@@ -79,7 +80,7 @@ impl CompositeToolRegistry {
             return self.cached_defs.iter().map(|d| d.schema.clone()).collect();
         }
 
-        let loaded = self.loaded_deferred.read().unwrap();
+        let loaded = self.loaded_deferred.read();
         let mut schemas: Vec<ToolSchema> = self
             .cached_defs
             .iter()
@@ -107,7 +108,7 @@ impl CompositeToolRegistry {
 
     /// Mark tools as loaded, returning their full schemas.
     fn load_tools(&self, names: &[String]) -> Value {
-        let mut loaded = self.loaded_deferred.write().unwrap();
+        let mut loaded = self.loaded_deferred.write();
         let mut results = Vec::new();
 
         for name in names {
@@ -147,7 +148,7 @@ impl CompositeToolRegistry {
             .map(|&idx| &self.cached_defs[idx])
         {
             if def.loading == ToolLoading::Deferred {
-                let mut loaded = self.loaded_deferred.write().unwrap();
+                let mut loaded = self.loaded_deferred.write();
                 loaded.insert(name.to_string());
                 return true;
             }
@@ -177,11 +178,15 @@ impl CompositeToolRegistry {
 #[async_trait]
 impl ToolRegistry for CompositeToolRegistry {
     fn definitions(&self) -> Vec<ToolDef> {
-        let mut defs = self.cached_defs.as_ref().clone();
         if self.has_deferred {
-            defs.push(ToolDef::eager(Self::meta_tool_schema()));
+            self.cached_defs
+                .iter()
+                .cloned()
+                .chain(std::iter::once(ToolDef::eager(Self::meta_tool_schema())))
+                .collect()
+        } else {
+            self.cached_defs.to_vec()
         }
-        defs
     }
 
     fn schemas(&self) -> Vec<ToolSchema> {

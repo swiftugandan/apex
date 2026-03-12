@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
-use std::sync::{Mutex, RwLock};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -184,7 +184,7 @@ impl FsHookRegistry {
 
     /// Validate all hooks in the hooks directory.
     pub fn validate_all(&self) -> Vec<(String, Vec<String>)> {
-        let hooks = self.hooks.read().unwrap();
+        let hooks = self.hooks.read();
         let mut issues = Vec::new();
         for hook in hooks.iter() {
             if let Err(errs) = Self::validate_hook(hook) {
@@ -373,7 +373,7 @@ async fn execute_hook(hook: &HookDef, context: &Value, working_dir: Option<&Path
 #[async_trait]
 impl HookRegistry for FsHookRegistry {
     fn hooks_for(&self, event: HookEvent) -> Vec<HookDef> {
-        let hooks = self.hooks.read().unwrap();
+        let hooks = self.hooks.read();
         let mut filtered: Vec<_> = hooks
             .iter()
             .filter(|h| h.hook.event == event)
@@ -384,24 +384,30 @@ impl HookRegistry for FsHookRegistry {
     }
 
     fn all_hooks(&self) -> Vec<HookDef> {
-        self.hooks.read().unwrap().clone()
+        self.hooks.read().clone()
     }
 
     async fn dispatch(&self, event: HookEvent, context: &Value) -> Vec<HookOutcome> {
-        // Reload hooks from disk if the cache TTL has elapsed.
+        // Reload hooks from disk if the cache TTL has elapsed. Use spawn_blocking
+        // so sync filesystem I/O does not block the async executor.
         {
-            let elapsed = self.last_loaded.lock().unwrap().elapsed();
+            let elapsed = self.last_loaded.lock().elapsed();
             if elapsed >= std::time::Duration::from_secs(self.cache_ttl_secs) {
-                let fresh = Self::load_hooks_from_dir(&self.hooks_dir);
-                let mut guard = self.hooks.write().unwrap();
-                *guard = fresh;
-                drop(guard);
-                *self.last_loaded.lock().unwrap() = std::time::Instant::now();
+                let hooks_dir = self.hooks_dir.clone();
+                if let Ok(fresh) =
+                    tokio::task::spawn_blocking(move || Self::load_hooks_from_dir(&hooks_dir)).await
+                {
+                    let mut guard = self.hooks.write();
+                    *guard = fresh;
+                    drop(guard);
+                    *self.last_loaded.lock() = std::time::Instant::now();
+                }
+                // If spawn_blocking join failed, keep existing hooks and continue
             }
         }
 
         let hooks = {
-            let guard = self.hooks.read().unwrap();
+            let guard = self.hooks.read();
             let mut filtered: Vec<_> = guard
                 .iter()
                 .filter(|h| h.hook.event == event)
@@ -419,13 +425,13 @@ impl HookRegistry for FsHookRegistry {
 
     fn reload(&mut self) -> Result<(), String> {
         let fresh = Self::load_hooks_from_dir(&self.hooks_dir);
-        *self.hooks.get_mut().unwrap() = fresh;
-        *self.last_loaded.lock().unwrap() = std::time::Instant::now();
+        *self.hooks.get_mut() = fresh;
+        *self.last_loaded.get_mut() = std::time::Instant::now();
         Ok(())
     }
 
     fn has_hooks_for(&self, event: HookEvent) -> bool {
-        let hooks = self.hooks.read().unwrap();
+        let hooks = self.hooks.read();
         hooks.iter().any(|h| h.hook.event == event)
     }
 }

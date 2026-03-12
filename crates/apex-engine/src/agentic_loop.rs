@@ -105,11 +105,16 @@ async fn maybe_compact(messages: &mut Vec<ChatMessage>, config: &LoopConfig<'_>)
         return false;
     }
 
-    // Spill full conversation history to disk before compaction (Principle 5 & 6)
+    // Spill full conversation history to disk before compaction (Principle 5 & 6).
+    // Run in spawn_blocking so sync filesystem I/O does not block the async executor.
     if config.compaction.spill_history {
-        match config.scratch_dir.as_deref() {
-            Some(dir) => match spill_to_disk(dir, messages) {
-                Ok(path) => {
+        if let Some(ref scratch_dir) = config.scratch_dir {
+            let dir = scratch_dir.clone();
+            let messages_clone = messages.clone();
+            let spill_result =
+                tokio::task::spawn_blocking(move || spill_to_disk(&dir, &messages_clone)).await;
+            match spill_result {
+                Ok(Ok(path)) => {
                     let msg_count = messages.len();
                     let p = path.display();
                     dispatch_log(
@@ -126,11 +131,11 @@ async fn maybe_compact(messages: &mut Vec<ChatMessage>, config: &LoopConfig<'_>)
                     )
                     .await;
                 }
-                Err(e) => eprintln!("  compaction spill failed ({e})"),
-            },
-            None => {
-                eprintln!("  spill_history enabled but no scratch_dir configured, skipping spill");
+                Ok(Err(e)) => eprintln!("  compaction spill failed ({e})"),
+                Err(e) => eprintln!("  compaction spill spawn_blocking failed: {e}"),
             }
+        } else {
+            eprintln!("  spill_history enabled but no scratch_dir configured, skipping spill");
         }
     }
 
