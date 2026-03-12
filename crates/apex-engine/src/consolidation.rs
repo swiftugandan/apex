@@ -115,17 +115,20 @@ pub async fn consolidate_learnings(
                             id: SkillId(String::new()),
                             name: slugify(title),
                             description: title.to_string(),
+                            license: None,
+                            compatibility: None,
+                            allowed_tools: None,
+                            extra_metadata: Default::default(),
                             task_pattern: title.to_string(),
                             approach,
                             tools_used,
-                            criteria_template: None,
                             success_count: 1,
                             failure_count: 0,
                             fitness: 0.5,
                             min_samples: 3,
                             last_used: String::new(),
-                            notes: String::new(),
                             status: SkillStatus::Active,
+                            skill_dir: None,
                         };
                         if let Err(e) = skill_store.store_skill(skill).await {
                             log_consolidation_err(hooks, "failed to store skill", &e.to_string())
@@ -166,14 +169,21 @@ pub async fn consolidate_learnings(
                 }
             }
             Ok(None) => {
+                let extra_metadata = std::collections::BTreeMap::from([(
+                    "apex-avg-subtasks".to_string(),
+                    scratchpad.subtasks.len().to_string(),
+                )]);
                 let skill = Skill {
                     id: SkillId(String::new()),
                     name: slugify(&format!("decompose-{}", scratchpad.goal)),
                     description: format!("Decomposition strategy for: {}", scratchpad.goal),
+                    license: None,
+                    compatibility: None,
+                    allowed_tools: None,
+                    extra_metadata,
                     task_pattern: pattern,
                     approach: decomposition,
                     tools_used: vec![],
-                    criteria_template: None,
                     success_count: if record.outcome == AttemptOutcome::Success {
                         1
                     } else {
@@ -187,8 +197,8 @@ pub async fn consolidate_learnings(
                     fitness: 0.5,
                     min_samples: 3,
                     last_used: String::new(),
-                    notes: format!("avg_subtasks: {}", scratchpad.subtasks.len()),
                     status: SkillStatus::Active,
+                    skill_dir: None,
                 };
                 if let Err(e) = skill_store.store_skill(skill).await {
                     log_consolidation_err(

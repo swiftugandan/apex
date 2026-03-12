@@ -403,17 +403,20 @@ impl CustomToolRegistry {
                     id: SkillId(format!("skill-tool-{name}")),
                     name: apex_core::domain::slugify(name),
                     description: description.to_string(),
+                    license: None,
+                    compatibility: None,
+                    allowed_tools: None,
+                    extra_metadata: Default::default(),
                     task_pattern: pattern.clone(),
                     approach: format!("Use the custom tool '{name}': {description}"),
                     tools_used: vec![name.to_string()],
-                    criteria_template: None,
                     success_count: 0,
                     failure_count: 0,
                     fitness: 0.5,
                     min_samples: 3,
                     last_used: now_iso(),
-                    notes: format!("Auto-created when tool '{name}' was registered"),
                     status: SkillStatus::Active,
+                    skill_dir: None,
                 };
                 let _ = skill_store.store_skill(skill).await;
             }

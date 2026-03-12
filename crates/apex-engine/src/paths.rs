@@ -55,17 +55,19 @@ on_failure = "continue"
 #[derive(Clone)]
 pub struct ProjectPaths {
     pub root: PathBuf,
-    pub apex_dir: PathBuf,       // root/.apex
-    pub work_queue: PathBuf,     // root/.apex/queues/work
-    pub queues_dir: PathBuf,     // root/.apex/queues
-    pub prompts_dir: PathBuf,    // root/.apex/prompts
-    pub working_memory: PathBuf, // root/.apex/memory/working
-    pub long_term_dir: PathBuf,  // root/.apex/memory/long-term
-    pub skills_dir: PathBuf,     // root/.apex/memory/long-term/skills
-    pub scratch_dir: PathBuf,    // root/.apex/scratch
-    pub tools_dir: PathBuf,      // root/.apex/tools
-    pub config_dir: PathBuf,     // root/.apex/config
-    pub hooks_dir: PathBuf,      // root/.apex/hooks
+    pub apex_dir: PathBuf,            // root/.apex
+    pub work_queue: PathBuf,          // root/.apex/queues/work
+    pub queues_dir: PathBuf,          // root/.apex/queues
+    pub prompts_dir: PathBuf,         // root/.apex/prompts
+    pub working_memory: PathBuf,      // root/.apex/memory/working
+    pub long_term_dir: PathBuf,       // root/.apex/memory/long-term
+    pub skills_dir: PathBuf,          // root/.apex/memory/long-term/skills (learned)
+    pub authored_skills_dir: PathBuf, // root/.apex/skills (client-specific authored)
+    pub shared_skills_dir: PathBuf,   // root/.agents/skills (cross-client interop)
+    pub scratch_dir: PathBuf,         // root/.apex/scratch
+    pub tools_dir: PathBuf,           // root/.apex/tools
+    pub config_dir: PathBuf,          // root/.apex/config
+    pub hooks_dir: PathBuf,           // root/.apex/hooks
 }
 
 impl ProjectPaths {
@@ -88,6 +90,8 @@ impl ProjectPaths {
             prompts_dir: apex_dir.join("prompts"),
             working_memory: apex_dir.join("memory").join("working"),
             skills_dir: long_term_dir.join("skills"),
+            authored_skills_dir: apex_dir.join("skills"),
+            shared_skills_dir: root.join(".agents").join("skills"),
             long_term_dir,
             scratch_dir: apex_dir.join("scratch"),
             tools_dir: apex_dir.join("tools"),
@@ -114,6 +118,9 @@ impl ProjectPaths {
             .context("failed to create .apex/memory/long-term/ directory")?;
         std::fs::create_dir_all(&self.skills_dir)
             .context("failed to create .apex/memory/long-term/skills/ directory")?;
+        std::fs::create_dir_all(&self.authored_skills_dir)
+            .context("failed to create .apex/skills/ directory")?;
+        // .agents/skills/ is only created on demand (cross-client interop)
         std::fs::create_dir_all(&self.scratch_dir)
             .context("failed to create .apex/scratch/ directory")?;
         std::fs::create_dir_all(self.tools_dir.join("custom"))

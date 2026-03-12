@@ -1,3 +1,6 @@
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -291,37 +294,70 @@ impl std::fmt::Display for SkillStatus {
     }
 }
 
+/// YAML frontmatter for agentskills.io spec-compliant SKILL.md files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SkillFrontmatter {
+    name: String,
+    description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    license: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compatibility: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    metadata: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "allowed-tools"
+    )]
+    allowed_tools: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
-    pub id: SkillId,
+    // Spec fields (in frontmatter)
     pub name: String,
     pub description: String,
+    pub license: Option<String>,
+    pub compatibility: Option<String>,
+    pub allowed_tools: Option<String>,
+    /// Non-apex metadata from other clients, preserved on round-trip.
+    #[serde(default)]
+    pub extra_metadata: BTreeMap<String, String>,
+
+    // Operational fields (stored in metadata.apex-* keys)
+    pub id: SkillId,
     pub task_pattern: String,
+    /// Freeform body content (per agentskills.io spec, no format restrictions).
     pub approach: String,
     pub tools_used: Vec<String>,
-    pub criteria_template: Option<String>,
     pub success_count: u32,
     pub failure_count: u32,
     pub fitness: f64,
     pub min_samples: u32,
     pub last_used: String,
-    pub notes: String,
     #[serde(default = "default_skill_status")]
     pub status: SkillStatus,
+    /// Path to the skill directory (set on load, not serialized).
+    #[serde(skip)]
+    pub skill_dir: Option<PathBuf>,
 }
 
 fn default_skill_status() -> SkillStatus {
     SkillStatus::Active
 }
 
-/// Convert a task_pattern into a filename-safe slug.
+/// Convert a string into an agentskills.io spec-compliant name.
+///
+/// Constraints: lowercase alphanumeric + hyphens only, no consecutive hyphens,
+/// no leading/trailing hyphens, max 64 chars (truncated at word boundary).
 pub fn slugify(s: &str) -> String {
     let lower = s.to_lowercase();
     let slug: String = lower
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    // Collapse consecutive dashes and trim
+    // Collapse consecutive dashes and trim leading/trailing
     let mut result = String::new();
     let mut prev_dash = false;
     for c in slug.chars() {
@@ -335,13 +371,25 @@ pub fn slugify(s: &str) -> String {
             prev_dash = false;
         }
     }
-    result.trim_end_matches('-').to_string()
+    let result = result.trim_end_matches('-').to_string();
+
+    // Enforce max 64 chars, truncating at word (hyphen) boundary
+    if result.len() <= 64 {
+        return result;
+    }
+    let truncated = &result[..64];
+    match truncated.rfind('-') {
+        Some(pos) if pos > 0 => truncated[..pos].to_string(),
+        _ => truncated.to_string(),
+    }
 }
 
 impl Skill {
-    /// Serialize this skill to a markdown file with YAML frontmatter.
+    /// Serialize this skill to an agentskills.io spec-compliant SKILL.md file.
+    ///
+    /// Operational fields are stored in the `metadata` map with `apex-` prefix.
+    /// Body preserves the structured section format.
     pub fn to_markdown(&self) -> String {
-        let tools_str = format!("[{}]", self.tools_used.join(", "));
         let name = if self.name.is_empty() {
             slugify(&self.task_pattern)
         } else {
@@ -352,53 +400,49 @@ impl Skill {
         } else {
             self.description.clone()
         };
-        let mut out = format!(
-            "---\n\
-             name: {}\n\
-             description: \"{}\"\n\
-             id: {}\n\
-             task_pattern: \"{}\"\n\
-             tools_used: {}\n\
-             success_count: {}\n\
-             failure_count: {}\n\
-             fitness: {:.2}\n\
-             min_samples: {}\n\
-             last_used: \"{}\"\n\
-             status: {}\n\
-             ---\n\n",
-            name,
-            description.replace('"', "\\\""),
-            self.id.0,
-            self.task_pattern.replace('"', "\\\""),
-            tools_str,
-            self.success_count,
-            self.failure_count,
-            self.fitness,
-            self.min_samples,
-            self.last_used,
-            self.status,
+
+        // Build metadata map: apex-* operational fields + any extra metadata
+        let mut metadata = self.extra_metadata.clone();
+        metadata.insert("apex-id".to_string(), self.id.0.clone());
+        metadata.insert("apex-task-pattern".to_string(), self.task_pattern.clone());
+        if !self.tools_used.is_empty() {
+            metadata.insert("apex-tools-used".to_string(), self.tools_used.join(", "));
+        }
+        metadata.insert(
+            "apex-success-count".to_string(),
+            self.success_count.to_string(),
         );
+        metadata.insert(
+            "apex-failure-count".to_string(),
+            self.failure_count.to_string(),
+        );
+        metadata.insert("apex-fitness".to_string(), format!("{:.2}", self.fitness));
+        metadata.insert("apex-min-samples".to_string(), self.min_samples.to_string());
+        metadata.insert("apex-last-used".to_string(), self.last_used.clone());
+        metadata.insert("apex-status".to_string(), self.status.to_string());
 
-        out.push_str("## Approach\n\n");
+        let frontmatter = SkillFrontmatter {
+            name,
+            description,
+            license: self.license.clone(),
+            compatibility: self.compatibility.clone(),
+            metadata,
+            allowed_tools: self.allowed_tools.clone(),
+        };
+
+        let yaml = yaml_serde::to_string(&frontmatter).unwrap_or_default();
+        let mut out = format!("---\n{yaml}---\n\n");
+
         out.push_str(&self.approach);
-        out.push_str("\n\n");
-
-        if let Some(ref criteria) = self.criteria_template {
-            out.push_str("## Acceptance Criteria\n\n");
-            out.push_str(criteria);
-            out.push_str("\n\n");
-        }
-
-        if !self.notes.is_empty() {
-            out.push_str("## Notes\n\n");
-            out.push_str(&self.notes);
-            out.push('\n');
-        }
+        out.push('\n');
 
         out
     }
 
-    /// Parse a skill from a markdown file with YAML frontmatter.
+    /// Parse a skill from a SKILL.md file with YAML frontmatter.
+    ///
+    /// Supports both the agentskills.io spec format (metadata map with `apex-*` keys)
+    /// and the legacy Apex format (flat frontmatter keys) for backward compatibility.
     pub fn from_markdown(md: &str) -> Result<Self, String> {
         // Split frontmatter from body
         let md = md.trim_start();
@@ -409,120 +453,32 @@ impl Skill {
         let end = after_first
             .find("\n---")
             .ok_or("missing closing frontmatter delimiter")?;
-        let frontmatter = &after_first[..end];
+        let frontmatter_str = &after_first[..end];
         let body = &after_first[end + 4..]; // skip "\n---"
 
-        // Parse frontmatter key-value pairs
-        let mut id = String::new();
-        let mut name = String::new();
-        let mut description = String::new();
-        let mut task_pattern = String::new();
-        let mut tools_used: Vec<String> = Vec::new();
-        let mut success_count: u32 = 0;
-        let mut failure_count: u32 = 0;
-        let mut fitness: f64 = 0.0;
-        let mut min_samples: u32 = 3;
-        let mut last_used = String::new();
-        let mut status = SkillStatus::Active;
+        // Parse YAML frontmatter via yaml_serde
+        let fm = yaml_serde::from_str::<SkillFrontmatter>(frontmatter_str)
+            .map_err(|e| format!("invalid YAML frontmatter: {e}"))?;
+        let (
+            mut name,
+            mut description,
+            license,
+            compatibility,
+            allowed_tools,
+            id,
+            task_pattern,
+            tools_used,
+            success_count,
+            failure_count,
+            fitness,
+            min_samples,
+            last_used,
+            status,
+            extra_metadata,
+        ) = Self::extract_from_spec_frontmatter(fm);
 
-        for line in frontmatter.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Some((key, value)) = line.split_once(':') {
-                let key = key.trim();
-                let value = value.trim().trim_matches('"');
-                match key {
-                    "id" => id = value.to_string(),
-                    "name" => name = value.to_string(),
-                    "description" => description = value.replace("\\\"", "\""),
-                    "task_pattern" => task_pattern = value.replace("\\\"", "\""),
-                    "tools_used" => {
-                        // Parse "[bash, shell_exec]"
-                        let inner = value.trim_start_matches('[').trim_end_matches(']');
-                        if !inner.is_empty() {
-                            tools_used = inner
-                                .split(',')
-                                .map(|s| s.trim().trim_matches('"').to_string())
-                                .filter(|s| !s.is_empty())
-                                .collect();
-                        }
-                    }
-                    "success_count" => success_count = value.parse().unwrap_or(0),
-                    "failure_count" => failure_count = value.parse().unwrap_or(0),
-                    "fitness" => fitness = value.parse().unwrap_or(0.0),
-                    "min_samples" => min_samples = value.parse().unwrap_or(3),
-                    "last_used" => last_used = value.to_string(),
-                    "status" => {
-                        status = match value {
-                            "retired" => SkillStatus::Retired,
-                            _ => SkillStatus::Active,
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if id.is_empty() {
-            return Err("missing id in frontmatter".to_string());
-        }
-
-        // Parse body sections
-        let mut approach = String::new();
-        let mut criteria_template: Option<String> = None;
-        let mut notes = String::new();
-
-        #[derive(PartialEq)]
-        enum Section {
-            None,
-            Approach,
-            Criteria,
-            Notes,
-        }
-        let mut section = Section::None;
-
-        for line in body.lines() {
-            if line.starts_with("## Approach") {
-                section = Section::Approach;
-                continue;
-            }
-            if line.starts_with("## Acceptance Criteria") {
-                section = Section::Criteria;
-                criteria_template = Some(String::new());
-                continue;
-            }
-            if line.starts_with("## Notes") {
-                section = Section::Notes;
-                continue;
-            }
-            fn append_line(buf: &mut String, line: &str) {
-                if !buf.is_empty() || !line.is_empty() {
-                    if !buf.is_empty() {
-                        buf.push('\n');
-                    }
-                    buf.push_str(line);
-                }
-            }
-            match section {
-                Section::Approach => append_line(&mut approach, line),
-                Section::Criteria => {
-                    if let Some(ref mut c) = criteria_template {
-                        append_line(c, line);
-                    }
-                }
-                Section::Notes => append_line(&mut notes, line),
-                Section::None => {}
-            }
-        }
-
-        // Trim trailing whitespace from parsed sections
-        let approach = approach.trim_end().to_string();
-        let criteria_template = criteria_template
-            .map(|c| c.trim_end().to_string())
-            .filter(|c| !c.is_empty());
-        let notes = notes.trim_end().to_string();
+        // Body is freeform markdown per agentskills.io spec
+        let approach = body.trim().to_string();
 
         // Derive name/description from task_pattern for backward compat
         if name.is_empty() {
@@ -533,22 +489,143 @@ impl Skill {
         }
 
         Ok(Skill {
-            id: SkillId(id),
             name,
             description,
+            license,
+            compatibility,
+            allowed_tools,
+            extra_metadata,
+            id: SkillId(id),
             task_pattern,
             approach,
             tools_used,
-            criteria_template,
             success_count,
             failure_count,
             fitness,
             min_samples,
             last_used,
-            notes,
             status,
+            skill_dir: None,
         })
     }
+
+    /// Extract operational fields from spec-compliant frontmatter with `metadata.apex-*` keys.
+    #[allow(clippy::type_complexity)]
+    fn extract_from_spec_frontmatter(
+        fm: SkillFrontmatter,
+    ) -> (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        Vec<String>,
+        u32,
+        u32,
+        f64,
+        u32,
+        String,
+        SkillStatus,
+        BTreeMap<String, String>,
+    ) {
+        let id = fm.metadata.get("apex-id").cloned().unwrap_or_default();
+        let task_pattern = fm
+            .metadata
+            .get("apex-task-pattern")
+            .cloned()
+            .unwrap_or_else(|| fm.description.clone());
+        let tools_used = fm
+            .metadata
+            .get("apex-tools-used")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let success_count = fm
+            .metadata
+            .get("apex-success-count")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let failure_count = fm
+            .metadata
+            .get("apex-failure-count")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let fitness = fm
+            .metadata
+            .get("apex-fitness")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        let min_samples = fm
+            .metadata
+            .get("apex-min-samples")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let last_used = fm
+            .metadata
+            .get("apex-last-used")
+            .cloned()
+            .unwrap_or_default();
+        let status = match fm.metadata.get("apex-status").map(|s| s.as_str()) {
+            Some("retired") => SkillStatus::Retired,
+            _ => SkillStatus::Active,
+        };
+
+        // Preserve non-apex metadata keys
+        let extra_metadata: BTreeMap<String, String> = fm
+            .metadata
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with("apex-"))
+            .collect();
+
+        (
+            fm.name,
+            fm.description,
+            fm.license,
+            fm.compatibility,
+            fm.allowed_tools,
+            id,
+            task_pattern,
+            tools_used,
+            success_count,
+            failure_count,
+            fitness,
+            min_samples,
+            last_used,
+            status,
+            extra_metadata,
+        )
+    }
+}
+
+/// List resource files in a skill's optional subdirectories (scripts/, references/, assets/).
+///
+/// Returns a map of directory name to relative file paths within that directory.
+pub fn list_skill_resources(skill_dir: &std::path::Path) -> HashMap<String, Vec<String>> {
+    let mut resources = HashMap::new();
+    for subdir in &["scripts", "references", "assets"] {
+        if let Ok(entries) = std::fs::read_dir(skill_dir.join(subdir)) {
+            let mut files: Vec<String> = entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
+                .filter_map(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|name| format!("{subdir}/{name}"))
+                })
+                .collect();
+            files.sort();
+            if !files.is_empty() {
+                resources.insert(subdir.to_string(), files);
+            }
+        }
+    }
+    resources
 }
 
 // ── Working Memory types ──────────────────────────────────────────
@@ -1480,5 +1557,148 @@ mod tests {
         assert!(pad.status_summary.is_empty());
         assert!(pad.notes.is_empty());
         assert!(pad.log.is_empty());
+    }
+
+    // ── Skill spec-compliant format ─────────────────────────────────
+
+    #[test]
+    fn skill_round_trip_spec_format() {
+        let skill = Skill {
+            name: "deploy-app".to_string(),
+            description: "Deploy app to production".to_string(),
+            license: Some("MIT".to_string()),
+            compatibility: None,
+            allowed_tools: Some("shell_exec, file_read".to_string()),
+            extra_metadata: BTreeMap::from([("custom-key".to_string(), "custom-val".to_string())]),
+            id: SkillId("skill-abc123".to_string()),
+            task_pattern: "deploy app to production".to_string(),
+            approach: "1. Run tests\n2. Build release".to_string(),
+            tools_used: vec!["shell_exec".to_string(), "file_read".to_string()],
+            success_count: 5,
+            failure_count: 1,
+            fitness: 0.83,
+            min_samples: 3,
+            last_used: "1707123456".to_string(),
+            status: SkillStatus::Active,
+            skill_dir: None,
+        };
+
+        let md = skill.to_markdown();
+        assert!(md.starts_with("---\n"));
+        assert!(md.contains("name: deploy-app"));
+        assert!(md.contains("apex-id: skill-abc123"));
+        assert!(md.contains("apex-task-pattern: deploy app to production"));
+        assert!(md.contains("custom-key: custom-val"));
+        assert!(md.contains("license: MIT"));
+
+        let parsed = Skill::from_markdown(&md).unwrap();
+        assert_eq!(parsed.name, "deploy-app");
+        assert_eq!(parsed.description, "Deploy app to production");
+        assert_eq!(parsed.license, Some("MIT".to_string()));
+        assert_eq!(parsed.id.0, "skill-abc123");
+        assert_eq!(parsed.task_pattern, "deploy app to production");
+        assert_eq!(parsed.tools_used, vec!["shell_exec", "file_read"]);
+        assert_eq!(parsed.success_count, 5);
+        assert_eq!(parsed.failure_count, 1);
+        assert!((parsed.fitness - 0.83).abs() < 0.01);
+        assert_eq!(parsed.approach, "1. Run tests\n2. Build release");
+        assert_eq!(parsed.status, SkillStatus::Active);
+        assert_eq!(
+            parsed.extra_metadata.get("custom-key").unwrap(),
+            "custom-val"
+        );
+    }
+
+    #[test]
+    fn skill_freeform_body_round_trip() {
+        let freeform_body = "# Getting Started\n\nRun `cargo build` first.\n\n## Tips\n\n- Use `--release` for production\n- Check logs in `/var/log`";
+        let skill = Skill {
+            name: "freeform-skill".to_string(),
+            description: "A skill with freeform body".to_string(),
+            license: None,
+            compatibility: None,
+            allowed_tools: None,
+            extra_metadata: Default::default(),
+            id: SkillId("skill-free".to_string()),
+            task_pattern: "freeform task".to_string(),
+            approach: freeform_body.to_string(),
+            tools_used: vec![],
+            success_count: 0,
+            failure_count: 0,
+            fitness: 0.5,
+            min_samples: 3,
+            last_used: String::new(),
+            status: SkillStatus::Active,
+            skill_dir: None,
+        };
+
+        let md = skill.to_markdown();
+        let parsed = Skill::from_markdown(&md).unwrap();
+        assert_eq!(parsed.approach, freeform_body);
+    }
+
+    #[test]
+    fn skill_authored_no_apex_id() {
+        let authored = "\
+---
+name: my-authored-skill
+description: An authored skill for testing
+---
+
+Just do the thing.
+";
+        let skill = Skill::from_markdown(authored).unwrap();
+        assert_eq!(skill.name, "my-authored-skill");
+        assert_eq!(skill.description, "An authored skill for testing");
+        assert!(skill.id.0.is_empty()); // no apex-id
+        assert_eq!(skill.task_pattern, "An authored skill for testing"); // derived from description
+        assert_eq!(skill.approach, "Just do the thing.");
+    }
+
+    // ── slugify spec compliance ─────────────────────────────────────
+
+    #[test]
+    fn slugify_basic() {
+        assert_eq!(slugify("Deploy App"), "deploy-app");
+        assert_eq!(slugify("hello   world"), "hello-world");
+        assert_eq!(slugify("--leading--trailing--"), "leading-trailing");
+    }
+
+    #[test]
+    fn slugify_max_64_chars() {
+        let long = "a".repeat(100);
+        let result = slugify(&long);
+        assert!(result.len() <= 64);
+    }
+
+    #[test]
+    fn slugify_truncates_at_word_boundary() {
+        // 65 chars with a hyphen near the boundary
+        let input = format!("{}-{}", "a".repeat(50), "b".repeat(14));
+        let result = slugify(&input);
+        assert!(result.len() <= 64);
+        assert!(!result.ends_with('-'));
+    }
+
+    #[test]
+    fn slugify_no_consecutive_hyphens() {
+        let result = slugify("hello---world");
+        assert!(!result.contains("--"));
+    }
+
+    #[test]
+    fn skill_empty_body() {
+        let md = "---\nname: empty\ndescription: No body\n---\n";
+        let skill = Skill::from_markdown(md).unwrap();
+        assert_eq!(skill.approach, "");
+    }
+
+    #[test]
+    fn skill_body_with_horizontal_rule() {
+        let md = "---\nname: hr-test\ndescription: Body has hr\n---\n\nBefore rule\n\n---\n\nAfter rule\n";
+        let skill = Skill::from_markdown(md).unwrap();
+        assert!(skill.approach.contains("Before rule"));
+        assert!(skill.approach.contains("---"));
+        assert!(skill.approach.contains("After rule"));
     }
 }

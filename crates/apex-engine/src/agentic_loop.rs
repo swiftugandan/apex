@@ -112,12 +112,14 @@ async fn maybe_compact(messages: &mut Vec<ChatMessage>, config: &LoopConfig<'_>)
                     let p = path.display();
                     dispatch_log(
                         config.hooks,
-                        || serde_json::json!({
-                            "level": "info",
-                            "event": "compaction_spill",
-                            "messages": msg_count,
-                            "path": p.to_string(),
-                        }),
+                        || {
+                            serde_json::json!({
+                                "level": "info",
+                                "event": "compaction_spill",
+                                "messages": msg_count,
+                                "path": p.to_string(),
+                            })
+                        },
                         &format!("  spilled {msg_count} messages to {p}"),
                     )
                     .await;
@@ -774,7 +776,10 @@ mod tests {
                 }],
             },
             tool_calls: vec![],
-            usage: apex_core::domain::TokenUsage { input_tokens: 100, output_tokens: 30 },
+            usage: apex_core::domain::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 30,
+            },
             stop_reason: apex_core::domain::StopReason::EndTurn,
         });
         let llm = MockLlmProvider::new(vec![summary_response]).with_context_window(200);
@@ -788,12 +793,19 @@ mod tests {
         let compacted = maybe_compact(&mut msgs, &cfg).await;
 
         assert!(compacted, "should have triggered compaction");
-        assert!(msgs.len() < original_len, "compacted messages should be shorter");
+        assert!(
+            msgs.len() < original_len,
+            "compacted messages should be shorter"
+        );
         assert_eq!(msgs[0].text(), "Original task description");
         assert_eq!(msgs[1].role, MessageRole::Assistant);
         assert!(msgs[1].text().contains("compacted"));
         for i in 1..msgs.len() {
-            assert_ne!(msgs[i].role, msgs[i - 1].role, "alternation violated at index {i}");
+            assert_ne!(
+                msgs[i].role,
+                msgs[i - 1].role,
+                "alternation violated at index {i}"
+            );
         }
     }
 
@@ -808,7 +820,9 @@ mod tests {
             ChatMessage::user_text("Hi"),
             ChatMessage {
                 role: MessageRole::Assistant,
-                content: vec![ContentBlock::Text { text: "Hello".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "Hello".into(),
+                }],
             },
             ChatMessage::user_text("How are you?"),
         ];
@@ -831,13 +845,19 @@ mod tests {
                 }],
             },
             tool_calls: vec![],
-            usage: apex_core::domain::TokenUsage { input_tokens: 80, output_tokens: 20 },
+            usage: apex_core::domain::TokenUsage {
+                input_tokens: 80,
+                output_tokens: 20,
+            },
             stop_reason: apex_core::domain::StopReason::EndTurn,
         });
         let llm = MockLlmProvider::new(vec![summary_response]).with_context_window(200);
         let tools = MockToolRegistry::echo("t");
         let estimator = default_estimator();
-        let compaction = CompactionSection { preserve_turns: 2, ..test_compaction() };
+        let compaction = CompactionSection {
+            preserve_turns: 2,
+            ..test_compaction()
+        };
         let cfg = compact_test_config(&llm, &tools, &estimator, compaction, None);
 
         let mut msgs = messages.clone();
@@ -846,7 +866,10 @@ mod tests {
         assert!(compacted);
         let compacted_tail = &msgs[2..];
         let original_tail = &messages[messages.len() - compacted_tail.len()..];
-        assert!(!compacted_tail.is_empty(), "should have preserved at least some recent turns");
+        assert!(
+            !compacted_tail.is_empty(),
+            "should have preserved at least some recent turns"
+        );
         for (i, (orig, comp)) in original_tail.iter().zip(compacted_tail.iter()).enumerate() {
             assert_eq!(orig.role, comp.role, "tail message {i} role mismatch");
             assert_eq!(orig.text(), comp.text(), "tail message {i} text mismatch");
@@ -938,7 +961,10 @@ mod tests {
                 }],
             },
             tool_calls: vec![],
-            usage: apex_core::domain::TokenUsage { input_tokens: 100, output_tokens: 30 },
+            usage: apex_core::domain::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 30,
+            },
             stop_reason: apex_core::domain::StopReason::EndTurn,
         });
         let llm = MockLlmProvider::new(vec![summary_response]).with_context_window(200);
@@ -946,9 +972,16 @@ mod tests {
         let estimator = default_estimator();
 
         let tmp = tempfile::tempdir().unwrap();
-        let compaction = CompactionSection { spill_history: true, ..test_compaction() };
+        let compaction = CompactionSection {
+            spill_history: true,
+            ..test_compaction()
+        };
         let cfg = compact_test_config(
-            &llm, &tools, &estimator, compaction, Some(tmp.path().to_path_buf()),
+            &llm,
+            &tools,
+            &estimator,
+            compaction,
+            Some(tmp.path().to_path_buf()),
         );
 
         let mut msgs = messages.clone();
@@ -974,7 +1007,8 @@ mod tests {
         for (i, (orig, spilled)) in messages.iter().zip(deserialized.iter()).enumerate() {
             assert_eq!(orig.role, spilled.role, "role mismatch at index {i}");
             assert_eq!(
-                orig.content.len(), spilled.content.len(),
+                orig.content.len(),
+                spilled.content.len(),
                 "content block count mismatch at index {i}"
             );
             for (j, (ob, sb)) in orig.content.iter().zip(spilled.content.iter()).enumerate() {
@@ -983,20 +1017,48 @@ mod tests {
                         assert_eq!(a, b, "text mismatch at msg {i} block {j}");
                     }
                     (
-                        ContentBlock::ToolUse { id: a_id, name: a_name, input: a_input },
-                        ContentBlock::ToolUse { id: b_id, name: b_name, input: b_input },
+                        ContentBlock::ToolUse {
+                            id: a_id,
+                            name: a_name,
+                            input: a_input,
+                        },
+                        ContentBlock::ToolUse {
+                            id: b_id,
+                            name: b_name,
+                            input: b_input,
+                        },
                     ) => {
                         assert_eq!(a_id, b_id, "tool_use id mismatch at msg {i} block {j}");
-                        assert_eq!(a_name, b_name, "tool_use name mismatch at msg {i} block {j}");
-                        assert_eq!(a_input, b_input, "tool_use input mismatch at msg {i} block {j}");
+                        assert_eq!(
+                            a_name, b_name,
+                            "tool_use name mismatch at msg {i} block {j}"
+                        );
+                        assert_eq!(
+                            a_input, b_input,
+                            "tool_use input mismatch at msg {i} block {j}"
+                        );
                     }
                     (
-                        ContentBlock::ToolResult { tool_use_id: a_id, content: a_c, is_error: a_e },
-                        ContentBlock::ToolResult { tool_use_id: b_id, content: b_c, is_error: b_e },
+                        ContentBlock::ToolResult {
+                            tool_use_id: a_id,
+                            content: a_c,
+                            is_error: a_e,
+                        },
+                        ContentBlock::ToolResult {
+                            tool_use_id: b_id,
+                            content: b_c,
+                            is_error: b_e,
+                        },
                     ) => {
                         assert_eq!(a_id, b_id, "tool_result id mismatch at msg {i} block {j}");
-                        assert_eq!(a_c, b_c, "tool_result content mismatch at msg {i} block {j}");
-                        assert_eq!(a_e, b_e, "tool_result is_error mismatch at msg {i} block {j}");
+                        assert_eq!(
+                            a_c, b_c,
+                            "tool_result content mismatch at msg {i} block {j}"
+                        );
+                        assert_eq!(
+                            a_e, b_e,
+                            "tool_result is_error mismatch at msg {i} block {j}"
+                        );
                     }
                     _ => panic!("content block variant mismatch at msg {i} block {j}"),
                 }
@@ -1039,7 +1101,11 @@ mod tests {
             .iter()
             .filter(|tc| tc.output_summary == "BUDGET_EXCEEDED")
             .collect();
-        assert_eq!(budget_exceeded.len(), 3, "expected 3 budget-exceeded records");
+        assert_eq!(
+            budget_exceeded.len(),
+            3,
+            "expected 3 budget-exceeded records"
+        );
 
         assert!(matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "Done!"));
     }
@@ -1073,7 +1139,11 @@ mod tests {
 
         // Should have executed at most 3 tool calls total
         let executed = tools.calls.lock().await;
-        assert!(executed.len() <= 3, "expected at most 3 executed calls, got {}", executed.len());
+        assert!(
+            executed.len() <= 3,
+            "expected at most 3 executed calls, got {}",
+            executed.len()
+        );
     }
 
     #[tokio::test]
@@ -1100,7 +1170,11 @@ mod tests {
         let (turns, _outcome, _msgs) = run_agentic_loop(messages, &config).await;
 
         let executed = tools.calls.lock().await;
-        assert_eq!(executed.len(), 5, "expected 5 tool calls (capped by remaining budget)");
+        assert_eq!(
+            executed.len(),
+            5,
+            "expected 5 tool calls (capped by remaining budget)"
+        );
 
         // 3 excess should be budget-exceeded
         let budget_exceeded: Vec<_> = turns[0]

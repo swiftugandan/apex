@@ -45,7 +45,10 @@ fn assert_no_dependency(pkg_name: &str, forbidden: &str) {
 #[test]
 fn apex_core_has_no_apex_dependencies() {
     let deps = direct_deps("apex-core");
-    let violations: Vec<_> = deps.iter().filter(|d| d.starts_with("apex-") || d.starts_with("apex_")).collect();
+    let violations: Vec<_> = deps
+        .iter()
+        .filter(|d| d.starts_with("apex-") || d.starts_with("apex_"))
+        .collect();
     assert!(
         violations.is_empty(),
         "apex-core must have zero apex-* dependencies, but found: {violations:?}"

@@ -354,7 +354,14 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
             .context("failed to open long-term memory database")?,
     );
 
-    let skills: Arc<dyn SkillStore> = Arc::new(FsSkillStore::new(paths.skills_dir.clone()));
+    let skills: Arc<dyn SkillStore> = Arc::new(FsSkillStore::with_dirs(
+        vec![
+            paths.shared_skills_dir.clone(),
+            paths.authored_skills_dir.clone(),
+            paths.skills_dir.clone(),
+        ],
+        paths.skills_dir.clone(),
+    ));
 
     let calibration = long_term.load_calibration().await.unwrap_or_default();
     let estimator = Arc::new(Mutex::new(TokenEstimator::new(calibration)));
@@ -540,7 +547,14 @@ async fn cmd_memory_facts() -> Result<()> {
 
 async fn cmd_memory_skills() -> Result<()> {
     let paths = ProjectPaths::resolve()?;
-    let skill_store = FsSkillStore::new(paths.skills_dir.clone());
+    let skill_store = FsSkillStore::with_dirs(
+        vec![
+            paths.shared_skills_dir.clone(),
+            paths.authored_skills_dir.clone(),
+            paths.skills_dir.clone(),
+        ],
+        paths.skills_dir.clone(),
+    );
     let skills = skill_store
         .list_skills(100)
         .await

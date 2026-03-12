@@ -23,6 +23,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "io-std", "io-util", "sync", "time"] }
 tokio-util = "0.7"
 regex = "1"
+yaml_serde = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [profile.release]

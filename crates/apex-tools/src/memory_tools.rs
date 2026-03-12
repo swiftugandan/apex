@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use apex_core::domain::{
-    slugify, Fact, FactId, Skill, SkillId, SkillStatus, SubtaskEntry, SubtaskStatus, ToolCall,
-    ToolDef, ToolResult, ToolSchema,
+    list_skill_resources, slugify, Fact, FactId, Skill, SkillId, SkillStatus, SubtaskEntry,
+    SubtaskStatus, ToolCall, ToolDef, ToolResult, ToolSchema,
 };
 use apex_core::error::ToolError;
 use apex_core::ports::{MemoryStore, SkillStore, ToolRegistry, WorkingMemory};
@@ -180,14 +180,6 @@ impl ToolRegistry for MemoryToolRegistry {
                                 "items": { "type": "string" },
                                 "description": "List of tools used in this approach"
                             },
-                            "criteria_template": {
-                                "type": "string",
-                                "description": "Optional acceptance criteria template for this task type"
-                            },
-                            "notes": {
-                                "type": "string",
-                                "description": "Additional notes about this skill"
-                            }
                         },
                         "required": ["task_pattern", "approach"]
                     }),
@@ -432,18 +424,6 @@ impl MemoryToolRegistry {
                     .collect()
             })
             .unwrap_or_default();
-        let criteria_template = call
-            .input
-            .get("criteria_template")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let notes = call
-            .input
-            .get("notes")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
         let name = call
             .input
             .get("name")
@@ -461,17 +441,20 @@ impl MemoryToolRegistry {
             id: SkillId(String::new()),
             name,
             description,
+            license: None,
+            compatibility: None,
+            allowed_tools: None,
+            extra_metadata: Default::default(),
             task_pattern: task_pattern.to_string(),
             approach: approach.to_string(),
             tools_used,
-            criteria_template,
             success_count: 0,
             failure_count: 0,
             fitness: 0.5,
             min_samples: 3,
             last_used: String::new(),
-            notes,
             status: SkillStatus::Active,
+            skill_dir: None,
         };
 
         let id = self
@@ -501,19 +484,28 @@ impl MemoryToolRegistry {
             .map_err(|e| ToolError::Execution(e.to_string()))?;
 
         let output = match skill {
-            Some(s) => json!({
-                "found": true,
-                "id": s.id.0,
-                "name": s.name,
-                "description": s.description,
-                "task_pattern": s.task_pattern,
-                "approach": s.approach,
-                "tools_used": s.tools_used,
-                "criteria_template": s.criteria_template,
-                "fitness": format!("{:.2}", s.fitness),
-                "success_count": s.success_count,
-                "failure_count": s.failure_count,
-            }),
+            Some(s) => {
+                let resources = s
+                    .skill_dir
+                    .as_ref()
+                    .map(|dir| list_skill_resources(dir))
+                    .unwrap_or_default();
+                json!({
+                    "found": true,
+                    "id": s.id.0,
+                    "name": s.name,
+                    "description": s.description,
+                    "task_pattern": s.task_pattern,
+                    "approach": s.approach,
+                    "tools_used": s.tools_used,
+                    "fitness": format!("{:.2}", s.fitness),
+                    "success_count": s.success_count,
+                    "failure_count": s.failure_count,
+                    "license": s.license,
+                    "compatibility": s.compatibility,
+                    "resources": resources,
+                })
+            }
             None => json!({ "found": false }),
         };
 

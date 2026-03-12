@@ -277,9 +277,7 @@ async fn execute_claim(
         LoopOutcome::TimedOut => Some("loop timeout exceeded".to_string()),
         LoopOutcome::Cancelled => Some("cancelled".to_string()),
         LoopOutcome::BlockedByHook(msg) => Some(format!("blocked by hook: {msg}")),
-        LoopOutcome::ToolCallBudgetExhausted => {
-            Some("tool call budget exhausted".to_string())
-        }
+        LoopOutcome::ToolCallBudgetExhausted => Some("tool call budget exhausted".to_string()),
         LoopOutcome::Completed(_) | LoopOutcome::MaxTurnsExhausted => None,
     };
     if let Some(reason) = failure_reason {

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -7,23 +8,50 @@ use apex_core::domain::{slugify, Skill, SkillId, SkillStatus};
 use apex_core::error::MemoryError;
 use apex_core::ports::SkillStore;
 
+/// Multi-directory skill store supporting agentskills.io discovery.
+///
+/// Scans directories in precedence order:
+/// 1. `.agents/skills/` (cross-client interop, highest priority)
+/// 2. `.apex/skills/` (client-specific authored skills)
+/// 3. `.apex/memory/long-term/skills/` (learned skills)
+///
+/// Name collisions: first-found wins.
+/// Writes always go to the learned-skills directory (last in the list).
 pub struct FsSkillStore {
-    dir: PathBuf,
+    /// Directories to scan, in precedence order (first = highest priority).
+    scan_dirs: Vec<PathBuf>,
+    /// Directory for writing learned skills (always the last scan dir).
+    write_dir: PathBuf,
     cache: Mutex<Option<Arc<Vec<Skill>>>>,
     auto_retire_below: f64,
 }
 
 impl FsSkillStore {
+    /// Create a store that only scans a single directory (backward compatible).
     pub fn new(dir: PathBuf) -> Self {
         Self {
-            dir,
+            write_dir: dir.clone(),
+            scan_dirs: vec![dir],
             cache: Mutex::new(None),
             auto_retire_below: 0.2,
         }
     }
 
-    fn ensure_dir(&self) -> Result<(), MemoryError> {
-        std::fs::create_dir_all(&self.dir)
+    /// Create a store that scans multiple directories with precedence.
+    ///
+    /// `scan_dirs` are ordered by priority (first = highest).
+    /// `write_dir` is where learned skills are stored (typically the last scan dir).
+    pub fn with_dirs(scan_dirs: Vec<PathBuf>, write_dir: PathBuf) -> Self {
+        Self {
+            scan_dirs,
+            write_dir,
+            cache: Mutex::new(None),
+            auto_retire_below: 0.2,
+        }
+    }
+
+    fn ensure_write_dir(&self) -> Result<(), MemoryError> {
+        std::fs::create_dir_all(&self.write_dir)
             .map_err(|e| MemoryError::Database(format!("failed to create skills dir: {e}")))?;
         Ok(())
     }
@@ -34,20 +62,14 @@ impl FsSkillStore {
         }
     }
 
-    fn load_all(&self) -> Result<Arc<Vec<Skill>>, MemoryError> {
-        // Check cache first
-        if let Ok(cache) = self.cache.lock() {
-            if let Some(ref cached) = *cache {
-                return Ok(Arc::clone(cached));
-            }
-        }
-
-        self.ensure_dir()?;
+    /// Scan a single directory for skills.
+    fn scan_dir(dir: &PathBuf) -> Vec<Skill> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
 
         let mut results = Vec::new();
-        let entries = std::fs::read_dir(&self.dir)
-            .map_err(|e| MemoryError::Database(format!("failed to read skills dir: {e}")))?;
-
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_dir() {
@@ -59,13 +81,47 @@ impl FsSkillStore {
                 Err(_) => continue,
             };
             match Skill::from_markdown(&content) {
-                Ok(skill) => results.push(skill),
+                Ok(mut skill) => {
+                    // Authored skills (no apex-id) get sensible defaults
+                    if skill.id.0.is_empty() {
+                        skill.id = SkillId(format!("skill-{}", skill.name));
+                        skill.fitness = 1.0; // authored skills always preferred
+                        if skill.task_pattern.is_empty() {
+                            skill.task_pattern = skill.description.clone();
+                        }
+                    }
+                    skill.skill_dir = Some(path.clone());
+                    results.push(skill);
+                }
                 Err(_) => continue,
+            }
+        }
+        results
+    }
+
+    fn load_all(&self) -> Result<Arc<Vec<Skill>>, MemoryError> {
+        // Check cache first
+        if let Ok(cache) = self.cache.lock() {
+            if let Some(ref cached) = *cache {
+                return Ok(Arc::clone(cached));
+            }
+        }
+
+        self.ensure_write_dir()?;
+
+        let mut results = Vec::new();
+        let mut seen_names = HashSet::new();
+
+        // Scan directories in precedence order; first-found wins on name collision
+        for dir in &self.scan_dirs {
+            for skill in Self::scan_dir(dir) {
+                if seen_names.insert(skill.name.clone()) {
+                    results.push(skill);
+                }
             }
         }
 
         let results = Arc::new(results);
-        // Populate cache
         if let Ok(mut cache) = self.cache.lock() {
             *cache = Some(Arc::clone(&results));
         }
@@ -74,13 +130,13 @@ impl FsSkillStore {
     }
 
     fn write_skill(&self, skill: &Skill) -> Result<PathBuf, MemoryError> {
-        self.ensure_dir()?;
+        self.ensure_write_dir()?;
         let name = if skill.name.is_empty() {
             slugify(&skill.task_pattern)
         } else {
             skill.name.clone()
         };
-        let skill_dir = self.dir.join(&name);
+        let skill_dir = self.write_dir.join(&name);
         std::fs::create_dir_all(&skill_dir)
             .map_err(|e| MemoryError::Database(format!("failed to create skill dir: {e}")))?;
         let path = skill_dir.join("SKILL.md");
@@ -204,17 +260,20 @@ mod tests {
             id: SkillId(String::new()),
             name: String::new(),
             description: String::new(),
+            license: None,
+            compatibility: None,
+            allowed_tools: None,
+            extra_metadata: Default::default(),
             task_pattern: pattern.to_string(),
             approach: "Test approach".to_string(),
             tools_used: vec!["bash".to_string()],
-            criteria_template: None,
             success_count: 0,
             failure_count: 0,
             fitness: 0.5,
             min_samples: 3,
             last_used: String::new(),
-            notes: String::new(),
             status: SkillStatus::Active,
+            skill_dir: None,
         }
     }
 
@@ -277,17 +336,20 @@ mod tests {
             id: SkillId("s-bad".to_string()),
             name: String::new(),
             description: String::new(),
+            license: None,
+            compatibility: None,
+            allowed_tools: None,
+            extra_metadata: Default::default(),
             task_pattern: "flaky task".to_string(),
             approach: "bad approach".to_string(),
             tools_used: vec![],
-            criteria_template: None,
             success_count: 0,
             failure_count: 0,
             fitness: 0.5,
             min_samples: 3,
             last_used: String::new(),
-            notes: String::new(),
             status: SkillStatus::Active,
+            skill_dir: None,
         };
         store.store_skill(skill).await.unwrap();
 
@@ -311,18 +373,102 @@ mod tests {
     #[tokio::test]
     async fn skill_file_is_readable_markdown() {
         let (_dir, store) = temp_skill_store();
-        let mut skill = make_skill("deploy app");
-        skill.notes = "Works on Linux.".to_string();
-        skill.criteria_template = Some("- command: `which app`\n  expect: exit_code 0".to_string());
+        let skill = make_skill("deploy app");
         store.store_skill(skill).await.unwrap();
 
-        // Read the file directly and verify it's valid markdown
-        let file_path = store.dir.join("deploy-app").join("SKILL.md");
+        // Read the file directly and verify it's valid spec-compliant markdown
+        let file_path = store.write_dir.join("deploy-app").join("SKILL.md");
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert!(content.starts_with("---"));
-        assert!(content.contains("task_pattern: \"deploy app\""));
-        assert!(content.contains("## Approach"));
-        assert!(content.contains("## Acceptance Criteria"));
-        assert!(content.contains("## Notes"));
+        assert!(content.contains("name: deploy-app"));
+        assert!(content.contains("apex-task-pattern: deploy app"));
+        assert!(content.contains("Test approach"));
+    }
+
+    #[tokio::test]
+    async fn multi_dir_discovery_with_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared_dir = dir.path().join("shared");
+        let authored_dir = dir.path().join("authored");
+        let learned_dir = dir.path().join("learned");
+
+        // Create an authored skill (no apex-id)
+        std::fs::create_dir_all(authored_dir.join("my-skill")).unwrap();
+        std::fs::write(
+            authored_dir.join("my-skill").join("SKILL.md"),
+            "---\nname: my-skill\ndescription: An authored skill\n---\n\nDo the thing.\n",
+        )
+        .unwrap();
+
+        // Create a learned skill with the same name (should be shadowed)
+        std::fs::create_dir_all(learned_dir.join("my-skill")).unwrap();
+        std::fs::write(
+            learned_dir.join("my-skill").join("SKILL.md"),
+            "---\nname: my-skill\ndescription: A learned skill\nmetadata:\n  apex-id: skill-123\n  apex-task-pattern: my task\n  apex-status: active\n  apex-fitness: '0.50'\n  apex-success-count: '2'\n  apex-failure-count: '1'\n  apex-min-samples: '3'\n  apex-last-used: '1234'\n---\n\nLearned approach.\n",
+        ).unwrap();
+
+        let store = FsSkillStore::with_dirs(
+            vec![shared_dir, authored_dir, learned_dir.clone()],
+            learned_dir,
+        );
+
+        let skills = store.list_skills(10).await.unwrap();
+        assert_eq!(skills.len(), 1);
+        // Authored skill wins (higher precedence directory)
+        assert_eq!(skills[0].description, "An authored skill");
+        assert_eq!(skills[0].fitness, 1.0); // authored skill default
+    }
+
+    #[tokio::test]
+    async fn authored_skill_gets_sensible_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        std::fs::create_dir_all(skills_dir.join("test-skill")).unwrap();
+        std::fs::write(
+            skills_dir.join("test-skill").join("SKILL.md"),
+            "---\nname: test-skill\ndescription: A test skill\n---\n\nDo stuff.\n",
+        )
+        .unwrap();
+
+        let store = FsSkillStore::new(skills_dir);
+        let skills = store.list_skills(10).await.unwrap();
+        assert_eq!(skills.len(), 1);
+        let s = &skills[0];
+        assert_eq!(s.id.0, "skill-test-skill");
+        assert_eq!(s.fitness, 1.0);
+        assert_eq!(s.task_pattern, "A test skill");
+        assert_eq!(s.success_count, 0);
+        assert_eq!(s.status, SkillStatus::Active);
+        assert!(s.skill_dir.is_some());
+    }
+
+    #[test]
+    fn list_skill_resources_finds_files() {
+        use apex_core::domain::list_skill_resources;
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("my-skill");
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+        std::fs::create_dir_all(skill_dir.join("assets")).unwrap();
+        std::fs::write(skill_dir.join("scripts").join("extract.py"), "# script").unwrap();
+        std::fs::write(skill_dir.join("references").join("REFERENCE.md"), "# ref").unwrap();
+        std::fs::write(skill_dir.join("assets").join("template.json"), "{}").unwrap();
+
+        let resources = list_skill_resources(&skill_dir);
+        assert_eq!(resources.len(), 3);
+        assert_eq!(resources["scripts"], vec!["scripts/extract.py"]);
+        assert_eq!(resources["references"], vec!["references/REFERENCE.md"]);
+        assert_eq!(resources["assets"], vec!["assets/template.json"]);
+    }
+
+    #[test]
+    fn list_skill_resources_empty_when_no_dirs() {
+        use apex_core::domain::list_skill_resources;
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("empty-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+
+        let resources = list_skill_resources(&skill_dir);
+        assert!(resources.is_empty());
     }
 }

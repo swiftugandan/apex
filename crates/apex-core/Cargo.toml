@@ -9,6 +9,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 toml = "0.8"
+yaml_serde.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]
