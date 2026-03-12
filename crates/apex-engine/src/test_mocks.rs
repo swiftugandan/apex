@@ -87,18 +87,27 @@ impl MockLlmProvider {
 
     /// Create a provider that returns a tool call followed by a text response.
     pub fn tool_then_text(tool_call: ToolCall, final_text: &str) -> Self {
+        Self::multi_tool_then_text(vec![tool_call], final_text)
+    }
+
+    /// Create a provider that returns multiple tool calls in one turn, then text.
+    pub fn multi_tool_then_text(calls: Vec<ToolCall>, final_text: &str) -> Self {
         let text = final_text.to_string();
+        let content: Vec<ContentBlock> = calls
+            .iter()
+            .map(|c| ContentBlock::ToolUse {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                input: c.input.clone(),
+            })
+            .collect();
         Self::new(vec![
             Ok(ToolCompletionResponse {
                 message: ChatMessage {
                     role: MessageRole::Assistant,
-                    content: vec![ContentBlock::ToolUse {
-                        id: tool_call.id.clone(),
-                        name: tool_call.name.clone(),
-                        input: tool_call.input.clone(),
-                    }],
+                    content,
                 },
-                tool_calls: vec![tool_call],
+                tool_calls: calls,
                 usage: TokenUsage {
                     input_tokens: 100,
                     output_tokens: 50,
@@ -122,18 +131,27 @@ impl MockLlmProvider {
 
     /// Create a provider that always returns tool calls (for max turns testing).
     pub fn always_tool_call(call: ToolCall, count: usize) -> Self {
-        let responses = (0..count)
+        Self::always_multi_tool_calls(vec![call], count)
+    }
+
+    /// Create a provider that always returns multiple tool calls per turn (for budget testing).
+    pub fn always_multi_tool_calls(calls: Vec<ToolCall>, turns: usize) -> Self {
+        let responses = (0..turns)
             .map(|_| {
+                let content: Vec<ContentBlock> = calls
+                    .iter()
+                    .map(|c| ContentBlock::ToolUse {
+                        id: c.id.clone(),
+                        name: c.name.clone(),
+                        input: c.input.clone(),
+                    })
+                    .collect();
                 Ok(ToolCompletionResponse {
                     message: ChatMessage {
                         role: MessageRole::Assistant,
-                        content: vec![ContentBlock::ToolUse {
-                            id: call.id.clone(),
-                            name: call.name.clone(),
-                            input: call.input.clone(),
-                        }],
+                        content,
                     },
-                    tool_calls: vec![call.clone()],
+                    tool_calls: calls.clone(),
                     usage: TokenUsage {
                         input_tokens: 100,
                         output_tokens: 50,

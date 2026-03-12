@@ -128,6 +128,8 @@ pub struct SpawnerConfig {
     pub max_empty_cycles: u32,
     pub compaction: CompactionSection,
     pub consolidation: ConsolidationSection,
+    pub max_tool_calls_per_turn: usize,
+    pub max_total_tool_calls: usize,
 }
 
 // ── InProcessSpawner ────────────────────────────────────────────────
@@ -231,6 +233,8 @@ impl SubAgentSpawner for InProcessSpawner {
                 max_empty_cycles: self.config.max_empty_cycles,
                 compaction: self.config.compaction.clone(),
                 consolidation: self.config.consolidation.clone(),
+                max_tool_calls_per_turn: self.config.max_tool_calls_per_turn,
+                max_total_tool_calls: self.config.max_total_tool_calls,
             },
             runtime: Arc::clone(&self.runtime),
             hooks: sub_hooks.clone(),
@@ -320,6 +324,8 @@ impl SubAgentSpawner for InProcessSpawner {
                 max_turns: self.config.max_turns,
                 max_empty_cycles: self.config.max_empty_cycles,
                 max_tool_input_bytes: self.config.max_tool_input_bytes,
+                max_tool_calls_per_turn: self.config.max_tool_calls_per_turn,
+                max_total_tool_calls: self.config.max_total_tool_calls,
             },
             estimator: Arc::clone(&self.estimator),
             compaction: self.config.compaction.clone(),

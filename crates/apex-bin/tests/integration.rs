@@ -265,6 +265,8 @@ async fn single_task_roundtrip() {
             max_turns: 32,
             max_empty_cycles: 300,
             max_tool_input_bytes: 40_000,
+            max_tool_calls_per_turn: 64,
+            max_total_tool_calls: 512,
         },
         estimator,
         compaction: CompactionSection {

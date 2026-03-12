@@ -28,6 +28,8 @@ pub struct WorkerLimits {
     pub max_turns: usize,
     pub max_empty_cycles: u32,
     pub max_tool_input_bytes: usize,
+    pub max_tool_calls_per_turn: usize,
+    pub max_total_tool_calls: usize,
 }
 
 #[derive(Clone)]
@@ -252,6 +254,8 @@ async fn execute_claim(
         hooks: ctx.hooks.as_deref(),
         max_tool_input_bytes: ctx.limits.max_tool_input_bytes,
         scratch_dir: ctx.scratch_dir.clone(),
+        max_tool_calls_per_turn: ctx.limits.max_tool_calls_per_turn,
+        max_total_tool_calls: ctx.limits.max_total_tool_calls,
     };
     let (turns, loop_outcome, _messages) = run_agentic_loop(messages, &loop_config).await;
 
@@ -273,6 +277,9 @@ async fn execute_claim(
         LoopOutcome::TimedOut => Some("loop timeout exceeded".to_string()),
         LoopOutcome::Cancelled => Some("cancelled".to_string()),
         LoopOutcome::BlockedByHook(msg) => Some(format!("blocked by hook: {msg}")),
+        LoopOutcome::ToolCallBudgetExhausted => {
+            Some("tool call budget exhausted".to_string())
+        }
         LoopOutcome::Completed(_) | LoopOutcome::MaxTurnsExhausted => None,
     };
     if let Some(reason) = failure_reason {
@@ -636,6 +643,8 @@ mod tests {
                 max_turns: 32,
                 max_empty_cycles: 300,
                 max_tool_input_bytes: 40_000,
+                max_tool_calls_per_turn: 64,
+                max_total_tool_calls: 512,
             },
             estimator: Arc::new(Mutex::new(TokenEstimator::default())),
             compaction: CompactionSection {

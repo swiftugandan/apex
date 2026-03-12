@@ -34,6 +34,8 @@ pub enum LoopOutcome {
     BlockedByHook(String),
     /// Hit the turn limit without the LLM finishing.
     MaxTurnsExhausted,
+    /// Aggregate tool call budget exhausted.
+    ToolCallBudgetExhausted,
 }
 
 /// Configuration bundle for the agentic loop.
@@ -60,6 +62,10 @@ pub struct LoopConfig<'a> {
     pub scratch_dir: Option<PathBuf>,
     /// Compaction settings (preserve_turns, max_summary_tokens, spill_history).
     pub compaction: CompactionSection,
+    /// Maximum tool calls allowed per single LLM turn.
+    pub max_tool_calls_per_turn: usize,
+    /// Maximum total tool calls across all turns.
+    pub max_total_tool_calls: usize,
 }
 
 /// Serialize `messages` as pretty-printed JSON directly to a file under `dir`,
@@ -175,6 +181,7 @@ pub async fn run_agentic_loop(
     let mut messages = initial_messages;
     let mut turns: Vec<TurnRecord> = Vec::new();
     let mut outcome: Option<LoopOutcome> = None;
+    let mut total_tool_calls: usize = 0;
     let deadline = config.timeout.map(|d| Instant::now() + d);
     let schemas = config.tools.schemas();
     let system_prompt = config.persona.to_string();
@@ -335,10 +342,36 @@ pub async fn run_agentic_loop(
             }
         }
 
-        let tool_futures: Vec<_> = resp
+        // Enforce per-turn and aggregate tool call limits
+        let non_blocked: Vec<_> = resp
             .tool_calls
             .iter()
             .filter(|c| !blocked_calls.contains(&c.id))
+            .collect();
+
+        let remaining_budget = config.max_total_tool_calls.saturating_sub(total_tool_calls);
+        let effective_limit = config.max_tool_calls_per_turn.min(remaining_budget);
+        let split = non_blocked.len().min(effective_limit);
+        let (allowed_calls, excess_calls) = non_blocked.split_at(split);
+
+        // Generate error results for excess calls
+        for call in excess_calls {
+            result_blocks.push(ContentBlock::ToolResult {
+                tool_use_id: call.id.clone(),
+                content: "Tool call budget exceeded: too many tool calls in this turn or total budget exhausted".to_string(),
+                is_error: true,
+            });
+            call_records.push(ToolCallRecord {
+                name: call.name.clone(),
+                input_summary: summarize_json(&call.input, 80),
+                output_summary: "BUDGET_EXCEEDED".to_string(),
+                is_error: true,
+                duration_ms: 0,
+            });
+        }
+
+        let tool_futures: Vec<_> = allowed_calls
+            .iter()
             .map(|call| async move {
                 dispatch_log(
                     config.hooks,
@@ -364,11 +397,12 @@ pub async fn run_agentic_loop(
                         ..Default::default()
                     },
                 };
-                (call, result, start.elapsed())
+                (*call, result, start.elapsed())
             })
             .collect();
 
         let results = join_all(tool_futures).await;
+        total_tool_calls += results.len();
 
         for (call, result, elapsed) in results {
             let duration_ms = elapsed.as_millis() as u64;
@@ -494,6 +528,12 @@ pub async fn run_agentic_loop(
             });
             let _ = hooks.dispatch(HookEvent::AfterTurn, &ctx).await;
         }
+
+        // ── aggregate tool call budget check ──
+        if total_tool_calls >= config.max_total_tool_calls {
+            outcome = Some(LoopOutcome::ToolCallBudgetExhausted);
+            break;
+        }
     }
 
     let outcome = outcome.unwrap_or(LoopOutcome::MaxTurnsExhausted);
@@ -518,17 +558,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn loop_returns_on_end_turn() {
-        let llm = MockLlmProvider::text_only("Hello, world!");
-        let tools = MockToolRegistry::echo("test_tool");
-        let estimator = default_estimator();
-
-        let config = LoopConfig {
+    /// Build a `LoopConfig` with sensible test defaults. Tests override
+    /// specific fields via struct update syntax (`.. base`).
+    fn test_loop_config<'a>(
+        llm: &'a dyn LlmProvider,
+        tools: &'a dyn ToolRegistry,
+        estimator: &'a Arc<Mutex<TokenEstimator>>,
+    ) -> LoopConfig<'a> {
+        LoopConfig {
             persona: "You are helpful.",
-            llm: &llm,
-            tools: &tools,
-            estimator: &estimator,
+            llm,
+            tools,
+            estimator,
             max_tool_result_bytes: 10_000,
             max_output_tokens: 4096,
             scratchpad: None,
@@ -540,7 +581,17 @@ mod tests {
             max_tool_input_bytes: 40_000,
             scratch_dir: None,
             compaction: test_compaction(),
-        };
+            max_tool_calls_per_turn: 64,
+            max_total_tool_calls: 512,
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_returns_on_end_turn() {
+        let llm = MockLlmProvider::text_only("Hello, world!");
+        let tools = MockToolRegistry::echo("test_tool");
+        let estimator = default_estimator();
+        let config = test_loop_config(&llm, &tools, &estimator);
 
         let messages = vec![ChatMessage::user_text("Hi")];
         let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
@@ -560,24 +611,7 @@ mod tests {
         let llm = MockLlmProvider::tool_then_text(tool_call, "Done!");
         let tools = MockToolRegistry::echo("test_tool");
         let estimator = default_estimator();
-
-        let config = LoopConfig {
-            persona: "You are helpful.",
-            llm: &llm,
-            tools: &tools,
-            estimator: &estimator,
-            max_tool_result_bytes: 10_000,
-            max_output_tokens: 4096,
-            scratchpad: None,
-            memory: None,
-            cancel: None,
-            timeout: None,
-            max_turns: 32,
-            hooks: None,
-            max_tool_input_bytes: 40_000,
-            scratch_dir: None,
-            compaction: test_compaction(),
-        };
+        let config = test_loop_config(&llm, &tools, &estimator);
 
         let messages = vec![ChatMessage::user_text("Do something")];
         let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
@@ -599,24 +633,7 @@ mod tests {
         let llm = MockLlmProvider::error("API overloaded");
         let tools = MockToolRegistry::echo("test_tool");
         let estimator = default_estimator();
-
-        let config = LoopConfig {
-            persona: "You are helpful.",
-            llm: &llm,
-            tools: &tools,
-            estimator: &estimator,
-            max_tool_result_bytes: 10_000,
-            max_output_tokens: 4096,
-            scratchpad: None,
-            memory: None,
-            cancel: None,
-            timeout: None,
-            max_turns: 32,
-            hooks: None,
-            max_tool_input_bytes: 40_000,
-            scratch_dir: None,
-            compaction: test_compaction(),
-        };
+        let config = test_loop_config(&llm, &tools, &estimator);
 
         let messages = vec![ChatMessage::user_text("Hi")];
         let (_turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
@@ -637,24 +654,7 @@ mod tests {
         let llm = MockLlmProvider::tool_then_text(tool_call, "Recovered");
         let tools = MockToolRegistry::failing("bad_tool", "disk full");
         let estimator = default_estimator();
-
-        let config = LoopConfig {
-            persona: "You are helpful.",
-            llm: &llm,
-            tools: &tools,
-            estimator: &estimator,
-            max_tool_result_bytes: 10_000,
-            max_output_tokens: 4096,
-            scratchpad: None,
-            memory: None,
-            cancel: None,
-            timeout: None,
-            max_turns: 32,
-            hooks: None,
-            max_tool_input_bytes: 40_000,
-            scratch_dir: None,
-            compaction: test_compaction(),
-        };
+        let config = test_loop_config(&llm, &tools, &estimator);
 
         let messages = vec![ChatMessage::user_text("Do something")];
         let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
@@ -675,21 +675,8 @@ mod tests {
         cancel.cancel(); // Pre-cancel
 
         let config = LoopConfig {
-            persona: "You are helpful.",
-            llm: &llm,
-            tools: &tools,
-            estimator: &estimator,
-            max_tool_result_bytes: 10_000,
-            max_output_tokens: 4096,
-            scratchpad: None,
-            memory: None,
             cancel: Some(&cancel),
-            timeout: None,
-            max_turns: 32,
-            hooks: None,
-            max_tool_input_bytes: 40_000,
-            scratch_dir: None,
-            compaction: test_compaction(),
+            ..test_loop_config(&llm, &tools, &estimator)
         };
 
         let messages = vec![ChatMessage::user_text("Hi")];
@@ -706,21 +693,8 @@ mod tests {
         let estimator = default_estimator();
 
         let config = LoopConfig {
-            persona: "You are helpful.",
-            llm: &llm,
-            tools: &tools,
-            estimator: &estimator,
-            max_tool_result_bytes: 10_000,
-            max_output_tokens: 4096,
-            scratchpad: None,
-            memory: None,
-            cancel: None,
-            timeout: Some(Duration::from_secs(0)), // Already expired
-            max_turns: 32,
-            hooks: None,
-            max_tool_input_bytes: 40_000,
-            scratch_dir: None,
-            compaction: test_compaction(),
+            timeout: Some(Duration::from_secs(0)),
+            ..test_loop_config(&llm, &tools, &estimator)
         };
 
         let messages = vec![ChatMessage::user_text("Hi")];
@@ -743,21 +717,8 @@ mod tests {
         let estimator = default_estimator();
 
         let config = LoopConfig {
-            persona: "You are helpful.",
-            llm: &llm,
-            tools: &tools,
-            estimator: &estimator,
-            max_tool_result_bytes: 10_000,
-            max_output_tokens: 4096,
-            scratchpad: None,
-            memory: None,
-            cancel: None,
-            timeout: None,
             max_turns,
-            hooks: None,
-            max_tool_input_bytes: 40_000,
-            scratch_dir: None,
-            compaction: test_compaction(),
+            ..test_loop_config(&llm, &tools, &estimator)
         };
 
         let messages = vec![ChatMessage::user_text("Do something")];
@@ -796,20 +757,9 @@ mod tests {
     ) -> LoopConfig<'a> {
         LoopConfig {
             persona: "",
-            llm,
-            tools,
-            estimator,
-            max_tool_result_bytes: 10_000,
-            max_output_tokens: 4096,
-            scratchpad: None,
-            memory: None,
-            cancel: None,
-            timeout: None,
-            max_turns: 32,
-            hooks: None,
-            max_tool_input_bytes: 40_000,
-            scratch_dir,
             compaction,
+            scratch_dir,
+            ..test_loop_config(llm, tools, estimator)
         }
     }
 
@@ -915,21 +865,8 @@ mod tests {
         let estimator = default_estimator();
 
         let config = LoopConfig {
-            persona: "You are helpful.",
-            llm: &llm,
-            tools: &tools,
-            estimator: &estimator,
             max_tool_result_bytes: 1_000,
-            max_output_tokens: 4096,
-            scratchpad: None,
-            memory: None,
-            cancel: None,
-            timeout: None,
-            max_turns: 32,
-            hooks: None,
-            max_tool_input_bytes: 40_000,
-            scratch_dir: None,
-            compaction: test_compaction(),
+            ..test_loop_config(&llm, &tools, &estimator)
         };
 
         let messages = vec![ChatMessage::user_text("Get data")];
@@ -1065,5 +1002,112 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── tool call budget tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn loop_caps_tool_calls_per_turn() {
+        // LLM returns 5 tool calls in one turn, but limit is 2
+        let calls: Vec<ToolCall> = (0..5)
+            .map(|i| ToolCall {
+                id: format!("call-{i}"),
+                name: "test_tool".into(),
+                input: serde_json::json!({}),
+            })
+            .collect();
+        let llm = MockLlmProvider::multi_tool_then_text(calls, "Done!");
+        let tools = MockToolRegistry::echo("test_tool");
+        let estimator = default_estimator();
+
+        let config = LoopConfig {
+            max_tool_calls_per_turn: 2,
+            ..test_loop_config(&llm, &tools, &estimator)
+        };
+
+        let messages = vec![ChatMessage::user_text("Do something")];
+        let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
+
+        // Only 2 tool calls should have been executed
+        let executed = tools.calls.lock().await;
+        assert_eq!(executed.len(), 2, "expected only 2 tool calls to execute");
+
+        // Turn record should show 5 total (2 executed + 3 budget-exceeded)
+        assert_eq!(turns[0].tool_calls.len(), 5);
+        let budget_exceeded: Vec<_> = turns[0]
+            .tool_calls
+            .iter()
+            .filter(|tc| tc.output_summary == "BUDGET_EXCEEDED")
+            .collect();
+        assert_eq!(budget_exceeded.len(), 3, "expected 3 budget-exceeded records");
+
+        assert!(matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "Done!"));
+    }
+
+    #[tokio::test]
+    async fn loop_terminates_on_total_budget() {
+        // Each turn makes 2 tool calls, total budget is 3, so should exhaust after 2 turns
+        let calls: Vec<ToolCall> = (0..2)
+            .map(|i| ToolCall {
+                id: format!("call-{i}"),
+                name: "test_tool".into(),
+                input: serde_json::json!({}),
+            })
+            .collect();
+        let llm = MockLlmProvider::always_multi_tool_calls(calls, 10);
+        let tools = MockToolRegistry::echo("test_tool");
+        let estimator = default_estimator();
+
+        let config = LoopConfig {
+            max_total_tool_calls: 3,
+            ..test_loop_config(&llm, &tools, &estimator)
+        };
+
+        let messages = vec![ChatMessage::user_text("Do something")];
+        let (_turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
+
+        assert!(
+            matches!(outcome, LoopOutcome::ToolCallBudgetExhausted),
+            "expected ToolCallBudgetExhausted, got: {outcome:?}"
+        );
+
+        // Should have executed at most 3 tool calls total
+        let executed = tools.calls.lock().await;
+        assert!(executed.len() <= 3, "expected at most 3 executed calls, got {}", executed.len());
+    }
+
+    #[tokio::test]
+    async fn per_turn_limit_considers_remaining_budget() {
+        // per_turn=10, total=5, LLM returns 8 calls → only 5 should execute
+        let calls: Vec<ToolCall> = (0..8)
+            .map(|i| ToolCall {
+                id: format!("call-{i}"),
+                name: "test_tool".into(),
+                input: serde_json::json!({}),
+            })
+            .collect();
+        let llm = MockLlmProvider::multi_tool_then_text(calls, "Done!");
+        let tools = MockToolRegistry::echo("test_tool");
+        let estimator = default_estimator();
+
+        let config = LoopConfig {
+            max_tool_calls_per_turn: 10,
+            max_total_tool_calls: 5,
+            ..test_loop_config(&llm, &tools, &estimator)
+        };
+
+        let messages = vec![ChatMessage::user_text("Do something")];
+        let (turns, _outcome, _msgs) = run_agentic_loop(messages, &config).await;
+
+        let executed = tools.calls.lock().await;
+        assert_eq!(executed.len(), 5, "expected 5 tool calls (capped by remaining budget)");
+
+        // 3 excess should be budget-exceeded
+        let budget_exceeded: Vec<_> = turns[0]
+            .tool_calls
+            .iter()
+            .filter(|tc| tc.output_summary == "BUDGET_EXCEEDED")
+            .collect();
+        assert_eq!(budget_exceeded.len(), 3);
     }
 }

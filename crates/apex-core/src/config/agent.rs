@@ -56,6 +56,14 @@ pub struct AgentSection {
     #[serde(default = "default_scratchpad_retention_days")]
     pub scratchpad_retention_days: u32,
 
+    /// Maximum tool calls allowed per single LLM turn.
+    #[serde(default = "default_max_tool_calls_per_turn")]
+    pub max_tool_calls_per_turn: usize,
+
+    /// Maximum total tool calls across all turns in a single agentic loop.
+    #[serde(default = "default_max_total_tool_calls")]
+    pub max_total_tool_calls: usize,
+
     /// Enabled tool names (empty = all available).
     #[serde(default)]
     pub tools: Vec<String>,
@@ -197,6 +205,12 @@ fn default_max_empty_cycles() -> u32 {
 fn default_scratchpad_retention_days() -> u32 {
     7
 }
+fn default_max_tool_calls_per_turn() -> usize {
+    64
+}
+fn default_max_total_tool_calls() -> usize {
+    512
+}
 fn default_max_body_tokens() -> usize {
     50_000
 }
@@ -285,6 +299,8 @@ impl Default for AgentSection {
             max_turns: default_max_turns(),
             max_empty_cycles: default_max_empty_cycles(),
             scratchpad_retention_days: default_scratchpad_retention_days(),
+            max_tool_calls_per_turn: default_max_tool_calls_per_turn(),
+            max_total_tool_calls: default_max_total_tool_calls(),
             tools: vec![],
         }
     }
