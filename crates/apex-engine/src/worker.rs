@@ -375,6 +375,7 @@ async fn execute_claim(
         consolidate_learnings(
             ctx.long_term.as_ref(),
             ctx.skills.as_ref(),
+            ctx.llm.as_ref(),
             &claimed.headers.correlation_id,
             &record,
             &scratchpad,

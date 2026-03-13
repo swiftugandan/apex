@@ -187,6 +187,10 @@ pub struct ConsolidationSection {
     /// Maximum number of facts to request from the store before token trimming.
     #[serde(default = "default_retrieval_max_facts")]
     pub retrieval_max_facts: usize,
+
+    /// Whether to use an LLM call for skill extraction (name, description, approach).
+    #[serde(default = "default_true")]
+    pub use_llm_extraction: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -407,6 +411,7 @@ impl Default for ConsolidationSection {
             retrieval_at_start: true,
             retrieval_max_tokens: default_retrieval_max_tokens(),
             retrieval_max_facts: default_retrieval_max_facts(),
+            use_llm_extraction: true,
         }
     }
 }
