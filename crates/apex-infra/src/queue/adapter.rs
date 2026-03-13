@@ -34,6 +34,13 @@ impl RfbmqAdapter {
     pub fn init_or_open(root: &Path) -> Result<Self, QueueError> {
         Self::init(root).or_else(|_| Self::open(root))
     }
+
+    /// Move all failed messages back to pending with retry counts reset.
+    pub fn retry_all_failed(&self) -> Result<u32, QueueError> {
+        self.queue
+            .retry_all_failed()
+            .map_err(|e| QueueError::Io(e.to_string()))
+    }
 }
 
 #[async_trait]

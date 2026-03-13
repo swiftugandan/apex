@@ -51,8 +51,9 @@ async fn main() -> Result<()> {
             let subcmd = args.get(1).map(|s| s.as_str());
             match subcmd {
                 Some("reap") => cmd_queue_reap().await,
+                Some("retry") => cmd_queue_retry().await,
                 None => cmd_queue_depth().await,
-                Some(sub) => bail!("unknown queue subcommand: {sub}. Available: reap"),
+                Some(sub) => bail!("unknown queue subcommand: {sub}. Available: reap, retry"),
             }
         }
         Some("cat") => {
@@ -228,6 +229,20 @@ async fn cmd_queue_reap() -> Result<()> {
     match spill.clean_all() {
         Ok(n) if n > 0 => eprintln!("cleaned {n} scratch file(s)"),
         _ => {}
+    }
+
+    Ok(())
+}
+
+async fn cmd_queue_retry() -> Result<()> {
+    let paths = ProjectPaths::resolve()?;
+    let adapter = open_queue(&paths)?;
+
+    let count = adapter.retry_all_failed()?;
+    if count == 0 {
+        eprintln!("no failed messages to retry");
+    } else {
+        eprintln!("✓ retried {count} failed message(s)");
     }
 
     Ok(())

@@ -242,6 +242,59 @@ impl Queue {
         Ok(())
     }
 
+    /// Move a message from `failed/` back to `pending/` with retry count reset to 0.
+    /// Returns `Ok(true)` if the message was retried, `Ok(false)` if not found.
+    pub fn retry_failed(&self, id: &MessageId) -> Result<bool> {
+        let failed_path = self.root().join(DIR_FAILED).join(format!("{}.md", id));
+        if !failed_path.exists() {
+            return Ok(false);
+        }
+
+        let mut msg = parse_file(&failed_path)?;
+        msg.header.retry_count = 0;
+
+        let buf = msg.serialize()?;
+        let enqueue_ts = format_ts(Utc::now());
+        let pending_name = format!("{}.{}.md", enqueue_ts, id);
+        let pending_dir = self.pending_dir_for(msg.header.priority);
+        let pending_path = pending_dir.join(&pending_name);
+
+        durable_write_rename(
+            &self.root().join(DIR_TMP),
+            &format!("retry-{}.md", id),
+            &pending_path,
+            buf.as_bytes(),
+            self.file_mode(),
+            self.fsync_mode(),
+        )?;
+
+        fs::remove_file(&failed_path)?;
+        fsync_dir(&self.root().join(DIR_FAILED), self.fsync_mode())?;
+
+        Ok(true)
+    }
+
+    /// Move all messages from `failed/` back to `pending/` with retry counts reset.
+    /// Returns the number of messages retried.
+    pub fn retry_all_failed(&self) -> Result<u32> {
+        let failed_dir = self.root().join(DIR_FAILED);
+        if !failed_dir.exists() {
+            return Ok(0);
+        }
+
+        let names = collect_md_files(&failed_dir)?;
+        let mut count = 0u32;
+        for name in &names {
+            let id_str = name.strip_suffix(".md").unwrap_or(name);
+            if let Ok(id) = id_str.parse::<MessageId>() {
+                if self.retry_failed(&id)? {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
     pub fn reap(&self) -> Result<u32> {
         let mut count = 0u32;
         let now = Utc::now().timestamp();
