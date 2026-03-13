@@ -111,8 +111,9 @@ async fn main() -> Result<()> {
             }
         }
         Some("validate") => cmd_validate().await,
+        Some("version") => cmd_version().await,
         Some(cmd) => bail!(
-            "unknown command: {cmd}. Available: init, run, queue, cat, work, status, memory, scratch, tools, config, hooks, validate"
+            "unknown command: {cmd}. Available: init, run, queue, cat, work, status, memory, scratch, tools, config, hooks, validate, version"
         ),
         None => bail!("no command provided. Usage: apex <command>"),
     }
@@ -920,5 +921,11 @@ async fn cmd_validate() -> Result<()> {
     if has_errors {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+async fn cmd_version() -> Result<()> {
+    let version = env!("CARGO_PKG_VERSION");
+    println!("apex v{version}");
     Ok(())
 }
