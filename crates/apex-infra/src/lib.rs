@@ -1,7 +1,11 @@
+pub mod compaction;
+pub mod extraction;
 pub mod llm;
 pub mod memory;
 pub mod queue;
 
+pub use compaction::LlmConversationCompactor;
+pub use extraction::LlmSkillExtractor;
 pub use llm::anthropic::AnthropicProvider;
 pub use llm::openai::OpenAiProvider;
 pub use memory::fs_skill_store::FsSkillStore;

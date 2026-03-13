@@ -1,6 +1,5 @@
 mod agentic_loop;
 mod claim_tool_factory;
-mod compaction;
 mod consolidation;
 mod jit_retrieval;
 pub mod log;

@@ -445,6 +445,14 @@ pub struct SkillManifest {
     pub digest: Option<String>,
 }
 
+/// Skill metadata extracted from a completed task attempt via LLM.
+#[derive(Debug, Clone)]
+pub struct ExtractedSkill {
+    pub name: String,
+    pub description: String,
+    pub approach: String,
+}
+
 /// A skill that has been fully loaded into memory for use.
 #[derive(Debug, Clone)]
 pub struct LoadedSkill {

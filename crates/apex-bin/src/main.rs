@@ -13,8 +13,8 @@ use apex_core::ports::HookRegistry;
 use apex_core::ports::{MemoryStore, Queue, SkillStore, WorkingMemory};
 use apex_engine::{worker_loop, ClaimToolFactory, ProjectPaths, WorkerContext, WorkerLimits};
 use apex_infra::{
-    AnthropicProvider, FsScratchpadStore, FsSkillStore, OpenAiProvider, RfbmqAdapter,
-    SqliteMemoryStore,
+    AnthropicProvider, FsScratchpadStore, FsSkillStore, LlmConversationCompactor,
+    LlmSkillExtractor, OpenAiProvider, RfbmqAdapter, SqliteMemoryStore,
 };
 use apex_tools::spill::SpillManager;
 use apex_tools::FsHookRegistry;
@@ -375,6 +375,15 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         ),
     };
 
+    let compactor: Arc<dyn apex_core::ports::ConversationCompactor> =
+        Arc::new(LlmConversationCompactor::new(llm.clone()));
+    let skill_extractor: Option<Arc<dyn apex_core::ports::SkillExtractor>> =
+        if agent_config.consolidation.use_llm_extraction {
+            Some(Arc::new(LlmSkillExtractor::new(llm.clone())))
+        } else {
+            None
+        };
+
     let memory: Arc<dyn WorkingMemory> =
         Arc::new(FsScratchpadStore::new(paths.working_memory.clone()));
 
@@ -409,6 +418,8 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         parent_long_term: long_term.clone(),
         parent_skills: skills.clone(),
         llm: llm.clone(),
+        compactor: compactor.clone(),
+        skill_extractor: skill_extractor.clone(),
         estimator: estimator.clone(),
         config: runtime::SpawnerConfig {
             invariants: Arc::clone(&invariants),
@@ -454,6 +465,8 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         queue,
         claim_tool_factory: claim_factory,
         llm,
+        compactor,
+        skill_extractor,
         memory,
         long_term,
         skills,

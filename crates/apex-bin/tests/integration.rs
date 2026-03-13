@@ -254,10 +254,14 @@ async fn single_task_roundtrip() {
         estimator: estimator.clone(),
     });
 
+    let compactor: Arc<dyn apex_core::ports::ConversationCompactor> =
+        Arc::new(apex_infra::LlmConversationCompactor::new(llm.clone()));
     let ctx = WorkerContext {
         queue: Arc::clone(&queue),
         claim_tool_factory: claim_factory,
         llm,
+        compactor,
+        skill_extractor: None,
         memory,
         long_term,
         skills,

@@ -13,8 +13,8 @@ use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{MessageHeaders, MessageType, QueueMessage, ToolCall, ToolDef, ToolResult};
 use apex_core::error::ToolError;
 use apex_core::ports::{
-    HookRegistry, LlmProvider, MemoryStore, Queue, SkillStore, SubAgentResult, SubAgentSpawner,
-    ToolRegistry, WorkingMemory,
+    ConversationCompactor, HookRegistry, LlmProvider, MemoryStore, Queue, SkillExtractor,
+    SkillStore, SubAgentResult, SubAgentSpawner, ToolRegistry, WorkingMemory,
 };
 use serde_json::Value;
 
@@ -147,6 +147,8 @@ pub struct InProcessSpawner {
     pub parent_long_term: Arc<dyn MemoryStore>,
     pub parent_skills: Arc<dyn SkillStore>,
     pub llm: Arc<dyn LlmProvider>,
+    pub compactor: Arc<dyn ConversationCompactor>,
+    pub skill_extractor: Option<Arc<dyn SkillExtractor>>,
     pub estimator: Arc<Mutex<TokenEstimator>>,
     pub config: SpawnerConfig,
     pub runtime: Arc<SubAgentRuntimeBuilder>,
@@ -225,6 +227,8 @@ impl SubAgentSpawner for InProcessSpawner {
             parent_long_term: sub_long_term.clone(),
             parent_skills: sub_skills.clone(),
             llm: sub_llm.clone(),
+            compactor: Arc::clone(&self.compactor),
+            skill_extractor: self.skill_extractor.clone(),
             estimator: Arc::clone(&self.estimator),
             config: SpawnerConfig {
                 invariants: Arc::clone(&self.config.invariants),
@@ -321,6 +325,8 @@ impl SubAgentSpawner for InProcessSpawner {
             queue: sub_queue.clone(),
             claim_tool_factory: claim_factory,
             llm: sub_llm,
+            compactor: Arc::clone(&self.compactor),
+            skill_extractor: self.skill_extractor.clone(),
             memory: sub_memory,
             long_term: sub_long_term,
             skills: sub_skills,

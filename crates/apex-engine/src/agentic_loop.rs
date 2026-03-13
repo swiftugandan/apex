@@ -12,11 +12,12 @@ use apex_core::domain::{
     CacheHint, ChatMessage, CompletionRequest, ContentBlock, HookEvent, HookOutcome, LogEntry,
     MessageRole, SystemBlock, ToolCallRecord, TurnRecord,
 };
-use apex_core::ports::{HookRegistry, LlmProvider, ToolRegistry, WorkingMemory};
+use apex_core::ports::{
+    ConversationCompactor, HookRegistry, LlmProvider, ToolRegistry, WorkingMemory,
+};
 
 use apex_core::summarize_json;
 
-use crate::compaction::compact_messages;
 use crate::log::dispatch_log;
 
 /// Outcome of an agentic loop run.
@@ -42,6 +43,7 @@ pub enum LoopOutcome {
 pub struct LoopConfig<'a> {
     pub persona: &'a str,
     pub llm: &'a dyn LlmProvider,
+    pub compactor: &'a dyn ConversationCompactor,
     pub tools: &'a dyn ToolRegistry,
     pub estimator: &'a Arc<Mutex<TokenEstimator>>,
     pub max_tool_result_bytes: usize,
@@ -151,13 +153,14 @@ async fn maybe_compact(messages: &mut Vec<ChatMessage>, config: &LoopConfig<'_>)
         }
     }
 
-    match compact_messages(
-        messages,
-        config.llm,
-        config.compaction.preserve_turns,
-        config.compaction.max_summary_tokens,
-    )
-    .await
+    match config
+        .compactor
+        .compact(
+            messages,
+            config.compaction.preserve_turns,
+            config.compaction.max_summary_tokens,
+        )
+        .await
     {
         Ok((compacted, count)) => {
             dispatch_log(
@@ -654,16 +657,22 @@ mod tests {
         }
     }
 
+    fn default_compactor() -> MockConversationCompactor {
+        MockConversationCompactor::new("Summary of conversation so far")
+    }
+
     /// Build a `LoopConfig` with sensible test defaults. Tests override
     /// specific fields via struct update syntax (`.. base`).
     fn test_loop_config<'a>(
         llm: &'a dyn LlmProvider,
+        compactor: &'a dyn apex_core::ports::ConversationCompactor,
         tools: &'a dyn ToolRegistry,
         estimator: &'a Arc<Mutex<TokenEstimator>>,
     ) -> LoopConfig<'a> {
         LoopConfig {
             persona: "You are helpful.",
             llm,
+            compactor,
             tools,
             estimator,
             max_tool_result_bytes: 10_000,
@@ -689,7 +698,8 @@ mod tests {
         let llm = MockLlmProvider::text_only("Hello, world!");
         let tools = MockToolRegistry::echo("test_tool");
         let estimator = default_estimator();
-        let config = test_loop_config(&llm, &tools, &estimator);
+        let compactor = default_compactor();
+        let config = test_loop_config(&llm, &compactor, &tools, &estimator);
 
         let messages = vec![ChatMessage::user_text("Hi")];
         let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
@@ -709,7 +719,8 @@ mod tests {
         let llm = MockLlmProvider::tool_then_text(tool_call, "Done!");
         let tools = MockToolRegistry::echo("test_tool");
         let estimator = default_estimator();
-        let config = test_loop_config(&llm, &tools, &estimator);
+        let compactor = default_compactor();
+        let config = test_loop_config(&llm, &compactor, &tools, &estimator);
 
         let messages = vec![ChatMessage::user_text("Do something")];
         let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
@@ -731,7 +742,8 @@ mod tests {
         let llm = MockLlmProvider::error("API overloaded");
         let tools = MockToolRegistry::echo("test_tool");
         let estimator = default_estimator();
-        let config = test_loop_config(&llm, &tools, &estimator);
+        let compactor = default_compactor();
+        let config = test_loop_config(&llm, &compactor, &tools, &estimator);
 
         let messages = vec![ChatMessage::user_text("Hi")];
         let (_turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
@@ -752,7 +764,8 @@ mod tests {
         let llm = MockLlmProvider::tool_then_text(tool_call, "Recovered");
         let tools = MockToolRegistry::failing("bad_tool", "disk full");
         let estimator = default_estimator();
-        let config = test_loop_config(&llm, &tools, &estimator);
+        let compactor = default_compactor();
+        let config = test_loop_config(&llm, &compactor, &tools, &estimator);
 
         let messages = vec![ChatMessage::user_text("Do something")];
         let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
@@ -769,12 +782,13 @@ mod tests {
         let llm = MockLlmProvider::text_only("Should not reach");
         let tools = MockToolRegistry::echo("test_tool");
         let estimator = default_estimator();
+        let compactor = default_compactor();
         let cancel = CancellationToken::new();
         cancel.cancel(); // Pre-cancel
 
         let config = LoopConfig {
             cancel: Some(&cancel),
-            ..test_loop_config(&llm, &tools, &estimator)
+            ..test_loop_config(&llm, &compactor, &tools, &estimator)
         };
 
         let messages = vec![ChatMessage::user_text("Hi")];
@@ -789,10 +803,11 @@ mod tests {
         let llm = MockLlmProvider::text_only("Should not reach");
         let tools = MockToolRegistry::echo("test_tool");
         let estimator = default_estimator();
+        let compactor = default_compactor();
 
         let config = LoopConfig {
             timeout: Some(Duration::from_secs(0)),
-            ..test_loop_config(&llm, &tools, &estimator)
+            ..test_loop_config(&llm, &compactor, &tools, &estimator)
         };
 
         let messages = vec![ChatMessage::user_text("Hi")];
@@ -813,10 +828,11 @@ mod tests {
         let llm = MockLlmProvider::always_tool_call(tool_call, max_turns + 5);
         let tools = MockToolRegistry::echo("test_tool");
         let estimator = default_estimator();
+        let compactor = default_compactor();
 
         let config = LoopConfig {
             max_turns,
-            ..test_loop_config(&llm, &tools, &estimator)
+            ..test_loop_config(&llm, &compactor, &tools, &estimator)
         };
 
         let messages = vec![ChatMessage::user_text("Do something")];
@@ -850,6 +866,7 @@ mod tests {
     /// the usable-input threshold is positive and compaction can trigger.
     fn compact_test_config<'a>(
         llm: &'a dyn LlmProvider,
+        compactor: &'a dyn apex_core::ports::ConversationCompactor,
         tools: &'a dyn ToolRegistry,
         estimator: &'a Arc<Mutex<TokenEstimator>>,
         compaction: CompactionSection,
@@ -861,7 +878,7 @@ mod tests {
             scratch_dir,
             reserved_reasoning_tokens: 0,
             max_output_tokens: 10,
-            ..test_loop_config(llm, tools, estimator)
+            ..test_loop_config(llm, compactor, tools, estimator)
         }
     }
 
@@ -886,7 +903,15 @@ mod tests {
         let llm = MockLlmProvider::new(vec![summary_response]).with_context_window(200);
         let tools = MockToolRegistry::echo("t");
         let estimator = default_estimator();
-        let cfg = compact_test_config(&llm, &tools, &estimator, test_compaction(), None);
+        let compactor = default_compactor();
+        let cfg = compact_test_config(
+            &llm,
+            &compactor,
+            &tools,
+            &estimator,
+            test_compaction(),
+            None,
+        );
 
         let mut msgs = messages.clone();
         let original_len = msgs.len();
@@ -914,7 +939,15 @@ mod tests {
         let llm = MockLlmProvider::text_only("should not be called").with_context_window(1_000_000);
         let tools = MockToolRegistry::echo("t");
         let estimator = default_estimator();
-        let cfg = compact_test_config(&llm, &tools, &estimator, test_compaction(), None);
+        let compactor = default_compactor();
+        let cfg = compact_test_config(
+            &llm,
+            &compactor,
+            &tools,
+            &estimator,
+            test_compaction(),
+            None,
+        );
 
         let mut msgs = vec![
             ChatMessage::user_text("Hi"),
@@ -958,11 +991,12 @@ mod tests {
         let llm = MockLlmProvider::new(vec![summary_response]).with_context_window(200);
         let tools = MockToolRegistry::echo("t");
         let estimator = default_estimator();
+        let compactor = default_compactor();
         let compaction = CompactionSection {
             preserve_turns: 2,
             ..test_compaction()
         };
-        let cfg = compact_test_config(&llm, &tools, &estimator, compaction, None);
+        let cfg = compact_test_config(&llm, &compactor, &tools, &estimator, compaction, None);
 
         let mut msgs = messages.clone();
         let _estimated = maybe_compact(&mut msgs, &cfg).await;
@@ -993,10 +1027,11 @@ mod tests {
         let llm = MockLlmProvider::tool_then_text(tool_call, "Done");
         let tools = MockToolRegistry::large_output("big_tool", 100_000);
         let estimator = default_estimator();
+        let compactor = default_compactor();
 
         let config = LoopConfig {
             max_tool_result_bytes: 1_000,
-            ..test_loop_config(&llm, &tools, &estimator)
+            ..test_loop_config(&llm, &compactor, &tools, &estimator)
         };
 
         let messages = vec![ChatMessage::user_text("Get data")];
@@ -1078,6 +1113,7 @@ mod tests {
         let llm = MockLlmProvider::new(vec![summary_response]).with_context_window(200);
         let tools = MockToolRegistry::echo("t");
         let estimator = default_estimator();
+        let compactor = default_compactor();
 
         let tmp = tempfile::tempdir().unwrap();
         let compaction = CompactionSection {
@@ -1086,6 +1122,7 @@ mod tests {
         };
         let cfg = compact_test_config(
             &llm,
+            &compactor,
             &tools,
             &estimator,
             compaction,
@@ -1191,10 +1228,11 @@ mod tests {
         let llm = MockLlmProvider::multi_tool_then_text(calls, "Done!");
         let tools = MockToolRegistry::echo("test_tool");
         let estimator = default_estimator();
+        let compactor = default_compactor();
 
         let config = LoopConfig {
             max_tool_calls_per_turn: 2,
-            ..test_loop_config(&llm, &tools, &estimator)
+            ..test_loop_config(&llm, &compactor, &tools, &estimator)
         };
 
         let messages = vec![ChatMessage::user_text("Do something")];
@@ -1233,10 +1271,11 @@ mod tests {
         let llm = MockLlmProvider::always_multi_tool_calls(calls, 10);
         let tools = MockToolRegistry::echo("test_tool");
         let estimator = default_estimator();
+        let compactor = default_compactor();
 
         let config = LoopConfig {
             max_total_tool_calls: 3,
-            ..test_loop_config(&llm, &tools, &estimator)
+            ..test_loop_config(&llm, &compactor, &tools, &estimator)
         };
 
         let messages = vec![ChatMessage::user_text("Do something")];
@@ -1269,11 +1308,12 @@ mod tests {
         let llm = MockLlmProvider::multi_tool_then_text(calls, "Done!");
         let tools = MockToolRegistry::echo("test_tool");
         let estimator = default_estimator();
+        let compactor = default_compactor();
 
         let config = LoopConfig {
             max_tool_calls_per_turn: 10,
             max_total_tool_calls: 5,
-            ..test_loop_config(&llm, &tools, &estimator)
+            ..test_loop_config(&llm, &compactor, &tools, &estimator)
         };
 
         let messages = vec![ChatMessage::user_text("Do something")];

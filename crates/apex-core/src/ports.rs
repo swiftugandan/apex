@@ -2,10 +2,10 @@ use async_trait::async_trait;
 
 use crate::config::RoleProfile;
 use crate::domain::{
-    CalibrationData, ClaimedTask, CompletionRequest, CompletionResponse, Fact, FactId, HookDef,
-    HookEvent, HookOutcome, QueueDepth, QueueMessage, QueueMessageMeta, ReapResult, Scratchpad,
-    Skill, SkillId, SkillManifest, ToolCall, ToolCompletionResponse, ToolDef, ToolResult,
-    ToolSchema,
+    AttemptRecord, CalibrationData, ChatMessage, ClaimedTask, CompletionRequest,
+    CompletionResponse, ExtractedSkill, Fact, FactId, HookDef, HookEvent, HookOutcome, QueueDepth,
+    QueueMessage, QueueMessageMeta, ReapResult, Scratchpad, Skill, SkillId, SkillManifest,
+    ToolCall, ToolCompletionResponse, ToolDef, ToolResult, ToolSchema,
 };
 use crate::error::{LlmError, MemoryError, QueueError, ToolError};
 use serde_json::Value;
@@ -134,6 +134,32 @@ pub trait HookRegistry: Send + Sync {
 pub struct SubAgentResult {
     pub done_bodies: Vec<String>,
     pub failed_bodies: Vec<String>,
+}
+
+/// Summarize older messages in a conversation to reduce token count.
+#[async_trait]
+pub trait ConversationCompactor: Send + Sync {
+    /// Summarize older messages, preserving the first message and the last
+    /// `preserve_turns` turns. Returns (compacted_messages, count_summarized).
+    async fn compact(
+        &self,
+        messages: &[ChatMessage],
+        preserve_turns: usize,
+        max_summary_tokens: u32,
+    ) -> Result<(Vec<ChatMessage>, usize), String>;
+}
+
+/// Extract a reusable skill from a completed task attempt.
+#[async_trait]
+pub trait SkillExtractor: Send + Sync {
+    /// Extract a reusable skill from a completed attempt.
+    /// Returns None on failure (caller uses deterministic fallback).
+    async fn extract_skill(
+        &self,
+        goal: &str,
+        record: &AttemptRecord,
+        skill_store: &dyn SkillStore,
+    ) -> Option<ExtractedSkill>;
 }
 
 /// Trait for spawning sub-agent processes. Decouples the delegate tool from

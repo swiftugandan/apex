@@ -1,7 +1,11 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
 use apex_core::domain::{
     CacheHint, ChatMessage, CompletionRequest, ContentBlock, MessageRole, SystemBlock,
 };
-use apex_core::ports::LlmProvider;
+use apex_core::ports::{ConversationCompactor, LlmProvider};
 use apex_core::truncate_str;
 
 const MAX_SUMMARY_INPUT_CHARS: usize = 32_000;
@@ -15,115 +19,122 @@ and any facts or constraints discovered. \
 Omit: redundant tool calls, verbose raw output, and conversational filler. \
 Format the summary as a structured list with clear section headings.";
 
-/// LLM-based compaction: summarize older messages using an LLM call.
-/// Returns `Ok((compacted_messages, count_summarized))` or `Err(reason)`.
-pub(crate) async fn compact_messages(
-    messages: &[ChatMessage],
-    llm: &dyn LlmProvider,
-    preserve_turns: usize,
-    max_summary_tokens: u32,
-) -> Result<(Vec<ChatMessage>, usize), String> {
-    // Need at least 3 messages to compact (original + something + preserved)
-    if messages.len() < 3 {
-        return Err("too few messages to compact".into());
+pub struct LlmConversationCompactor {
+    llm: Arc<dyn LlmProvider>,
+}
+
+impl LlmConversationCompactor {
+    pub fn new(llm: Arc<dyn LlmProvider>) -> Self {
+        Self { llm }
     }
+}
 
-    // Compute split point: preserve first message + last N turns (each turn ≈ 2 messages)
-    let preserve_msgs = (preserve_turns * 2).min(messages.len().saturating_sub(1));
-    let mut split_point = messages.len().saturating_sub(preserve_msgs);
-
-    // Nothing to compact if split would keep everything
-    if split_point <= 1 {
-        return Err("nothing to compact after preserving recent turns".into());
-    }
-
-    // Ensure preserved tail starts with a User message (for alternation after Assistant summary)
-    if split_point < messages.len() && messages[split_point].role == MessageRole::Assistant {
-        if split_point + 1 < messages.len() {
-            split_point += 1;
-        } else {
-            return Err("cannot maintain message alternation".into());
+#[async_trait]
+impl ConversationCompactor for LlmConversationCompactor {
+    async fn compact(
+        &self,
+        messages: &[ChatMessage],
+        preserve_turns: usize,
+        max_summary_tokens: u32,
+    ) -> Result<(Vec<ChatMessage>, usize), String> {
+        // Need at least 3 messages to compact (original + something + preserved)
+        if messages.len() < 3 {
+            return Err("too few messages to compact".into());
         }
-    }
 
-    // Serialize messages to summarize into a text prompt
-    let mut conversation_text = String::new();
-    for msg in &messages[1..split_point] {
-        let role_label = match msg.role {
-            MessageRole::Assistant => "Assistant",
-            MessageRole::User => "User",
+        // Compute split point: preserve first message + last N turns (each turn ≈ 2 messages)
+        let preserve_msgs = (preserve_turns * 2).min(messages.len().saturating_sub(1));
+        let mut split_point = messages.len().saturating_sub(preserve_msgs);
+
+        // Nothing to compact if split would keep everything
+        if split_point <= 1 {
+            return Err("nothing to compact after preserving recent turns".into());
+        }
+
+        // Ensure preserved tail starts with a User message (for alternation after Assistant summary)
+        if split_point < messages.len() && messages[split_point].role == MessageRole::Assistant {
+            if split_point + 1 < messages.len() {
+                split_point += 1;
+            } else {
+                return Err("cannot maintain message alternation".into());
+            }
+        }
+
+        // Serialize messages to summarize into a text prompt
+        let mut conversation_text = String::new();
+        for msg in &messages[1..split_point] {
+            let role_label = match msg.role {
+                MessageRole::Assistant => "Assistant",
+                MessageRole::User => "User",
+            };
+            for block in &msg.content {
+                match block {
+                    ContentBlock::Text { text } => {
+                        conversation_text.push_str(&format!("[{role_label}]: {text}\n\n"));
+                    }
+                    ContentBlock::ToolUse { name, .. } => {
+                        conversation_text
+                            .push_str(&format!("[{role_label}]: Called tool: {name}\n\n"));
+                    }
+                    ContentBlock::ToolResult {
+                        content, is_error, ..
+                    } => {
+                        let label = if *is_error { "error" } else { "ok" };
+                        conversation_text
+                            .push_str(&format!("[Tool result ({label})]: {content}\n\n"));
+                    }
+                }
+            }
+        }
+
+        let truncated = truncate_str(&conversation_text, MAX_SUMMARY_INPUT_CHARS);
+        let compacted_count = split_point - 1;
+
+        let prompt = format!(
+            "Summarize the following conversation excerpt ({compacted_count} messages). \
+             The original task was: {}\n\n---\n\n{truncated}",
+            messages[0].text(),
+        );
+
+        let summary_messages = vec![ChatMessage::user_text(&prompt)];
+        let system_blocks = [SystemBlock {
+            text: SUMMARIZATION_SYSTEM_PROMPT.to_string(),
+            cache_hint: CacheHint::Dynamic,
+        }];
+        let req = CompletionRequest {
+            system_blocks: &system_blocks,
+            messages: &summary_messages,
+            max_tokens: max_summary_tokens,
+            temperature: Some(0.0),
+            cache_tools: false,
+            reserved_reasoning_tokens: 0,
         };
-        for block in &msg.content {
-            match block {
-                ContentBlock::Text { text } => {
-                    conversation_text.push_str(&format!("[{role_label}]: {text}\n\n"));
+
+        let summary_text = match self.llm.complete(req).await {
+            Ok(resp) => {
+                let text = resp.text();
+                if text.is_empty() {
+                    return Err("LLM returned empty summary".into());
                 }
-                ContentBlock::ToolUse { name, .. } => {
-                    conversation_text.push_str(&format!("[{role_label}]: Called tool: {name}\n\n"));
-                }
-                ContentBlock::ToolResult {
-                    content, is_error, ..
-                } => {
-                    let label = if *is_error { "error" } else { "ok" };
-                    conversation_text.push_str(&format!("[Tool result ({label})]: {content}\n\n"));
-                }
+                format!("[Conversation compacted: {compacted_count} messages summarized]\n\n{text}")
             }
-        }
+            Err(err) => {
+                return Err(format!("LLM summary failed: {err}"));
+            }
+        };
+
+        let preserve_count = messages.len() - split_point;
+        let mut result = Vec::with_capacity(1 + 1 + preserve_count);
+        result.push(messages[0].clone()); // original task (User)
+        result.push(ChatMessage {
+            // summary (Assistant)
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::Text { text: summary_text }],
+        });
+        result.extend_from_slice(&messages[split_point..]); // User, Assistant, User, ...
+
+        Ok((result, compacted_count))
     }
-
-    let truncated = truncate_str(&conversation_text, MAX_SUMMARY_INPUT_CHARS);
-    let compacted_count = split_point - 1;
-
-    let prompt = format!(
-        "Summarize the following conversation excerpt ({compacted_count} messages). \
-         The original task was: {}\n\n---\n\n{truncated}",
-        messages[0].text(),
-    );
-
-    let summary_messages = vec![ChatMessage::user_text(&prompt)];
-    let system_blocks = [SystemBlock {
-        text: SUMMARIZATION_SYSTEM_PROMPT.to_string(),
-        cache_hint: CacheHint::Dynamic,
-    }];
-    let req = CompletionRequest {
-        system_blocks: &system_blocks,
-        messages: &summary_messages,
-        max_tokens: max_summary_tokens,
-        temperature: Some(0.0),
-        cache_tools: false,
-        reserved_reasoning_tokens: 0,
-    };
-
-    let summary_text = match llm.complete(req).await {
-        Ok(resp) => {
-            let text = resp.text();
-            if text.is_empty() {
-                return Err("LLM returned empty summary".into());
-            }
-            format!("[Conversation compacted: {compacted_count} messages summarized]\n\n{text}")
-        }
-        Err(err) => {
-            return Err(format!("LLM summary failed: {err}"));
-        }
-    };
-
-    let preserve_count = messages.len() - split_point;
-    let mut result = Vec::with_capacity(1 + 1 + preserve_count);
-    result.push(messages[0].clone()); // original task (User)
-    result.push(ChatMessage {
-        // summary (Assistant)
-        role: MessageRole::Assistant,
-        content: vec![ContentBlock::Text { text: summary_text }],
-    });
-    result.extend_from_slice(&messages[split_point..]); // User, Assistant, User, ...
-
-    eprintln!(
-        "  compacted: {} messages → {}",
-        messages.len(),
-        result.len()
-    );
-
-    Ok((result, compacted_count))
 }
 
 #[cfg(test)]
@@ -131,23 +142,7 @@ mod tests {
     use super::*;
     use apex_core::domain::{CompletionResponse, StopReason, TokenUsage};
     use apex_core::error::LlmError;
-    use apex_core::ports::LlmProvider;
     use async_trait::async_trait;
-
-    /// Build a message set with N assistant/user pairs after the initial user message.
-    fn make_messages(pairs: usize) -> Vec<ChatMessage> {
-        let mut messages = vec![ChatMessage::user_text("Original task")];
-        for i in 0..pairs {
-            messages.push(ChatMessage {
-                role: MessageRole::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: format!("Response {i}"),
-                }],
-            });
-            messages.push(ChatMessage::user_text(format!("Follow-up {i}")));
-        }
-        messages
-    }
 
     // ── Mock LLM provider ───────────────────────────────────────────
 
@@ -197,7 +192,7 @@ mod tests {
             _req: CompletionRequest<'_>,
             _tools: &[apex_core::domain::ToolSchema],
         ) -> Result<apex_core::domain::ToolCompletionResponse, LlmError> {
-            unimplemented!("not needed for compaction tests")
+            unimplemented!("not needed for these tests")
         }
 
         fn model_id(&self) -> &str {
@@ -208,29 +203,42 @@ mod tests {
         }
     }
 
-    // ── compact_messages tests ──────────────────────────────────────
+    // ── Helper: build messages ──────────────────────────────────────
+
+    fn make_messages(pairs: usize) -> Vec<ChatMessage> {
+        let mut messages = vec![ChatMessage::user_text("Original task")];
+        for i in 0..pairs {
+            messages.push(ChatMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: format!("Response {i}"),
+                }],
+            });
+            messages.push(ChatMessage::user_text(format!("Follow-up {i}")));
+        }
+        messages
+    }
+
+    // ── Compactor tests ─────────────────────────────────────────────
 
     #[tokio::test]
     async fn compact_uses_llm_summary() {
-        let messages = make_messages(20);
-        let llm = MockLlmProvider::success(
+        let llm = Arc::new(MockLlmProvider::success(
             "## Summary\n- Worked on the original task\n- Used shell_exec to run tests",
-        );
+        ));
+        let compactor = LlmConversationCompactor::new(llm);
+        let messages = make_messages(20);
 
-        let result = compact_messages(&messages, &llm, 3, 1024).await;
+        let result = compactor.compact(&messages, 3, 1024).await;
 
         assert!(result.is_ok());
         let (compacted, count) = result.unwrap();
         assert!(count > 0);
-        // First message should be original task
         assert_eq!(compacted[0].text(), "Original task");
-        // Second message should contain the LLM summary
         let summary = compacted[1].text();
         assert!(summary.contains("compacted"));
         assert!(summary.contains("Worked on the original task"));
-        // Should have fewer messages
         assert!(compacted.len() < messages.len());
-        // Verify strict alternation
         assert_eq!(compacted[0].role, MessageRole::User);
         assert_eq!(compacted[1].role, MessageRole::Assistant);
         for i in 1..compacted.len() {
@@ -244,10 +252,11 @@ mod tests {
 
     #[tokio::test]
     async fn compact_returns_error_on_llm_failure() {
+        let llm = Arc::new(MockLlmProvider::error());
+        let compactor = LlmConversationCompactor::new(llm);
         let messages = make_messages(20);
-        let llm = MockLlmProvider::error();
 
-        let result = compact_messages(&messages, &llm, 3, 1024).await;
+        let result = compactor.compact(&messages, 3, 1024).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("LLM summary failed"));
@@ -255,6 +264,8 @@ mod tests {
 
     #[tokio::test]
     async fn compact_returns_error_when_too_few_messages() {
+        let llm = Arc::new(MockLlmProvider::success("summary"));
+        let compactor = LlmConversationCompactor::new(llm);
         let messages = vec![
             ChatMessage::user_text("Do something"),
             ChatMessage {
@@ -262,9 +273,8 @@ mod tests {
                 content: vec![ContentBlock::Text { text: "OK".into() }],
             },
         ];
-        let llm = MockLlmProvider::success("summary");
 
-        let result = compact_messages(&messages, &llm, 6, 1024).await;
+        let result = compactor.compact(&messages, 6, 1024).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("too few messages"));
@@ -272,17 +282,14 @@ mod tests {
 
     #[tokio::test]
     async fn compact_split_point_starts_with_user() {
-        // 10 pairs = 21 messages, preserve_turns=2 => preserve 4 messages from end
-        // split_point = 21 - 4 = 17, messages[17] should be User
+        let llm = Arc::new(MockLlmProvider::success("Summary text"));
+        let compactor = LlmConversationCompactor::new(llm);
         let messages = make_messages(10);
-        let llm = MockLlmProvider::success("Summary text");
 
-        let result = compact_messages(&messages, &llm, 2, 1024).await;
+        let result = compactor.compact(&messages, 2, 1024).await;
 
         assert!(result.is_ok());
         let (compacted, _) = result.unwrap();
-        // After compaction: [User(original), Assistant(summary), User, Assistant, ...]
-        // Verify alternation holds
         for i in 1..compacted.len() {
             assert_ne!(
                 compacted[i].role,
@@ -292,24 +299,14 @@ mod tests {
         }
     }
 
-    // ── Characterization tests — compaction logic ──
-    //
-    // These tests pin the structural contract of `compact_messages()`:
-    //   1. First message (original task) is always preserved verbatim.
-    //   2. Second message is an Assistant summary containing the compacted count.
-    //   3. Preserved tail messages are appended unchanged.
-    //   4. Strict User/Assistant alternation is maintained throughout.
-    //   5. The returned `count` equals the number of middle messages summarized.
-    //
-    // Phase 2 changes the *trigger* mechanism (auto-compaction instead of a
-    // virtual tool) but must not change these structural guarantees.
-
     #[tokio::test]
     async fn characterization_compaction_preserves_first_message_verbatim() {
+        let llm = Arc::new(MockLlmProvider::success("Summary of work"));
+        let compactor = LlmConversationCompactor::new(llm);
         let messages = make_messages(10);
-        let llm = MockLlmProvider::success("Summary of work");
 
-        let (compacted, _count) = compact_messages(&messages, &llm, 2, 1024)
+        let (compacted, _count) = compactor
+            .compact(&messages, 2, 1024)
             .await
             .expect("compaction should succeed");
 
@@ -323,10 +320,12 @@ mod tests {
 
     #[tokio::test]
     async fn characterization_compaction_summary_contains_count_marker() {
+        let llm = Arc::new(MockLlmProvider::success("Summary of conversation"));
+        let compactor = LlmConversationCompactor::new(llm);
         let messages = make_messages(10);
-        let llm = MockLlmProvider::success("Summary of conversation");
 
-        let (compacted, count) = compact_messages(&messages, &llm, 2, 1024)
+        let (compacted, count) = compactor
+            .compact(&messages, 2, 1024)
             .await
             .expect("compaction should succeed");
 
@@ -345,21 +344,19 @@ mod tests {
 
     #[tokio::test]
     async fn characterization_compaction_preserved_tail_is_unchanged() {
-        let messages = make_messages(8); // 17 messages total
-        let llm = MockLlmProvider::success("Summary");
+        let llm = Arc::new(MockLlmProvider::success("Summary"));
+        let compactor = LlmConversationCompactor::new(llm);
+        let messages = make_messages(8);
         let preserve_turns = 2;
 
-        let (compacted, count) = compact_messages(&messages, &llm, preserve_turns, 1024)
+        let (compacted, count) = compactor
+            .compact(&messages, preserve_turns, 1024)
             .await
             .expect("compaction should succeed");
 
-        // The compacted tail = everything after [original_task, summary].
-        // The split point may shift by +1 to maintain User-first alternation,
-        // so we derive the actual tail from the returned count instead of
-        // assuming an exact `preserve_turns * 2` length.
-        let actual_split = count + 1; // messages[1..split_point] were summarized
+        let actual_split = count + 1;
         let original_tail = &messages[actual_split..];
-        let compacted_tail = &compacted[2..]; // skip [original_task, summary]
+        let compacted_tail = &compacted[2..];
 
         assert_eq!(
             compacted_tail.len(),
@@ -377,16 +374,16 @@ mod tests {
 
     #[tokio::test]
     async fn characterization_compaction_count_equals_summarized_middle() {
-        let messages = make_messages(10); // 21 messages
-        let llm = MockLlmProvider::success("Summary");
+        let llm = Arc::new(MockLlmProvider::success("Summary"));
+        let compactor = LlmConversationCompactor::new(llm);
+        let messages = make_messages(10);
         let preserve_turns = 3;
 
-        let (compacted, count) = compact_messages(&messages, &llm, preserve_turns, 1024)
+        let (compacted, count) = compactor
+            .compact(&messages, preserve_turns, 1024)
             .await
             .expect("compaction should succeed");
 
-        // count = split_point - 1 (we summarize messages[1..split_point])
-        // compacted = 1 (original) + 1 (summary) + preserved tail
         let preserved_tail_len = compacted.len() - 2;
         let expected_count = messages.len() - 1 - preserved_tail_len;
         assert_eq!(
@@ -397,8 +394,9 @@ mod tests {
 
     #[tokio::test]
     async fn characterization_compaction_with_tool_use_blocks() {
-        // Ensure messages containing ToolUse and ToolResult blocks are serialized
-        // into the summary prompt (i.e. not silently dropped).
+        let llm = Arc::new(MockLlmProvider::success("Ran cargo test, 3 tests passed"));
+        let compactor = LlmConversationCompactor::new(llm);
+
         let mut messages = vec![ChatMessage::user_text("Fix the bug")];
         messages.push(ChatMessage {
             role: MessageRole::Assistant,
@@ -416,7 +414,6 @@ mod tests {
                 is_error: false,
             }],
         });
-        // Add more pairs to have enough to compact
         for i in 0..6 {
             messages.push(ChatMessage {
                 role: MessageRole::Assistant,
@@ -427,8 +424,7 @@ mod tests {
             messages.push(ChatMessage::user_text(format!("Follow {i}")));
         }
 
-        let llm = MockLlmProvider::success("Ran cargo test, 3 tests passed");
-        let result = compact_messages(&messages, &llm, 2, 1024).await;
+        let result = compactor.compact(&messages, 2, 1024).await;
 
         assert!(
             result.is_ok(),
@@ -436,7 +432,6 @@ mod tests {
         );
         let (compacted, count) = result.unwrap();
         assert!(count > 0);
-        // Alternation must still hold
         for i in 1..compacted.len() {
             assert_ne!(
                 compacted[i].role,
@@ -448,7 +443,9 @@ mod tests {
 
     #[tokio::test]
     async fn compact_with_odd_message_count_adjusts_split() {
-        // Build messages ending with an Assistant message (odd count)
+        let llm = Arc::new(MockLlmProvider::success("Summary"));
+        let compactor = LlmConversationCompactor::new(llm);
+
         let mut messages = vec![ChatMessage::user_text("Task")];
         for i in 0..5 {
             messages.push(ChatMessage {
@@ -459,7 +456,6 @@ mod tests {
             });
             messages.push(ChatMessage::user_text(format!("Follow {i}")));
         }
-        // Add a trailing Assistant message
         messages.push(ChatMessage {
             role: MessageRole::Assistant,
             content: vec![ContentBlock::Text {
@@ -467,12 +463,10 @@ mod tests {
             }],
         });
 
-        let llm = MockLlmProvider::success("Summary");
-        let result = compact_messages(&messages, &llm, 2, 1024).await;
+        let result = compactor.compact(&messages, 2, 1024).await;
 
         assert!(result.is_ok());
         let (compacted, _) = result.unwrap();
-        // Verify alternation
         for i in 1..compacted.len() {
             assert_ne!(
                 compacted[i].role,

@@ -8,7 +8,10 @@ use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{
     AttemptOutcome, AttemptRecord, ChatMessage, ClaimedTask, HookEvent, HookOutcome, MessageType,
 };
-use apex_core::ports::{HookRegistry, LlmProvider, MemoryStore, Queue, SkillStore, WorkingMemory};
+use apex_core::ports::{
+    ConversationCompactor, HookRegistry, LlmProvider, MemoryStore, Queue, SkillExtractor,
+    SkillStore, WorkingMemory,
+};
 
 use crate::agentic_loop::{run_agentic_loop, LoopConfig, LoopOutcome};
 use crate::claim_tool_factory::{ClaimContext, ClaimToolFactory};
@@ -41,6 +44,9 @@ pub struct WorkerContext {
     pub queue: Arc<dyn Queue>,
     pub claim_tool_factory: Arc<dyn ClaimToolFactory>,
     pub llm: Arc<dyn LlmProvider>,
+    pub compactor: Arc<dyn ConversationCompactor>,
+    /// Used only during post-claim consolidation.
+    pub skill_extractor: Option<Arc<dyn SkillExtractor>>,
     pub memory: Arc<dyn WorkingMemory>,
     pub long_term: Arc<dyn MemoryStore>,
     pub skills: Arc<dyn SkillStore>,
@@ -280,6 +286,7 @@ async fn execute_claim(
     let loop_config = LoopConfig {
         persona: &ctx.persona,
         llm: ctx.llm.as_ref(),
+        compactor: ctx.compactor.as_ref(),
         tools: tools.as_ref(),
         estimator: &ctx.estimator,
         max_tool_result_bytes: ctx.limits.max_tool_result_bytes,
@@ -375,7 +382,7 @@ async fn execute_claim(
         consolidate_learnings(
             ctx.long_term.as_ref(),
             ctx.skills.as_ref(),
-            ctx.llm.as_ref(),
+            ctx.skill_extractor.as_deref(),
             &claimed.headers.correlation_id,
             &record,
             &scratchpad,
@@ -668,10 +675,14 @@ mod tests {
         let long_term: Arc<dyn MemoryStore> = Arc::new(MockMemoryStore::new());
         let skills: Arc<dyn SkillStore> = Arc::new(MockSkillStore::new());
 
+        let compactor: Arc<dyn ConversationCompactor> =
+            Arc::new(MockConversationCompactor::new("mock summary"));
         let ctx = WorkerContext {
             queue: queue as Arc<dyn Queue>,
             claim_tool_factory: claim_factory,
             llm,
+            compactor,
+            skill_extractor: None,
             memory,
             long_term,
             skills,

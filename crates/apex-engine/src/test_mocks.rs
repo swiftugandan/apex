@@ -8,13 +8,16 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use apex_core::domain::{
-    CalibrationData, ChatMessage, ClaimedTask, CompletionRequest, CompletionResponse, ContentBlock,
-    Fact, FactId, MessageRole, QueueDepth, QueueMessage, QueueMessageMeta, ReapResult, Scratchpad,
-    Skill, SkillId, SkillManifest, StopReason, TokenUsage, ToolCall, ToolCompletionResponse,
-    ToolDef, ToolResult, ToolSchema,
+    AttemptRecord, CalibrationData, ChatMessage, ClaimedTask, CompletionRequest,
+    CompletionResponse, ContentBlock, ExtractedSkill, Fact, FactId, MessageRole, QueueDepth,
+    QueueMessage, QueueMessageMeta, ReapResult, Scratchpad, Skill, SkillId, SkillManifest,
+    StopReason, TokenUsage, ToolCall, ToolCompletionResponse, ToolDef, ToolResult, ToolSchema,
 };
 use apex_core::error::{LlmError, MemoryError, QueueError, ToolError};
-use apex_core::ports::{LlmProvider, MemoryStore, Queue, SkillStore, ToolRegistry, WorkingMemory};
+use apex_core::ports::{
+    ConversationCompactor, LlmProvider, MemoryStore, Queue, SkillExtractor, SkillStore,
+    ToolRegistry, WorkingMemory,
+};
 
 use crate::claim_tool_factory::{ClaimContext, ClaimToolFactory};
 
@@ -606,5 +609,74 @@ impl SkillStore for MockSkillStore {
             }
         }
         Ok(())
+    }
+}
+
+// ── MockConversationCompactor ─────────────────────────────────────
+
+pub struct MockConversationCompactor {
+    pub summary: String,
+}
+
+impl MockConversationCompactor {
+    pub fn new(summary: &str) -> Self {
+        Self {
+            summary: summary.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl ConversationCompactor for MockConversationCompactor {
+    async fn compact(
+        &self,
+        messages: &[ChatMessage],
+        _preserve_turns: usize,
+        _max_summary_tokens: u32,
+    ) -> Result<(Vec<ChatMessage>, usize), String> {
+        if messages.len() < 3 {
+            return Err("too few messages to compact".into());
+        }
+        // Return a canned result: keep first message + summary + last message.
+        // Tests needing alternation-aware compaction should use LlmConversationCompactor
+        // with a mock LlmProvider instead.
+        let compacted_count = messages.len() - 2;
+        let summary_text = format!(
+            "[Conversation compacted: {compacted_count} messages summarized]\n\n{}",
+            self.summary
+        );
+        let result = vec![
+            messages[0].clone(),
+            ChatMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::Text { text: summary_text }],
+            },
+            messages.last().unwrap().clone(),
+        ];
+        Ok((result, compacted_count))
+    }
+}
+
+// ── MockSkillExtractor ────────────────────────────────────────────
+
+pub struct MockSkillExtractor {
+    pub result: Option<ExtractedSkill>,
+}
+
+impl MockSkillExtractor {
+    pub fn new(result: Option<ExtractedSkill>) -> Self {
+        Self { result }
+    }
+}
+
+#[async_trait]
+impl SkillExtractor for MockSkillExtractor {
+    async fn extract_skill(
+        &self,
+        _goal: &str,
+        _record: &AttemptRecord,
+        _skill_store: &dyn SkillStore,
+    ) -> Option<ExtractedSkill> {
+        self.result.clone()
     }
 }
