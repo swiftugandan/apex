@@ -169,6 +169,8 @@ pub struct CompletionRequest<'a> {
     pub temperature: Option<f32>,
     /// Hint to providers: tool schemas are stable and may be cached.
     pub cache_tools: bool,
+    /// When > 0, tells the provider to enable reasoning/thinking mode.
+    pub reserved_reasoning_tokens: u32,
 }
 
 /// Response from the LLM (no tools).

@@ -91,6 +91,7 @@ pub(crate) async fn compact_messages(
         max_tokens: max_summary_tokens,
         temperature: Some(0.0),
         cache_tools: false,
+        reserved_reasoning_tokens: 0,
     };
 
     let summary_text = match llm.complete(req).await {

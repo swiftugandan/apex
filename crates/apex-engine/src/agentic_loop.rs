@@ -275,6 +275,7 @@ pub async fn run_agentic_loop(
             max_tokens: effective_max_tokens,
             temperature: Some(0.2),
             cache_tools: config.prompt_caching,
+            reserved_reasoning_tokens: config.reserved_reasoning_tokens,
         };
 
         let resp = match config.llm.complete_with_tools(req, &schemas).await {

@@ -143,13 +143,18 @@ impl OpenAiProvider {
                         }
                     }
 
+                    // Some providers (e.g. StepFun) reject assistant messages with
+                    // content: null when tool_calls is present. Always send at least
+                    // an empty string to avoid "Unrecognized chat message" errors.
+                    let content_str = if text_parts.is_empty() {
+                        String::new()
+                    } else {
+                        text_parts.join("\n")
+                    };
+
                     out.push(OaiMessage {
                         role: "assistant".into(),
-                        content: if text_parts.is_empty() {
-                            None
-                        } else {
-                            Some(text_parts.join("\n"))
-                        },
+                        content: Some(content_str),
                         tool_calls: if tool_calls.is_empty() {
                             None
                         } else {
@@ -287,11 +292,15 @@ impl LlmProvider for OpenAiProvider {
         let mut messages = vec![Self::build_system_message(req.system_blocks)];
         messages.extend(Self::build_messages(req.messages));
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model,
             "max_tokens": req.max_tokens,
             "messages": messages,
         });
+
+        if req.reserved_reasoning_tokens > 0 {
+            body["reasoning"] = serde_json::json!({ "enabled": true });
+        }
 
         let response = self.send_request(body).await?;
         let (message, _) = Self::parse_response(&response)?;
@@ -317,13 +326,17 @@ impl LlmProvider for OpenAiProvider {
         let mut messages = vec![Self::build_system_message(req.system_blocks)];
         messages.extend(Self::build_messages(req.messages));
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model,
             "max_tokens": req.max_tokens,
             "messages": messages,
             "tools": Self::build_tools(tools),
             "tool_choice": "auto",
         });
+
+        if req.reserved_reasoning_tokens > 0 {
+            body["reasoning"] = serde_json::json!({ "enabled": true });
+        }
 
         let response = self.send_request(body).await?;
         let (message, tool_calls) = Self::parse_response(&response)?;
