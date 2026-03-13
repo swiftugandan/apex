@@ -268,6 +268,7 @@ mod tests {
                 output_summary: "test output".to_string(),
                 is_error: false,
                 duration_ms: 100,
+                error_output: None,
             })
             .collect();
         AttemptRecord {

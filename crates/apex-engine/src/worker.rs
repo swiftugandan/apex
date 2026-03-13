@@ -321,7 +321,18 @@ async fn execute_claim(
         prompt_caching: ctx.limits.prompt_caching,
         orientation: orientation_provider.as_deref(),
     };
-    let (turns, loop_outcome, _messages) = run_agentic_loop(messages, &loop_config).await;
+    let (turns, loop_outcome, final_messages) = run_agentic_loop(messages, &loop_config).await;
+
+    // Best-effort: save full conversation for post-mortem debugging
+    if let Some(ref scratch) = ctx.scratch_dir {
+        let conv_dir = scratch.join("conversations");
+        let _ = std::fs::create_dir_all(&conv_dir);
+        let conv_path = conv_dir.join(format!("{job_id}.json"));
+        let _ = std::fs::write(
+            &conv_path,
+            serde_json::to_string_pretty(&final_messages).unwrap_or_default(),
+        );
+    }
 
     // Persist calibration data after loop completes
     {

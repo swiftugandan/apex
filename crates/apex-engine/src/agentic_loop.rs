@@ -490,6 +490,7 @@ pub async fn run_agentic_loop(
                             output_summary: format!("BLOCKED: {msg}"),
                             is_error: true,
                             duration_ms: 0,
+                            error_output: Some(format!("Blocked by hook: {msg}")),
                         });
                         break;
                     }
@@ -522,6 +523,7 @@ pub async fn run_agentic_loop(
                 output_summary: "BUDGET_EXCEEDED".to_string(),
                 is_error: true,
                 duration_ms: 0,
+                error_output: Some("Tool call budget exceeded".to_string()),
             });
         }
 
@@ -562,12 +564,19 @@ pub async fn run_agentic_loop(
         for (call, result, elapsed) in results {
             let duration_ms = elapsed.as_millis() as u64;
 
+            let error_output = if result.is_error {
+                let raw = result.output.to_string();
+                Some(apex_core::truncate_str(&raw, 2000).to_owned())
+            } else {
+                None
+            };
             call_records.push(ToolCallRecord {
                 name: call.name.clone(),
                 input_summary: summarize_json(&call.input, 80),
                 output_summary: summarize_json(&result.output, 120),
                 is_error: result.is_error,
                 duration_ms,
+                error_output,
             });
 
             // Post-execution: rewrite bulky tool inputs in history (Principle 5)

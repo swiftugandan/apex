@@ -126,9 +126,10 @@ fn create_tool_definition() -> ToolDef {
     ToolDef {
         schema: ToolSchema {
             name: "create_tool".into(),
-            description: "Create a new custom tool. Writes implementation script and schema, \
-                          runs tests, and registers the tool for immediate use."
-                .into(),
+            description:
+                "Create a new custom tool. Writes implementation script, schema, and test, \
+                          runs tests, and registers the tool in the manifest for immediate use."
+                    .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -142,7 +143,7 @@ fn create_tool_definition() -> ToolDef {
                     },
                     "implementation": {
                         "type": "string",
-                        "description": "Shell script content for run.sh. Receives JSON input on stdin, must write JSON to stdout."
+                        "description": "Shell script content for run.sh. Receives the full JSON input object on stdin (e.g. {\"text\":\"hello\"}). Use jq to extract fields: input=$(cat); text=$(echo \"$input\" | jq -r '.text'). Must write JSON to stdout."
                     },
                     "input_schema": {
                         "type": "object",
@@ -164,7 +165,7 @@ fn create_tool_definition() -> ToolDef {
                 "required": ["name", "description", "implementation", "input_schema", "test_script"]
             }),
         },
-        loading: ToolLoading::Deferred,
+        loading: ToolLoading::Eager,
     }
 }
 

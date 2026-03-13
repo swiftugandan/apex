@@ -44,6 +44,12 @@ impl MessageComposer {
                     "{}. Called `{}` — {} ({}ms, {})\n",
                     step, tc.name, tc.input_summary, tc.duration_ms, status
                 ));
+                if tc.is_error {
+                    if let Some(ref err) = tc.error_output {
+                        let capped = crate::truncate_str(err, 2000);
+                        out.push_str(&format!("   Error: {capped}\n"));
+                    }
+                }
                 step += 1;
             }
         }
@@ -361,8 +367,16 @@ impl MessageComposer {
                     "- Called `{}` — {} ({}ms, {})\n",
                     tc.name, tc.input_summary, tc.duration_ms, status
                 ));
-                if tc.is_error && !tc.output_summary.is_empty() {
-                    out.push_str(&format!("  Error: {}\n", tc.output_summary));
+                if tc.is_error {
+                    let err_text = tc
+                        .error_output
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(&tc.output_summary);
+                    if !err_text.is_empty() {
+                        let capped = crate::truncate_str(err_text, 500);
+                        out.push_str(&format!("  Error: {capped}\n"));
+                    }
                 }
             }
         }
@@ -400,6 +414,7 @@ mod tests {
             },
             is_error,
             duration_ms: 100,
+            error_output: None,
         }
     }
 

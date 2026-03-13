@@ -57,8 +57,10 @@ async fn main() -> Result<()> {
             }
         }
         Some("cat") => {
-            let path = args.get(1).context("Usage: apex cat <message-path>")?;
-            cmd_cat(path).await
+            let id_or_path = args
+                .get(1)
+                .context("Usage: apex cat <message-id-or-path>")?;
+            cmd_cat(id_or_path).await
         }
         Some("work") => cmd_work().await,
         Some("status") => cmd_status().await,
@@ -249,9 +251,15 @@ async fn cmd_queue_retry() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_cat(path: &str) -> Result<()> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read message file: {path}"))?;
+async fn cmd_cat(id_or_path: &str) -> Result<()> {
+    let resolved = if Path::new(id_or_path).exists() {
+        id_or_path.to_string()
+    } else {
+        resolve_message_path(id_or_path)?
+    };
+
+    let content = std::fs::read_to_string(&resolved)
+        .with_context(|| format!("failed to read message file: {resolved}"))?;
 
     if let Some(pos) = content.find("\n\n") {
         println!("{}", &content[pos + 2..]);
@@ -259,6 +267,45 @@ async fn cmd_cat(path: &str) -> Result<()> {
         println!("{content}");
     }
     Ok(())
+}
+
+/// Scan queue directories for a file matching the given ID prefix.
+fn resolve_message_path(id_prefix: &str) -> Result<String> {
+    let paths = ProjectPaths::resolve()?;
+    let queue_dir = paths.work_queue;
+    let dirs = ["done", "failed", "pending", "processing"];
+    let mut matches: Vec<std::path::PathBuf> = Vec::new();
+
+    for dir_name in &dirs {
+        let dir = queue_dir.join(dir_name);
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                let name = fname.to_string_lossy();
+                if name.starts_with(id_prefix) {
+                    matches.push(entry.path());
+                }
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => bail!("no message found matching prefix '{id_prefix}' in queue directories"),
+        1 => Ok(matches[0].to_string_lossy().into_owned()),
+        n => {
+            let listing: Vec<String> = matches
+                .iter()
+                .map(|p| format!("  {}", p.display()))
+                .collect();
+            bail!(
+                "ambiguous prefix '{id_prefix}' matched {n} files:\n{}",
+                listing.join("\n")
+            )
+        }
+    }
 }
 
 async fn cmd_status() -> Result<()> {

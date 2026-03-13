@@ -1244,6 +1244,8 @@ pub struct ToolCallRecord {
     pub output_summary: String,
     pub is_error: bool,
     pub duration_ms: u64,
+    /// Full error output (untruncated) for debugging; only populated when `is_error` is true.
+    pub error_output: Option<String>,
 }
 
 /// Outcome of an attempt.
