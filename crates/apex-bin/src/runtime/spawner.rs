@@ -349,6 +349,7 @@ impl SubAgentSpawner for InProcessSpawner {
             consolidation: self.config.consolidation.clone(),
             hooks: sub_hooks,
             scratch_dir: Some(self.project_paths.scratch_dir.clone()),
+            orientation_factory: Some(Arc::new(super::ScratchpadOrientationFactory)),
         };
 
         let num_workers = role.max_concurrent.max(1);

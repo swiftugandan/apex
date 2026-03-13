@@ -13,7 +13,8 @@ use apex_core::domain::{
     MessageRole, SystemBlock, ToolCallRecord, TurnRecord,
 };
 use apex_core::ports::{
-    ConversationCompactor, HookRegistry, LlmProvider, ToolRegistry, WorkingMemory,
+    ConversationCompactor, HookRegistry, LlmProvider, OrientationProvider, ToolRegistry,
+    WorkingMemory,
 };
 
 use apex_core::summarize_json;
@@ -72,6 +73,8 @@ pub struct LoopConfig<'a> {
     pub max_total_tool_calls: usize,
     /// Enable prompt caching hints for static system prompt and tool blocks.
     pub prompt_caching: bool,
+    /// Optional per-turn orientation provider (injected from composition root).
+    pub orientation: Option<&'a dyn OrientationProvider>,
 }
 
 /// Serialize `messages` as pretty-printed JSON directly to a file under `dir`,
@@ -105,8 +108,12 @@ async fn estimate_prompt_tokens(
 
 /// Automatically compact conversation history when estimated prompt tokens
 /// reach ≥ 80% of usable input capacity (context window minus reserve and max output).
-/// Returns the estimated prompt tokens (post-compaction if compaction occurred).
-async fn maybe_compact(messages: &mut Vec<ChatMessage>, config: &LoopConfig<'_>) -> u32 {
+/// Returns `(estimated_tokens, Option<compacted_count>)` — the second element is
+/// `Some(n)` when compaction fired and `n` messages were summarized.
+async fn maybe_compact(
+    messages: &mut Vec<ChatMessage>,
+    config: &LoopConfig<'_>,
+) -> (u32, Option<usize>) {
     let context_window = config.llm.context_window() as u32;
     let usable_input = context_window
         .saturating_sub(config.reserved_reasoning_tokens)
@@ -116,7 +123,7 @@ async fn maybe_compact(messages: &mut Vec<ChatMessage>, config: &LoopConfig<'_>)
     let estimated_tokens = estimate_prompt_tokens(messages, config.estimator).await;
 
     if threshold == 0 || estimated_tokens < threshold {
-        return estimated_tokens;
+        return (estimated_tokens, None);
     }
 
     // Spill full conversation history to disk before compaction (Principle 5 & 6).
@@ -177,7 +184,8 @@ async fn maybe_compact(messages: &mut Vec<ChatMessage>, config: &LoopConfig<'_>)
             .await;
             *messages = compacted;
             // Re-estimate after compaction since messages changed
-            estimate_prompt_tokens(messages, config.estimator).await
+            let new_est = estimate_prompt_tokens(messages, config.estimator).await;
+            (new_est, Some(count))
         }
         Err(reason) => {
             dispatch_log(
@@ -192,7 +200,7 @@ async fn maybe_compact(messages: &mut Vec<ChatMessage>, config: &LoopConfig<'_>)
                 &format!("  auto-compaction skipped: {reason}"),
             )
             .await;
-            estimated_tokens
+            (estimated_tokens, None)
         }
     }
 }
@@ -213,6 +221,7 @@ pub async fn run_agentic_loop(
     } else {
         CacheHint::Dynamic
     };
+    let mut compaction_info: Option<(usize, usize)> = None; // (messages_compacted, at_turn)
     let system_blocks = vec![SystemBlock {
         text: config.persona.to_string(),
         cache_hint,
@@ -256,17 +265,51 @@ pub async fn run_agentic_loop(
         }
 
         // ── auto-compaction ──
-        let estimated_prompt_tokens = maybe_compact(&mut messages, config).await;
+        let (estimated_prompt_tokens, compacted_count) = maybe_compact(&mut messages, config).await;
+        if let Some(count) = compacted_count {
+            compaction_info = Some((count, turn_num + 1));
+        }
+
+        // ── orientation (injected as user message to preserve system prompt cache) ──
+        let context_window = config.llm.context_window();
+        let orientation_injected = if let Some(provider) = config.orientation {
+            if let Some(text) = provider
+                .build(
+                    turn_num + 1,
+                    config.max_turns,
+                    estimated_prompt_tokens,
+                    context_window,
+                    compaction_info,
+                )
+                .await
+            {
+                // Temporarily append to the last user message so it rides
+                // alongside existing content without breaking alternation.
+                if let Some(last) = messages.last_mut() {
+                    if last.role == MessageRole::User {
+                        last.content.push(ContentBlock::Text { text });
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         // Per-turn schema extraction: picks up newly loaded deferred tools
         let schemas = config.tools.schemas();
 
         // Cap max_tokens so prompt + reserve + output never exceed context window
-        let context_window = config.llm.context_window() as u32;
         let effective_max_tokens = config
             .max_output_tokens
             .min(
-                context_window
+                (context_window as u32)
                     .saturating_sub(estimated_prompt_tokens)
                     .saturating_sub(config.reserved_reasoning_tokens),
             )
@@ -284,6 +327,12 @@ pub async fn run_agentic_loop(
         let resp = match config.llm.complete_with_tools(req, &schemas).await {
             Ok(r) => r,
             Err(err) => {
+                // Clean up injected orientation before breaking
+                if orientation_injected {
+                    if let Some(last) = messages.last_mut() {
+                        last.content.pop();
+                    }
+                }
                 outcome = Some(LoopOutcome::LlmError(format!("{err}")));
                 break;
             }
@@ -377,6 +426,13 @@ pub async fn run_agentic_loop(
                 ),
             )
             .await;
+        }
+
+        // Remove injected orientation from last user message before mutating history
+        if orientation_injected {
+            if let Some(last) = messages.last_mut() {
+                last.content.pop();
+            }
         }
 
         messages.push(resp.message.clone());
@@ -690,6 +746,7 @@ mod tests {
             max_tool_calls_per_turn: 64,
             max_total_tool_calls: 512,
             prompt_caching: false,
+            orientation: None,
         }
     }
 

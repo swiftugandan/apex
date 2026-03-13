@@ -10,10 +10,12 @@ use apex_tools::{
     HooksToolRegistry, MemoryToolRegistry, SkillToolRegistry,
 };
 
+pub mod orientation;
 pub mod session_memory;
 pub mod spawner;
 pub mod tool_factory;
 
+pub use orientation::ScratchpadOrientationFactory;
 pub use spawner::{InProcessSpawner, SpawnerConfig, SubAgentRuntimeBuilder};
 pub use tool_factory::CliClaimToolFactory;
 

@@ -490,6 +490,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         consolidation: agent_config.consolidation.clone(),
         hooks: Some(hooks),
         scratch_dir: Some(paths.scratch_dir.clone()),
+        orientation_factory: Some(Arc::new(runtime::ScratchpadOrientationFactory)),
     };
 
     if max_concurrent <= 1 {

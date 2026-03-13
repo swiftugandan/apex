@@ -288,6 +288,7 @@ async fn single_task_roundtrip() {
         consolidation: ConsolidationSection::default(),
         hooks: None,
         scratch_dir: None,
+        orientation_factory: None,
     };
 
     // Run the worker loop — it should process the one message and exit

@@ -15,4 +15,4 @@ pub use agentic_loop::{run_agentic_loop, LoopConfig, LoopOutcome};
 pub use claim_tool_factory::{ClaimContext, ClaimToolFactory};
 pub use paths::ProjectPaths;
 pub use registry::{CompositeToolRegistry, OwnedFilteredToolRegistry};
-pub use worker::{worker_loop, WorkerContext, WorkerLimits};
+pub use worker::{worker_loop, OrientationFactory, WorkerContext, WorkerLimits};

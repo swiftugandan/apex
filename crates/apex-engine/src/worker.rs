@@ -9,8 +9,8 @@ use apex_core::domain::{
     AttemptOutcome, AttemptRecord, ChatMessage, ClaimedTask, HookEvent, HookOutcome, MessageType,
 };
 use apex_core::ports::{
-    ConversationCompactor, HookRegistry, LlmProvider, MemoryStore, Queue, SkillExtractor,
-    SkillStore, WorkingMemory,
+    ConversationCompactor, HookRegistry, LlmProvider, MemoryStore, OrientationProvider, Queue,
+    SkillExtractor, SkillStore, WorkingMemory,
 };
 
 use crate::agentic_loop::{run_agentic_loop, LoopConfig, LoopOutcome};
@@ -58,6 +58,17 @@ pub struct WorkerContext {
     pub hooks: Option<Arc<dyn HookRegistry>>,
     /// Scratch directory for spilling original tool inputs before rewriting.
     pub scratch_dir: Option<std::path::PathBuf>,
+    /// Factory for building per-claim orientation providers from the claim's scratchpad.
+    pub orientation_factory: Option<Arc<dyn OrientationFactory>>,
+}
+
+/// Builds a per-claim `OrientationProvider` from the claim's scratchpad.
+/// Implemented in the composition root (apex-bin).
+pub trait OrientationFactory: Send + Sync {
+    fn build(
+        &self,
+        scratchpad: Arc<Mutex<apex_core::domain::Scratchpad>>,
+    ) -> Arc<dyn OrientationProvider>;
 }
 
 // ── Worker loop ─────────────────────────────────────────────────────
@@ -266,6 +277,10 @@ async fn execute_claim(
     let messages = vec![ChatMessage::user_text(&initial_body)];
 
     let scratchpad_arc = Arc::new(Mutex::new(scratchpad));
+    let orientation_provider: Option<Arc<dyn OrientationProvider>> = ctx
+        .orientation_factory
+        .as_ref()
+        .map(|f| f.build(Arc::clone(&scratchpad_arc)));
 
     // Build per-claim tools via the factory
     let claim_ctx = ClaimContext {
@@ -304,6 +319,7 @@ async fn execute_claim(
         max_tool_calls_per_turn: ctx.limits.max_tool_calls_per_turn,
         max_total_tool_calls: ctx.limits.max_total_tool_calls,
         prompt_caching: ctx.limits.prompt_caching,
+        orientation: orientation_provider.as_deref(),
     };
     let (turns, loop_outcome, _messages) = run_agentic_loop(messages, &loop_config).await;
 
@@ -709,6 +725,7 @@ mod tests {
             consolidation: ConsolidationSection::default(),
             hooks: None,
             scratch_dir: None,
+            orientation_factory: None,
         };
 
         let result = worker_loop(ctx, 0).await;

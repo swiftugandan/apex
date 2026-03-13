@@ -162,6 +162,23 @@ pub trait SkillExtractor: Send + Sync {
     ) -> Option<ExtractedSkill>;
 }
 
+/// Provides a per-turn orientation string for the model. The engine calls
+/// this each turn and injects the result into the conversation. Concrete
+/// implementations live in the composition root (apex-bin).
+#[async_trait]
+pub trait OrientationProvider: Send + Sync {
+    /// Build an orientation string for the current turn. Returns `None` to
+    /// skip injection (e.g. simple tasks with no scratchpad).
+    async fn build(
+        &self,
+        turn: usize,
+        max_turns: usize,
+        estimated_tokens: u32,
+        context_window: usize,
+        compaction_info: Option<(usize, usize)>,
+    ) -> Option<String>;
+}
+
 /// Trait for spawning sub-agent processes. Decouples the delegate tool from
 /// concrete queue/memory/LLM provisioning.
 #[async_trait]
