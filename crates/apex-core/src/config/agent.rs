@@ -301,7 +301,7 @@ fn default_compaction_preserve_turns() -> usize {
     6
 }
 fn default_compaction_max_summary_tokens() -> u32 {
-    1024
+    2048
 }
 fn default_retrieval_max_tokens() -> u32 {
     800
