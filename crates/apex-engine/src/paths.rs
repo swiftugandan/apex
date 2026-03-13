@@ -9,7 +9,7 @@ invariant = true
 propagate = true
 
 [action]
-action_type = "script"
+type = "script"
 command = """
 INPUT=$(cat)
 ERR=$(echo "$INPUT" | jq -r '.error // empty' | tr '[:upper:]' '[:lower:]')
@@ -31,7 +31,7 @@ invariant = true
 propagate = true
 
 [action]
-action_type = "script"
+type = "script"
 command = """
 INPUT=$(cat)
 ERR=$(echo "$INPUT" | jq -r '.error // empty' | tr '[:upper:]' '[:lower:]')
