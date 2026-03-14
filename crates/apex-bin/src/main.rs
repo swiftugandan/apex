@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use apex_core::config::ConfigLoader;
 use apex_core::context::{MessageComposer, TokenEstimator};
-use apex_core::domain::{MessageHeaders, MessageType, QueueMessage};
+use apex_core::domain::{LoopLimits, MessageHeaders, MessageType, QueueMessage};
 use apex_core::ports::HookRegistry;
 use apex_core::ports::{MemoryStore, Queue, SkillStore, WorkingMemory};
 use apex_engine::{worker_loop, ClaimToolFactory, ProjectPaths, WorkerContext, WorkerLimits};
@@ -459,6 +459,17 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
 
     let reserved_reasoning_tokens = ConfigLoader::resolve_reserved_reasoning_tokens(&agent_config);
 
+    let loop_limits = LoopLimits {
+        max_tool_result_bytes,
+        max_output_tokens,
+        reserved_reasoning_tokens,
+        max_turns: agent_config.agent.max_turns,
+        max_tool_input_bytes,
+        max_tool_calls_per_turn: agent_config.agent.max_tool_calls_per_turn,
+        max_total_tool_calls: agent_config.agent.max_total_tool_calls,
+        prompt_caching: agent_config.agent.prompt_caching,
+    };
+
     // Build the SubAgentSpawner with typed runtime builder (replaces closure bag)
     let sub_runtime = Arc::new(runtime::SubAgentRuntimeBuilder);
     let spawner: Arc<dyn apex_core::ports::SubAgentSpawner> = Arc::new(runtime::InProcessSpawner {
@@ -472,18 +483,11 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         config: runtime::SpawnerConfig {
             invariants: Arc::clone(&invariants),
             roles: Arc::clone(&roles),
-            max_tool_result_bytes,
-            max_tool_input_bytes,
-            max_output_tokens,
-            reserved_reasoning_tokens,
             remaining_delegate_depth,
-            max_turns: agent_config.agent.max_turns,
             max_empty_cycles: agent_config.agent.max_empty_cycles,
             compaction: agent_config.compaction.clone(),
             consolidation: agent_config.consolidation.clone(),
-            max_tool_calls_per_turn: agent_config.agent.max_tool_calls_per_turn,
-            max_total_tool_calls: agent_config.agent.max_total_tool_calls,
-            prompt_caching: agent_config.agent.prompt_caching,
+            limits: loop_limits,
             tool_loading: agent_config.tool_loading.clone(),
         },
         runtime: sub_runtime,
@@ -522,15 +526,8 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
         limits: WorkerLimits {
             max_depth,
             max_retries,
-            max_tool_result_bytes,
-            max_output_tokens,
-            reserved_reasoning_tokens,
-            max_turns: agent_config.agent.max_turns,
             max_empty_cycles: agent_config.agent.max_empty_cycles,
-            max_tool_input_bytes,
-            max_tool_calls_per_turn: agent_config.agent.max_tool_calls_per_turn,
-            max_total_tool_calls: agent_config.agent.max_total_tool_calls,
-            prompt_caching: agent_config.agent.prompt_caching,
+            limits: loop_limits,
         },
         estimator,
         compaction: agent_config.compaction.clone(),

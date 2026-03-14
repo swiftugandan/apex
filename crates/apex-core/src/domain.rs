@@ -4,6 +4,19 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Numeric execution limits shared across LoopConfig, WorkerLimits, and SpawnerConfig.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoopLimits {
+    pub max_tool_result_bytes: usize,
+    pub max_output_tokens: u32,
+    pub reserved_reasoning_tokens: u32,
+    pub max_turns: usize,
+    pub max_tool_input_bytes: usize,
+    pub max_tool_calls_per_turn: usize,
+    pub max_total_tool_calls: usize,
+    pub prompt_caching: bool,
+}
+
 /// JSON schema for a tool, sent to the LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSchema {

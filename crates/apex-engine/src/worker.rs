@@ -6,7 +6,8 @@ use anyhow::Result;
 use apex_core::config::{CompactionSection, ConsolidationSection};
 use apex_core::context::{MessageComposer, TokenEstimator};
 use apex_core::domain::{
-    AttemptOutcome, AttemptRecord, ChatMessage, ClaimedTask, HookEvent, HookOutcome, MessageType,
+    AttemptOutcome, AttemptRecord, ChatMessage, ClaimedTask, HookEvent, HookOutcome, LoopLimits,
+    MessageType,
 };
 use apex_core::ports::{
     ConversationCompactor, HookRegistry, LlmProvider, MemoryStore, OrientationProvider, Queue,
@@ -27,16 +28,8 @@ use crate::util::{composer_from_estimator, extract_title, now_unix_ts};
 pub struct WorkerLimits {
     pub max_depth: u32,
     pub max_retries: u32,
-    pub max_tool_result_bytes: usize,
-    pub max_output_tokens: u32,
-    /// Reserved token budget for model reasoning/thinking.
-    pub reserved_reasoning_tokens: u32,
-    pub max_turns: usize,
     pub max_empty_cycles: u32,
-    pub max_tool_input_bytes: usize,
-    pub max_tool_calls_per_turn: usize,
-    pub max_total_tool_calls: usize,
-    pub prompt_caching: bool,
+    pub limits: LoopLimits,
 }
 
 #[derive(Clone)]
@@ -304,21 +297,14 @@ async fn execute_claim(
         compactor: ctx.compactor.as_ref(),
         tools: tools.as_ref(),
         estimator: &ctx.estimator,
-        max_tool_result_bytes: ctx.limits.max_tool_result_bytes,
-        max_output_tokens: ctx.limits.max_output_tokens,
-        reserved_reasoning_tokens: ctx.limits.reserved_reasoning_tokens,
+        limits: ctx.limits.limits,
         scratchpad: Some(&scratchpad_arc),
         memory: Some(ctx.memory.as_ref()),
         cancel: None,
         timeout: None,
         compaction: ctx.compaction.clone(),
-        max_turns: ctx.limits.max_turns,
         hooks: ctx.hooks.as_deref(),
-        max_tool_input_bytes: ctx.limits.max_tool_input_bytes,
         scratch_dir: ctx.scratch_dir.clone(),
-        max_tool_calls_per_turn: ctx.limits.max_tool_calls_per_turn,
-        max_total_tool_calls: ctx.limits.max_total_tool_calls,
-        prompt_caching: ctx.limits.prompt_caching,
         orientation: orientation_provider.as_deref(),
     };
     let (turns, loop_outcome, final_messages) = run_agentic_loop(messages, &loop_config).await;
@@ -717,15 +703,17 @@ mod tests {
             limits: WorkerLimits {
                 max_depth: 3,
                 max_retries: 3,
-                max_tool_result_bytes: 10_000,
-                max_output_tokens: 4096,
-                reserved_reasoning_tokens: 4096,
-                max_turns: 32,
                 max_empty_cycles: 300,
-                max_tool_input_bytes: 40_000,
-                max_tool_calls_per_turn: 64,
-                max_total_tool_calls: 512,
-                prompt_caching: true,
+                limits: LoopLimits {
+                    max_tool_result_bytes: 10_000,
+                    max_output_tokens: 4096,
+                    reserved_reasoning_tokens: 4096,
+                    max_turns: 32,
+                    max_tool_input_bytes: 40_000,
+                    max_tool_calls_per_turn: 64,
+                    max_total_tool_calls: 512,
+                    prompt_caching: true,
+                },
             },
             estimator: Arc::new(Mutex::new(TokenEstimator::default())),
             compaction: CompactionSection {

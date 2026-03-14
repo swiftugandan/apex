@@ -9,14 +9,15 @@ use tokio::sync::Mutex;
 
 use apex_core::domain::{
     AttemptRecord, CalibrationData, ChatMessage, ClaimedTask, CompletionRequest,
-    CompletionResponse, ContentBlock, ExtractedSkill, Fact, FactId, MessageRole, QueueDepth,
-    QueueMessage, QueueMessageMeta, ReapResult, Scratchpad, Skill, SkillId, SkillManifest,
-    StopReason, TokenUsage, ToolCall, ToolCompletionResponse, ToolDef, ToolResult, ToolSchema,
+    CompletionResponse, ContentBlock, ExtractedSkill, Fact, FactId, HookDef, HookEvent,
+    HookOutcome, MessageRole, QueueDepth, QueueMessage, QueueMessageMeta, ReapResult, Scratchpad,
+    Skill, SkillId, SkillManifest, StopReason, TokenUsage, ToolCall, ToolCompletionResponse,
+    ToolDef, ToolResult, ToolSchema,
 };
 use apex_core::error::{LlmError, MemoryError, QueueError, ToolError};
 use apex_core::ports::{
-    ConversationCompactor, LlmProvider, MemoryStore, Queue, SkillExtractor, SkillStore,
-    ToolRegistry, WorkingMemory,
+    ConversationCompactor, HookRegistry, LlmProvider, MemoryStore, Queue, SkillExtractor,
+    SkillStore, ToolRegistry, WorkingMemory,
 };
 
 use crate::claim_tool_factory::{ClaimContext, ClaimToolFactory};
@@ -678,5 +679,46 @@ impl SkillExtractor for MockSkillExtractor {
         _skill_store: &dyn SkillStore,
     ) -> Option<ExtractedSkill> {
         self.result.clone()
+    }
+}
+
+// ── MockHookRegistry ──────────────────────────────────────────────
+
+/// A mock hook registry that returns scripted outcomes for specific events.
+pub struct MockHookRegistry {
+    block_event: HookEvent,
+    outcomes: Mutex<Vec<HookOutcome>>,
+}
+
+impl MockHookRegistry {
+    /// Create a registry that blocks `BeforeToolCall` with the given reason.
+    pub fn blocking_tool_calls(reason: &str) -> Self {
+        Self {
+            block_event: HookEvent::BeforeToolCall,
+            outcomes: Mutex::new(vec![HookOutcome::Block(reason.to_string())]),
+        }
+    }
+}
+
+#[async_trait]
+impl HookRegistry for MockHookRegistry {
+    fn hooks_for(&self, _event: HookEvent) -> Vec<HookDef> {
+        Vec::new()
+    }
+
+    fn all_hooks(&self) -> Vec<HookDef> {
+        Vec::new()
+    }
+
+    async fn dispatch(&self, event: HookEvent, _context: &serde_json::Value) -> Vec<HookOutcome> {
+        if event == self.block_event {
+            self.outcomes.lock().await.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn reload(&mut self) -> Result<(), String> {
+        Ok(())
     }
 }

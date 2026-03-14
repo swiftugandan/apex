@@ -10,7 +10,7 @@ use apex_core::config::CompactionSection;
 use apex_core::context::TokenEstimator;
 use apex_core::domain::{
     CacheHint, ChatMessage, CompletionRequest, ContentBlock, HookEvent, HookOutcome, LogEntry,
-    MessageRole, SystemBlock, ToolCall, ToolCallRecord, TurnRecord,
+    LoopLimits, MessageRole, SystemBlock, ToolCall, ToolCallRecord, TurnRecord,
 };
 use apex_core::ports::{
     ConversationCompactor, HookRegistry, LlmProvider, OrientationProvider, ToolRegistry,
@@ -48,32 +48,19 @@ pub struct LoopConfig<'a> {
     pub compactor: &'a dyn ConversationCompactor,
     pub tools: &'a dyn ToolRegistry,
     pub estimator: &'a Arc<Mutex<TokenEstimator>>,
-    pub max_tool_result_bytes: usize,
-    pub max_output_tokens: u32,
-    /// Reserved token budget for model reasoning/thinking; subtracted from usable context.
-    pub reserved_reasoning_tokens: u32,
+    pub limits: LoopLimits,
     pub scratchpad: Option<&'a Arc<Mutex<apex_core::domain::Scratchpad>>>,
     pub memory: Option<&'a dyn WorkingMemory>,
     /// Optional cancellation token — checked before each turn.
     pub cancel: Option<&'a CancellationToken>,
     /// Optional wall-clock timeout for the entire loop.
     pub timeout: Option<Duration>,
-    /// Maximum number of LLM turns in this loop.
-    pub max_turns: usize,
     /// Optional lifecycle hook registry.
     pub hooks: Option<&'a dyn HookRegistry>,
-    /// Maximum tool input size in bytes before rewriting in history.
-    pub max_tool_input_bytes: usize,
     /// Scratch directory for spilling original tool inputs.
     pub scratch_dir: Option<PathBuf>,
     /// Compaction settings (preserve_turns, max_summary_tokens, spill_history).
     pub compaction: CompactionSection,
-    /// Maximum tool calls allowed per single LLM turn.
-    pub max_tool_calls_per_turn: usize,
-    /// Maximum total tool calls across all turns.
-    pub max_total_tool_calls: usize,
-    /// Enable prompt caching hints for static system prompt and tool blocks.
-    pub prompt_caching: bool,
     /// Optional per-turn orientation provider (injected from composition root).
     pub orientation: Option<&'a dyn OrientationProvider>,
 }
@@ -117,8 +104,8 @@ async fn maybe_compact(
 ) -> (u32, Option<usize>) {
     let context_window = config.llm.context_window() as u32;
     let usable_input = context_window
-        .saturating_sub(config.reserved_reasoning_tokens)
-        .saturating_sub(config.max_output_tokens);
+        .saturating_sub(config.limits.reserved_reasoning_tokens)
+        .saturating_sub(config.limits.max_output_tokens);
     let threshold = ((usable_input as f64) * 0.8).ceil() as u32;
 
     let estimated_tokens = estimate_prompt_tokens(messages, config.estimator).await;
@@ -233,6 +220,241 @@ async fn persist_scratchpad_logs(
     }
 }
 
+/// Result of executing a batch of tool calls through the full safety pipeline.
+struct ToolExecutionResult {
+    call_records: Vec<ToolCallRecord>,
+    result_blocks: Vec<ContentBlock>,
+    executed_count: usize,
+}
+
+/// Execute tool calls through the full safety pipeline:
+/// before_tool_call hooks → budget enforcement → parallel execution →
+/// input rewriting/spilling → after_tool_result hooks → smart truncation.
+async fn execute_tool_calls(
+    calls: &[&ToolCall],
+    config: &LoopConfig<'_>,
+    messages: &mut [ChatMessage],
+    total_tool_calls: usize,
+) -> ToolExecutionResult {
+    let mut call_records = Vec::new();
+    let mut result_blocks = Vec::new();
+
+    // 1. before_tool_call hooks — collect blocked calls
+    let mut blocked_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(hooks) = config.hooks {
+        for call in calls {
+            let ctx = serde_json::json!({
+                "tool": call.name,
+                "name": call.name,
+                "id": call.id,
+                "input": call.input,
+            });
+            let outcomes = hooks.dispatch(HookEvent::BeforeToolCall, &ctx).await;
+            for outcome in &outcomes {
+                if let HookOutcome::Block(msg) = outcome {
+                    dispatch_log(
+                        config.hooks,
+                        || {
+                            serde_json::json!({
+                                "level": "warn",
+                                "event": "tool_blocked",
+                                "tool": &call.name,
+                                "id": &call.id,
+                                "reason": &msg,
+                            })
+                        },
+                        &format!("  ↳ {}(…) BLOCKED: {}", call.name, msg),
+                    )
+                    .await;
+                    blocked_calls.insert(call.id.clone());
+                    result_blocks.push(ContentBlock::ToolResult {
+                        tool_use_id: call.id.clone(),
+                        content: format!("Blocked by hook: {msg}"),
+                        is_error: true,
+                    });
+                    call_records.push(ToolCallRecord {
+                        name: call.name.clone(),
+                        input_summary: summarize_json(&call.input, 80),
+                        output_summary: format!("BLOCKED: {msg}"),
+                        is_error: true,
+                        duration_ms: 0,
+                        error_output: Some(format!("Blocked by hook: {msg}")),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    // 2. Budget enforcement — filter blocked, split allowed/excess
+    let non_blocked: Vec<_> = calls
+        .iter()
+        .filter(|c| !blocked_calls.contains(&c.id))
+        .collect();
+
+    let remaining_budget = config
+        .limits
+        .max_total_tool_calls
+        .saturating_sub(total_tool_calls);
+    let effective_limit = config.limits.max_tool_calls_per_turn.min(remaining_budget);
+    let split = non_blocked.len().min(effective_limit);
+    let (allowed_calls, excess_calls) = non_blocked.split_at(split);
+
+    for call in excess_calls {
+        result_blocks.push(ContentBlock::ToolResult {
+            tool_use_id: call.id.clone(),
+            content: "Tool call budget exceeded: too many tool calls in this turn or total budget exhausted".to_string(),
+            is_error: true,
+        });
+        call_records.push(ToolCallRecord {
+            name: call.name.clone(),
+            input_summary: summarize_json(&call.input, 80),
+            output_summary: "BUDGET_EXCEEDED".to_string(),
+            is_error: true,
+            duration_ms: 0,
+            error_output: Some("Tool call budget exceeded".to_string()),
+        });
+    }
+
+    // 3. Parallel execution
+    let tool_futures: Vec<_> = allowed_calls
+        .iter()
+        .map(|call| async move {
+            dispatch_log(
+                config.hooks,
+                || {
+                    serde_json::json!({
+                        "level": "info",
+                        "event": "tool_start",
+                        "tool": &call.name,
+                        "id": &call.id,
+                    })
+                },
+                &format!("  ↳ {}(…)", call.name),
+            )
+            .await;
+            let start = Instant::now();
+            let result = match config.tools.execute(call).await {
+                Ok(r) => r,
+                Err(err) => apex_core::domain::ToolResult {
+                    tool_use_id: call.id.clone(),
+                    name: call.name.clone(),
+                    output: serde_json::json!({ "error": err.to_string() }),
+                    is_error: true,
+                    ..Default::default()
+                },
+            };
+            (**call, result, start.elapsed())
+        })
+        .collect();
+
+    let results = join_all(tool_futures).await;
+    let executed_count = results.len();
+
+    // 4. Post-execution: records, input rewriting, after_tool_result hooks, truncation
+    for (call, result, elapsed) in results {
+        let duration_ms = elapsed.as_millis() as u64;
+
+        let error_output = if result.is_error {
+            let raw = result.output.to_string();
+            Some(apex_core::truncate_str(&raw, 2000).to_owned())
+        } else {
+            None
+        };
+        call_records.push(ToolCallRecord {
+            name: call.name.clone(),
+            input_summary: summarize_json(&call.input, 80),
+            output_summary: summarize_json(&result.output, 120),
+            is_error: result.is_error,
+            duration_ms,
+            error_output,
+        });
+
+        // Post-execution: rewrite bulky tool inputs in history (Principle 5)
+        if !result.is_error {
+            if let Some(mut rewritten) =
+                config
+                    .tools
+                    .rewrite_input(call, &result, config.limits.max_tool_input_bytes)
+            {
+                // Principle 6: spill original input to scratch for debuggability
+                if let Some(scratch) = &config.scratch_dir {
+                    let spill_path = scratch.join(format!("tool-input-{}.json", call.id));
+                    let _ = std::fs::create_dir_all(scratch);
+                    let _ = std::fs::write(
+                        &spill_path,
+                        serde_json::to_string_pretty(&call.input).unwrap_or_default(),
+                    );
+                    rewritten["_spilled"] =
+                        serde_json::json!(spill_path.to_string_lossy().into_owned());
+                }
+                // Mutate the ToolUse block in the stored assistant message
+                if let Some(last_assistant) = messages
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.role == MessageRole::Assistant)
+                {
+                    for block in &mut last_assistant.content {
+                        if let ContentBlock::ToolUse { id, input, .. } = block {
+                            if *id == call.id {
+                                *input = rewritten;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let raw_content =
+            serde_json::to_string(&result.output).unwrap_or_else(|_| "{}".to_string());
+
+        // after_tool_result hooks — pass untruncated content
+        let mut final_content = raw_content.clone();
+        let mut was_transformed = false;
+        if let Some(hooks) = config.hooks {
+            let ctx = serde_json::json!({
+                "tool": call.name,
+                "name": call.name,
+                "id": call.id,
+                "output": &raw_content,
+                "is_error": result.is_error,
+                "max_tool_result_bytes": config.limits.max_tool_result_bytes,
+            });
+            let outcomes = hooks.dispatch(HookEvent::AfterToolResult, &ctx).await;
+            for outcome in outcomes {
+                if let HookOutcome::Continue(Some(transformed)) = outcome {
+                    final_content = transformed;
+                    was_transformed = true;
+                }
+            }
+        }
+
+        // Apply default truncation as fallback only if no Transform hook acted.
+        if !was_transformed && final_content.len() > config.limits.max_tool_result_bytes {
+            let truncated =
+                apex_core::truncate_str(&final_content, config.limits.max_tool_result_bytes);
+            final_content = format!(
+                "{truncated}\n\n[truncated: {orig} bytes → {kept} bytes]",
+                orig = raw_content.len(),
+                kept = truncated.len()
+            );
+        }
+
+        result_blocks.push(ContentBlock::ToolResult {
+            tool_use_id: result.tool_use_id,
+            content: final_content,
+            is_error: result.is_error,
+        });
+    }
+
+    ToolExecutionResult {
+        call_records,
+        result_blocks,
+        executed_count,
+    }
+}
+
 /// Runs the multi-turn LLM + tool execution loop. Shared between
 /// execute_task, execute_continuation, and the `delegate` tool (sub-agents).
 pub async fn run_agentic_loop(
@@ -244,7 +466,7 @@ pub async fn run_agentic_loop(
     let mut outcome: Option<LoopOutcome> = None;
     let mut total_tool_calls: usize = 0;
     let deadline = config.timeout.map(|d| Instant::now() + d);
-    let cache_hint = if config.prompt_caching {
+    let cache_hint = if config.limits.prompt_caching {
         CacheHint::Static
     } else {
         CacheHint::Dynamic
@@ -255,7 +477,7 @@ pub async fn run_agentic_loop(
         cache_hint,
     }];
 
-    for turn_num in 0..config.max_turns {
+    for turn_num in 0..config.limits.max_turns {
         // Check cancellation and timeout before each turn
         if let Some(token) = config.cancel {
             if token.is_cancelled() {
@@ -304,7 +526,7 @@ pub async fn run_agentic_loop(
             if let Some(text) = provider
                 .build(
                     turn_num + 1,
-                    config.max_turns,
+                    config.limits.max_turns,
                     estimated_prompt_tokens,
                     context_window,
                     compaction_info,
@@ -335,11 +557,12 @@ pub async fn run_agentic_loop(
 
         // Cap max_tokens so prompt + reserve + output never exceed context window
         let effective_max_tokens = config
+            .limits
             .max_output_tokens
             .min(
                 (context_window as u32)
                     .saturating_sub(estimated_prompt_tokens)
-                    .saturating_sub(config.reserved_reasoning_tokens),
+                    .saturating_sub(config.limits.reserved_reasoning_tokens),
             )
             .max(1);
 
@@ -348,8 +571,8 @@ pub async fn run_agentic_loop(
             messages: &messages,
             max_tokens: effective_max_tokens,
             temperature: Some(0.2),
-            cache_tools: config.prompt_caching,
-            reserved_reasoning_tokens: config.reserved_reasoning_tokens,
+            cache_tools: config.limits.prompt_caching,
+            reserved_reasoning_tokens: config.limits.reserved_reasoning_tokens,
         };
 
         let resp = match config.llm.complete_with_tools(req, &schemas).await {
@@ -434,8 +657,9 @@ pub async fn run_agentic_loop(
         }
 
         // Warn when output approaches or exceeds reserved reasoning budget
-        if config.reserved_reasoning_tokens > 0
-            && resp.usage.output_tokens as f64 >= 0.9 * config.reserved_reasoning_tokens as f64
+        if config.limits.reserved_reasoning_tokens > 0
+            && resp.usage.output_tokens as f64
+                >= 0.9 * config.limits.reserved_reasoning_tokens as f64
         {
             dispatch_log(
                 config.hooks,
@@ -445,12 +669,12 @@ pub async fn run_agentic_loop(
                         "event": "token_reserve_warning",
                         "turn": turn_num + 1,
                         "output_tokens": resp.usage.output_tokens,
-                        "reserved_reasoning_tokens": config.reserved_reasoning_tokens,
+                        "reserved_reasoning_tokens": config.limits.reserved_reasoning_tokens,
                     })
                 },
                 &format!(
                     "  token reserve near exhausted: {} output tokens (reserve {})",
-                    resp.usage.output_tokens, config.reserved_reasoning_tokens,
+                    resp.usage.output_tokens, config.limits.reserved_reasoning_tokens,
                 ),
             )
             .await;
@@ -481,79 +705,15 @@ pub async fn run_agentic_loop(
                 .filter(|c| c.name != TASK_COMPLETE_TOOL)
                 .collect();
 
-            let mut call_records = Vec::new();
-            let mut result_blocks = Vec::new();
-
-            // Execute sibling tools so we don't lose work from the final turn
-            if !sibling_calls.is_empty() {
-                let tool_futures: Vec<_> = sibling_calls
-                    .iter()
-                    .map(|call| async move {
-                        dispatch_log(
-                            config.hooks,
-                            || {
-                                serde_json::json!({
-                                    "level": "info",
-                                    "event": "tool_start",
-                                    "tool": &call.name,
-                                    "id": &call.id,
-                                })
-                            },
-                            &format!("  ↳ {}(…)", call.name),
-                        )
+            // Execute sibling tools through full safety pipeline
+            let (call_records, mut result_blocks) = if !sibling_calls.is_empty() {
+                let exec =
+                    execute_tool_calls(&sibling_calls, config, &mut messages, total_tool_calls)
                         .await;
-                        let start = Instant::now();
-                        let result = match config.tools.execute(call).await {
-                            Ok(r) => r,
-                            Err(err) => apex_core::domain::ToolResult {
-                                tool_use_id: call.id.clone(),
-                                name: call.name.clone(),
-                                output: serde_json::json!({ "error": err.to_string() }),
-                                is_error: true,
-                                ..Default::default()
-                            },
-                        };
-                        (*call, result, start.elapsed())
-                    })
-                    .collect();
-
-                let results = join_all(tool_futures).await;
-
-                for (call, result, elapsed) in results {
-                    let duration_ms = elapsed.as_millis() as u64;
-                    let error_output = if result.is_error {
-                        let raw = result.output.to_string();
-                        Some(apex_core::truncate_str(&raw, 2000).to_owned())
-                    } else {
-                        None
-                    };
-                    call_records.push(ToolCallRecord {
-                        name: call.name.clone(),
-                        input_summary: summarize_json(&call.input, 80),
-                        output_summary: summarize_json(&result.output, 120),
-                        is_error: result.is_error,
-                        duration_ms,
-                        error_output,
-                    });
-                    let raw_content = serde_json::to_string(&result.output)
-                        .unwrap_or_else(|_| "{}".to_string());
-                    let mut final_content = raw_content.clone();
-                    if final_content.len() > config.max_tool_result_bytes {
-                        let truncated =
-                            apex_core::truncate_str(&final_content, config.max_tool_result_bytes);
-                        final_content = format!(
-                            "{truncated}\n\n[truncated: {orig} bytes → {kept} bytes]",
-                            orig = raw_content.len(),
-                            kept = truncated.len()
-                        );
-                    }
-                    result_blocks.push(ContentBlock::ToolResult {
-                        tool_use_id: result.tool_use_id,
-                        content: final_content,
-                        is_error: result.is_error,
-                    });
-                }
-            }
+                (exec.call_records, exec.result_blocks)
+            } else {
+                (Vec::new(), Vec::new())
+            };
 
             // Synthetic ToolResult for task_complete so history stays well-formed
             result_blocks.push(ContentBlock::ToolResult {
@@ -634,215 +794,11 @@ pub async fn run_agentic_loop(
             continue;
         }
 
-        let mut call_records = Vec::new();
-        let mut result_blocks = Vec::new();
-
-        // Check before_tool_call hooks (must be sequential since hooks may block)
-        let mut blocked_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
-        if let Some(hooks) = config.hooks {
-            for call in &resp.tool_calls {
-                let ctx = serde_json::json!({
-                    "tool": call.name,
-                    "name": call.name,
-                    "id": call.id,
-                    "input": call.input,
-                });
-                let outcomes = hooks.dispatch(HookEvent::BeforeToolCall, &ctx).await;
-                for outcome in &outcomes {
-                    if let HookOutcome::Block(msg) = outcome {
-                        dispatch_log(
-                            config.hooks,
-                            || {
-                                serde_json::json!({
-                                    "level": "warn",
-                                    "event": "tool_blocked",
-                                    "tool": &call.name,
-                                    "id": &call.id,
-                                    "reason": &msg,
-                                })
-                            },
-                            &format!("  ↳ {}(…) BLOCKED: {}", call.name, msg),
-                        )
-                        .await;
-                        blocked_calls.insert(call.id.clone());
-                        result_blocks.push(ContentBlock::ToolResult {
-                            tool_use_id: call.id.clone(),
-                            content: format!("Blocked by hook: {msg}"),
-                            is_error: true,
-                        });
-                        call_records.push(ToolCallRecord {
-                            name: call.name.clone(),
-                            input_summary: summarize_json(&call.input, 80),
-                            output_summary: format!("BLOCKED: {msg}"),
-                            is_error: true,
-                            duration_ms: 0,
-                            error_output: Some(format!("Blocked by hook: {msg}")),
-                        });
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Enforce per-turn and aggregate tool call limits
-        let non_blocked: Vec<_> = resp
-            .tool_calls
-            .iter()
-            .filter(|c| !blocked_calls.contains(&c.id))
-            .collect();
-
-        let remaining_budget = config.max_total_tool_calls.saturating_sub(total_tool_calls);
-        let effective_limit = config.max_tool_calls_per_turn.min(remaining_budget);
-        let split = non_blocked.len().min(effective_limit);
-        let (allowed_calls, excess_calls) = non_blocked.split_at(split);
-
-        // Generate error results for excess calls
-        for call in excess_calls {
-            result_blocks.push(ContentBlock::ToolResult {
-                tool_use_id: call.id.clone(),
-                content: "Tool call budget exceeded: too many tool calls in this turn or total budget exhausted".to_string(),
-                is_error: true,
-            });
-            call_records.push(ToolCallRecord {
-                name: call.name.clone(),
-                input_summary: summarize_json(&call.input, 80),
-                output_summary: "BUDGET_EXCEEDED".to_string(),
-                is_error: true,
-                duration_ms: 0,
-                error_output: Some("Tool call budget exceeded".to_string()),
-            });
-        }
-
-        let tool_futures: Vec<_> = allowed_calls
-            .iter()
-            .map(|call| async move {
-                dispatch_log(
-                    config.hooks,
-                    || {
-                        serde_json::json!({
-                            "level": "info",
-                            "event": "tool_start",
-                            "tool": &call.name,
-                            "id": &call.id,
-                        })
-                    },
-                    &format!("  ↳ {}(…)", call.name),
-                )
-                .await;
-                let start = Instant::now();
-                let result = match config.tools.execute(call).await {
-                    Ok(r) => r,
-                    Err(err) => apex_core::domain::ToolResult {
-                        tool_use_id: call.id.clone(),
-                        name: call.name.clone(),
-                        output: serde_json::json!({ "error": err.to_string() }),
-                        is_error: true,
-                        ..Default::default()
-                    },
-                };
-                (*call, result, start.elapsed())
-            })
-            .collect();
-
-        let results = join_all(tool_futures).await;
-        total_tool_calls += results.len();
-
-        for (call, result, elapsed) in results {
-            let duration_ms = elapsed.as_millis() as u64;
-
-            let error_output = if result.is_error {
-                let raw = result.output.to_string();
-                Some(apex_core::truncate_str(&raw, 2000).to_owned())
-            } else {
-                None
-            };
-            call_records.push(ToolCallRecord {
-                name: call.name.clone(),
-                input_summary: summarize_json(&call.input, 80),
-                output_summary: summarize_json(&result.output, 120),
-                is_error: result.is_error,
-                duration_ms,
-                error_output,
-            });
-
-            // Post-execution: rewrite bulky tool inputs in history (Principle 5)
-            if !result.is_error {
-                if let Some(mut rewritten) =
-                    config
-                        .tools
-                        .rewrite_input(call, &result, config.max_tool_input_bytes)
-                {
-                    // Principle 6: spill original input to scratch for debuggability
-                    if let Some(scratch) = &config.scratch_dir {
-                        let spill_path = scratch.join(format!("tool-input-{}.json", call.id));
-                        let _ = std::fs::create_dir_all(scratch);
-                        let _ = std::fs::write(
-                            &spill_path,
-                            serde_json::to_string_pretty(&call.input).unwrap_or_default(),
-                        );
-                        rewritten["_spilled"] =
-                            serde_json::json!(spill_path.to_string_lossy().into_owned());
-                    }
-                    // Mutate the ToolUse block in the stored assistant message
-                    if let Some(last_assistant) = messages
-                        .iter_mut()
-                        .rev()
-                        .find(|m| m.role == MessageRole::Assistant)
-                    {
-                        for block in &mut last_assistant.content {
-                            if let ContentBlock::ToolUse { id, input, .. } = block {
-                                if *id == call.id {
-                                    *input = rewritten;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            let raw_content =
-                serde_json::to_string(&result.output).unwrap_or_else(|_| "{}".to_string());
-
-            // ── after_tool_result hooks ──
-            // Pass untruncated content to hooks so they see the full output.
-            let mut final_content = raw_content.clone();
-            let mut was_transformed = false;
-            if let Some(hooks) = config.hooks {
-                let ctx = serde_json::json!({
-                    "tool": call.name,
-                    "name": call.name,
-                    "id": call.id,
-                    "output": &raw_content,
-                    "is_error": result.is_error,
-                    "max_tool_result_bytes": config.max_tool_result_bytes,
-                });
-                let outcomes = hooks.dispatch(HookEvent::AfterToolResult, &ctx).await;
-                for outcome in outcomes {
-                    if let HookOutcome::Continue(Some(transformed)) = outcome {
-                        final_content = transformed;
-                        was_transformed = true;
-                    }
-                }
-            }
-
-            // Apply default truncation as fallback only if no Transform hook acted.
-            if !was_transformed && final_content.len() > config.max_tool_result_bytes {
-                let truncated =
-                    apex_core::truncate_str(&final_content, config.max_tool_result_bytes);
-                final_content = format!(
-                    "{truncated}\n\n[truncated: {orig} bytes → {kept} bytes]",
-                    orig = raw_content.len(),
-                    kept = truncated.len()
-                );
-            }
-
-            result_blocks.push(ContentBlock::ToolResult {
-                tool_use_id: result.tool_use_id,
-                content: final_content,
-                is_error: result.is_error,
-            });
-        }
+        let call_refs: Vec<&ToolCall> = resp.tool_calls.iter().collect();
+        let exec = execute_tool_calls(&call_refs, config, &mut messages, total_tool_calls).await;
+        total_tool_calls += exec.executed_count;
+        let call_records = exec.call_records;
+        let result_blocks = exec.result_blocks;
 
         persist_scratchpad_logs(config, turn_num, &call_records).await;
 
@@ -866,7 +822,7 @@ pub async fn run_agentic_loop(
         }
 
         // ── aggregate tool call budget check ──
-        if total_tool_calls >= config.max_total_tool_calls {
+        if total_tool_calls >= config.limits.max_total_tool_calls {
             outcome = Some(LoopOutcome::ToolCallBudgetExhausted);
             break;
         }
@@ -880,9 +836,7 @@ pub async fn run_agentic_loop(
 mod tests {
     use super::*;
     use crate::test_mocks::*;
-    use apex_core::domain::{
-        StopReason, TokenUsage, ToolCall, ToolCompletionResponse,
-    };
+    use apex_core::domain::{StopReason, TokenUsage, ToolCall, ToolCompletionResponse};
 
     fn default_estimator() -> Arc<Mutex<TokenEstimator>> {
         Arc::new(Mutex::new(TokenEstimator::default()))
@@ -914,21 +868,23 @@ mod tests {
             compactor,
             tools,
             estimator,
-            max_tool_result_bytes: 10_000,
-            max_output_tokens: 4096,
-            reserved_reasoning_tokens: 4096,
+            limits: LoopLimits {
+                max_tool_result_bytes: 10_000,
+                max_output_tokens: 4096,
+                reserved_reasoning_tokens: 4096,
+                max_turns: 32,
+                max_tool_input_bytes: 40_000,
+                max_tool_calls_per_turn: 64,
+                max_total_tool_calls: 512,
+                prompt_caching: false,
+            },
             scratchpad: None,
             memory: None,
             cancel: None,
             timeout: None,
-            max_turns: 32,
             hooks: None,
-            max_tool_input_bytes: 40_000,
             scratch_dir: None,
             compaction: test_compaction(),
-            max_tool_calls_per_turn: 64,
-            max_total_tool_calls: 512,
-            prompt_caching: false,
             orientation: None,
         }
     }
@@ -1289,10 +1245,8 @@ mod tests {
         let estimator = default_estimator();
         let compactor = default_compactor();
 
-        let config = LoopConfig {
-            max_turns,
-            ..test_loop_config(&llm, &compactor, &tools, &estimator)
-        };
+        let mut config = test_loop_config(&llm, &compactor, &tools, &estimator);
+        config.limits.max_turns = max_turns;
 
         let messages = vec![ChatMessage::user_text("Do something")];
         let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
@@ -1331,14 +1285,13 @@ mod tests {
         compaction: CompactionSection,
         scratch_dir: Option<PathBuf>,
     ) -> LoopConfig<'a> {
-        LoopConfig {
-            persona: "",
-            compaction,
-            scratch_dir,
-            reserved_reasoning_tokens: 0,
-            max_output_tokens: 10,
-            ..test_loop_config(llm, compactor, tools, estimator)
-        }
+        let mut cfg = test_loop_config(llm, compactor, tools, estimator);
+        cfg.persona = "";
+        cfg.compaction = compaction;
+        cfg.scratch_dir = scratch_dir;
+        cfg.limits.reserved_reasoning_tokens = 0;
+        cfg.limits.max_output_tokens = 10;
+        cfg
     }
 
     #[tokio::test]
@@ -1508,10 +1461,8 @@ mod tests {
         let estimator = default_estimator();
         let compactor = default_compactor();
 
-        let config = LoopConfig {
-            max_tool_result_bytes: 1_000,
-            ..test_loop_config(&llm, &compactor, &tools, &estimator)
-        };
+        let mut config = test_loop_config(&llm, &compactor, &tools, &estimator);
+        config.limits.max_tool_result_bytes = 1_000;
 
         let messages = vec![ChatMessage::user_text("Get data")];
         let (_turns, _final_text, msgs) = run_agentic_loop(messages, &config).await;
@@ -1732,10 +1683,8 @@ mod tests {
         let estimator = default_estimator();
         let compactor = default_compactor();
 
-        let config = LoopConfig {
-            max_tool_calls_per_turn: 2,
-            ..test_loop_config(&llm, &compactor, &tools, &estimator)
-        };
+        let mut config = test_loop_config(&llm, &compactor, &tools, &estimator);
+        config.limits.max_tool_calls_per_turn = 2;
 
         let messages = vec![ChatMessage::user_text("Do something")];
         let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
@@ -1778,10 +1727,8 @@ mod tests {
         let estimator = default_estimator();
         let compactor = default_compactor();
 
-        let config = LoopConfig {
-            max_total_tool_calls: 3,
-            ..test_loop_config(&llm, &compactor, &tools, &estimator)
-        };
+        let mut config = test_loop_config(&llm, &compactor, &tools, &estimator);
+        config.limits.max_total_tool_calls = 3;
 
         let messages = vec![ChatMessage::user_text("Do something")];
         let (_turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
@@ -1835,11 +1782,9 @@ mod tests {
         let estimator = default_estimator();
         let compactor = default_compactor();
 
-        let config = LoopConfig {
-            max_tool_calls_per_turn: 10,
-            max_total_tool_calls: 5,
-            ..test_loop_config(&llm, &compactor, &tools, &estimator)
-        };
+        let mut config = test_loop_config(&llm, &compactor, &tools, &estimator);
+        config.limits.max_tool_calls_per_turn = 10;
+        config.limits.max_total_tool_calls = 5;
 
         let messages = vec![ChatMessage::user_text("Do something")];
         let (turns, _outcome, _msgs) = run_agentic_loop(messages, &config).await;
@@ -1858,5 +1803,147 @@ mod tests {
             .filter(|tc| tc.output_summary == "BUDGET_EXCEEDED")
             .collect();
         assert_eq!(budget_exceeded.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn task_complete_sibling_respects_hooks() {
+        // Hook blocks all tool calls; sibling should be blocked but loop still completes
+        let write_call = ToolCall {
+            id: "call-w".into(),
+            name: "test_tool".into(),
+            input: serde_json::json!({}),
+        };
+        let tc_call = ToolCall {
+            id: "call-tc".into(),
+            name: TASK_COMPLETE_TOOL.into(),
+            input: serde_json::json!({ "result": "done with hooks" }),
+        };
+        let content = vec![
+            ContentBlock::ToolUse {
+                id: write_call.id.clone(),
+                name: write_call.name.clone(),
+                input: write_call.input.clone(),
+            },
+            ContentBlock::ToolUse {
+                id: tc_call.id.clone(),
+                name: tc_call.name.clone(),
+                input: tc_call.input.clone(),
+            },
+        ];
+        let resp = ToolCompletionResponse {
+            message: ChatMessage {
+                role: MessageRole::Assistant,
+                content,
+            },
+            tool_calls: vec![write_call, tc_call],
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 30,
+                ..Default::default()
+            },
+            stop_reason: StopReason::ToolUse,
+        };
+        let llm = MockLlmProvider::new(vec![Ok(resp)]);
+        let tools = MockToolRegistry::echo("test_tool");
+        let hooks = MockHookRegistry::blocking_tool_calls("forbidden");
+        let estimator = default_estimator();
+        let compactor = default_compactor();
+        let mut config = test_loop_config(&llm, &compactor, &tools, &estimator);
+        config.hooks = Some(&hooks);
+
+        let messages = vec![ChatMessage::user_text("Do something")];
+        let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
+
+        // Loop still completes via task_complete
+        assert!(
+            matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "done with hooks"),
+            "got: {outcome:?}"
+        );
+
+        // Sibling tool was blocked by hook, not executed
+        let executed = tools.calls.lock().await;
+        assert_eq!(
+            executed.len(),
+            0,
+            "blocked tool should not have been executed"
+        );
+
+        // Turn should record the blocked call
+        assert_eq!(turns.len(), 1);
+        let blocked: Vec<_> = turns[0]
+            .tool_calls
+            .iter()
+            .filter(|tc| tc.output_summary.contains("BLOCKED"))
+            .collect();
+        assert_eq!(blocked.len(), 1, "should have one blocked sibling call");
+    }
+
+    #[tokio::test]
+    async fn task_complete_sibling_respects_budget() {
+        // Budget of 0 remaining tool calls; sibling should get budget error
+        let write_call = ToolCall {
+            id: "call-w".into(),
+            name: "test_tool".into(),
+            input: serde_json::json!({}),
+        };
+        let tc_call = ToolCall {
+            id: "call-tc".into(),
+            name: TASK_COMPLETE_TOOL.into(),
+            input: serde_json::json!({ "result": "done under budget" }),
+        };
+        let content = vec![
+            ContentBlock::ToolUse {
+                id: write_call.id.clone(),
+                name: write_call.name.clone(),
+                input: write_call.input.clone(),
+            },
+            ContentBlock::ToolUse {
+                id: tc_call.id.clone(),
+                name: tc_call.name.clone(),
+                input: tc_call.input.clone(),
+            },
+        ];
+        let resp = ToolCompletionResponse {
+            message: ChatMessage {
+                role: MessageRole::Assistant,
+                content,
+            },
+            tool_calls: vec![write_call, tc_call],
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 30,
+                ..Default::default()
+            },
+            stop_reason: StopReason::ToolUse,
+        };
+        let llm = MockLlmProvider::new(vec![Ok(resp)]);
+        let tools = MockToolRegistry::echo("test_tool");
+        let estimator = default_estimator();
+        let compactor = default_compactor();
+        let mut config = test_loop_config(&llm, &compactor, &tools, &estimator);
+        // Zero total budget — sibling tools should be rejected
+        config.limits.max_total_tool_calls = 0;
+
+        let messages = vec![ChatMessage::user_text("Do something")];
+        let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
+
+        // Loop still completes via task_complete
+        assert!(
+            matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "done under budget"),
+            "got: {outcome:?}"
+        );
+
+        // Sibling tool was NOT executed (budget exhausted)
+        let executed = tools.calls.lock().await;
+        assert_eq!(executed.len(), 0, "budget-exceeded tool should not execute");
+
+        // Turn should record the budget-exceeded call
+        assert_eq!(turns.len(), 1);
+        let exceeded: Vec<_> = turns[0]
+            .tool_calls
+            .iter()
+            .filter(|tc| tc.output_summary == "BUDGET_EXCEEDED")
+            .collect();
+        assert_eq!(exceeded.len(), 1, "should have one budget-exceeded sibling");
     }
 }

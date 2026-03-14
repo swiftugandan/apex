@@ -4,6 +4,8 @@ pub mod domain;
 pub mod error;
 pub mod ports;
 
+pub use domain::LoopLimits;
+
 /// Well-known tool name for the explicit completion protocol.
 /// The agentic loop intercepts this tool call as a signal to end the loop
 /// rather than dispatching it to a tool registry for execution.

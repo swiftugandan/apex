@@ -186,9 +186,8 @@ impl OrientationProvider for ScratchpadOrientation {
         }
 
         // Batching hint: detect single-call-per-turn patterns
-        let has_pending_work = !pending.is_empty()
-            || !active.is_empty()
-            || (subtasks.is_empty() && turns_left > 2);
+        let has_pending_work =
+            !pending.is_empty() || !active.is_empty() || (subtasks.is_empty() && turns_left > 2);
         if let Some(hint) = Self::batching_hint(&log, has_pending_work) {
             let _ = write!(out, "{hint}");
         }

@@ -10,7 +10,9 @@ use apex_core::config::{
     ToolLoadingSection,
 };
 use apex_core::context::{MessageComposer, TokenEstimator};
-use apex_core::domain::{MessageHeaders, MessageType, QueueMessage, ToolCall, ToolDef, ToolResult};
+use apex_core::domain::{
+    LoopLimits, MessageHeaders, MessageType, QueueMessage, ToolCall, ToolDef, ToolResult,
+};
 use apex_core::error::ToolError;
 use apex_core::ports::{
     ConversationCompactor, HookRegistry, LlmProvider, MemoryStore, Queue, SkillExtractor,
@@ -121,18 +123,11 @@ impl ClaimToolFactory for FilteredClaimToolFactory {
 pub struct SpawnerConfig {
     pub invariants: Arc<Invariants>,
     pub roles: Arc<[RoleProfile]>,
-    pub max_tool_result_bytes: usize,
-    pub max_tool_input_bytes: usize,
-    pub max_output_tokens: u32,
-    pub reserved_reasoning_tokens: u32,
     pub remaining_delegate_depth: u32,
-    pub max_turns: usize,
     pub max_empty_cycles: u32,
     pub compaction: CompactionSection,
     pub consolidation: ConsolidationSection,
-    pub max_tool_calls_per_turn: usize,
-    pub max_total_tool_calls: usize,
-    pub prompt_caching: bool,
+    pub limits: LoopLimits,
     pub tool_loading: ToolLoadingSection,
 }
 
@@ -233,18 +228,11 @@ impl SubAgentSpawner for InProcessSpawner {
             config: SpawnerConfig {
                 invariants: Arc::clone(&self.config.invariants),
                 roles: Arc::clone(&self.config.roles),
-                max_tool_result_bytes: self.config.max_tool_result_bytes,
-                max_tool_input_bytes: self.config.max_tool_input_bytes,
-                max_output_tokens: self.config.max_output_tokens,
-                reserved_reasoning_tokens: self.config.reserved_reasoning_tokens,
                 remaining_delegate_depth: sub_depth,
-                max_turns: self.config.max_turns,
                 max_empty_cycles: self.config.max_empty_cycles,
                 compaction: self.config.compaction.clone(),
                 consolidation: self.config.consolidation.clone(),
-                max_tool_calls_per_turn: self.config.max_tool_calls_per_turn,
-                max_total_tool_calls: self.config.max_total_tool_calls,
-                prompt_caching: self.config.prompt_caching,
+                limits: self.config.limits,
                 tool_loading: self.config.tool_loading.clone(),
             },
             runtime: Arc::clone(&self.runtime),
@@ -334,15 +322,8 @@ impl SubAgentSpawner for InProcessSpawner {
             limits: WorkerLimits {
                 max_depth: role.max_depth,
                 max_retries: role.max_retries,
-                max_tool_result_bytes: self.config.max_tool_result_bytes,
-                max_output_tokens: self.config.max_output_tokens,
-                reserved_reasoning_tokens: self.config.reserved_reasoning_tokens,
-                max_turns: self.config.max_turns,
                 max_empty_cycles: self.config.max_empty_cycles,
-                max_tool_input_bytes: self.config.max_tool_input_bytes,
-                max_tool_calls_per_turn: self.config.max_tool_calls_per_turn,
-                max_total_tool_calls: self.config.max_total_tool_calls,
-                prompt_caching: self.config.prompt_caching,
+                limits: self.config.limits,
             },
             estimator: Arc::clone(&self.estimator),
             compaction: self.config.compaction.clone(),

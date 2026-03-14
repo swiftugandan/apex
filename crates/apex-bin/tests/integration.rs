@@ -8,8 +8,8 @@ use apex_core::config::{CompactionSection, ConsolidationSection};
 use apex_core::context::TokenEstimator;
 use apex_core::domain::{
     CalibrationData, ChatMessage, CompletionRequest, CompletionResponse, ContentBlock, Fact,
-    FactId, MessageRole, QueueMessage, Scratchpad, Skill, SkillId, SkillManifest, StopReason,
-    TokenUsage, ToolCompletionResponse, ToolSchema,
+    FactId, LoopLimits, MessageRole, QueueMessage, Scratchpad, Skill, SkillId, SkillManifest,
+    StopReason, TokenUsage, ToolCompletionResponse, ToolSchema,
 };
 use apex_core::error::{LlmError, MemoryError};
 use apex_core::ports::{LlmProvider, MemoryStore, Queue, SkillStore, ToolRegistry, WorkingMemory};
@@ -269,15 +269,17 @@ async fn single_task_roundtrip() {
         limits: WorkerLimits {
             max_depth: 3,
             max_retries: 3,
-            max_tool_result_bytes: 10_000,
-            max_output_tokens: 4096,
-            reserved_reasoning_tokens: 4096,
-            max_turns: 32,
             max_empty_cycles: 300,
-            max_tool_input_bytes: 40_000,
-            max_tool_calls_per_turn: 64,
-            max_total_tool_calls: 512,
-            prompt_caching: true,
+            limits: LoopLimits {
+                max_tool_result_bytes: 10_000,
+                max_output_tokens: 4096,
+                reserved_reasoning_tokens: 4096,
+                max_turns: 32,
+                max_tool_input_bytes: 40_000,
+                max_tool_calls_per_turn: 64,
+                max_total_tool_calls: 512,
+                prompt_caching: true,
+            },
         },
         estimator,
         compaction: CompactionSection {

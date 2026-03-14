@@ -25,9 +25,7 @@ pub fn definition() -> ToolDef {
 
 /// Safety net — should never be called normally (loop intercepts first).
 pub async fn execute(call: &ToolCall) -> Result<ToolResult, ToolError> {
-    let result_text = call.input["result"]
-        .as_str()
-        .unwrap_or("Task completed.");
+    let result_text = call.input["result"].as_str().unwrap_or("Task completed.");
     Ok(ToolResult {
         tool_use_id: call.id.clone(),
         name: call.name.clone(),
