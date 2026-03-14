@@ -13,6 +13,7 @@ use crate::glob_tool;
 use crate::grep_tool;
 use crate::shell_exec;
 use crate::spill::SpillManager;
+use crate::task_complete;
 
 pub struct BuiltinToolRegistry {
     spill: SpillManager,
@@ -42,6 +43,7 @@ impl ToolRegistry for BuiltinToolRegistry {
             file_edit::definition(),
             glob_tool::definition(),
             grep_tool::definition(),
+            task_complete::definition(),
         ]
     }
 
@@ -53,6 +55,7 @@ impl ToolRegistry for BuiltinToolRegistry {
             "file_edit" => file_edit::execute(call).await,
             "glob" => glob_tool::execute(call).await,
             "grep" => grep_tool::execute(call).await,
+            apex_core::TASK_COMPLETE_TOOL => task_complete::execute(call).await,
             _ => Err(ToolError::UnknownTool(call.name.clone())),
         }
     }
@@ -78,10 +81,10 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn definitions_returns_6_tools() {
+    fn definitions_returns_7_tools() {
         let registry = BuiltinToolRegistry::default();
         let defs = registry.definitions();
-        assert_eq!(defs.len(), 6);
+        assert_eq!(defs.len(), 7);
         let names: Vec<&str> = defs.iter().map(|d| d.schema.name.as_str()).collect();
         assert!(names.contains(&"shell_exec"));
         assert!(names.contains(&"file_read"));
@@ -89,13 +92,14 @@ mod tests {
         assert!(names.contains(&"file_edit"));
         assert!(names.contains(&"glob"));
         assert!(names.contains(&"grep"));
+        assert!(names.contains(&apex_core::TASK_COMPLETE_TOOL));
     }
 
     #[test]
-    fn schemas_returns_6_schemas() {
+    fn schemas_returns_7_schemas() {
         let registry = BuiltinToolRegistry::default();
         let schemas = registry.schemas();
-        assert_eq!(schemas.len(), 6);
+        assert_eq!(schemas.len(), 7);
         let defs = registry.definitions();
         for (schema, def) in schemas.iter().zip(defs.iter()) {
             assert_eq!(schema.name, def.schema.name);

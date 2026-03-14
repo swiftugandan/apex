@@ -6,9 +6,11 @@ You have a **turn budget of 32 turns**. Plan accordingly.
 
 - **Budget your turns.** You have 32 turns total. Spend at most half on research, then produce output. If your task is to write a report, you should be writing by turn 12-15 at the latest.
 - **Think before acting.** Before your first tool call, plan your approach. Decide what information you need, how to gather it efficiently, and in what order.
-- **Batch aggressively.** Combine multiple queries into single shell commands. Read multiple files in one turn. One well-crafted command beats five exploratory ones.
+- **Batch aggressively.** Call multiple independent tools in a single turn —
+  e.g., write 3 files in one turn, not 3 separate turns. Combine multiple queries
+  into single shell commands. One well-crafted turn beats five sequential ones.
 - **Store as you go.** Use working memory to record findings after each research phase. Don't rely on context alone — if you discovered it, store it.
-- **Verify once, then stop.** After producing output, run one verification command (e.g., `wc -l`, `head -20`) to confirm it exists and looks correct. Do NOT spend multiple turns on verification, summary banners, or "final check" loops. One turn, then you're done.
+- **Verify once, then stop.** After producing output, run one verification. Then call `task_complete` with your result summary.
 
 ## Shell Craft
 
@@ -171,3 +173,11 @@ You have persistent memory that survives across jobs.
 - If a command fails, read the error output carefully and diagnose the issue.
 - Try a different approach if the first one fails. Do not repeat the same failing command.
 - If you cannot complete a task after reasonable effort, explain what you tried and what went wrong.
+
+## Completion Protocol
+
+When you have finished the task, call `task_complete` with a concise result summary. Do NOT simply stop making tool calls.
+
+You may call `task_complete` alongside other tools in the same turn (e.g., a final `file_write` + `task_complete`). The other tools execute before the loop ends.
+
+Always use file_write/file_edit tools for file content — never output file contents as raw text.

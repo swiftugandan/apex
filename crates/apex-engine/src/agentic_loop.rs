@@ -10,7 +10,7 @@ use apex_core::config::CompactionSection;
 use apex_core::context::TokenEstimator;
 use apex_core::domain::{
     CacheHint, ChatMessage, CompletionRequest, ContentBlock, HookEvent, HookOutcome, LogEntry,
-    MessageRole, SystemBlock, ToolCallRecord, TurnRecord,
+    MessageRole, SystemBlock, ToolCall, ToolCallRecord, TurnRecord,
 };
 use apex_core::ports::{
     ConversationCompactor, HookRegistry, LlmProvider, OrientationProvider, ToolRegistry,
@@ -18,6 +18,7 @@ use apex_core::ports::{
 };
 
 use apex_core::summarize_json;
+use apex_core::TASK_COMPLETE_TOOL;
 
 use crate::log::dispatch_log;
 
@@ -202,6 +203,33 @@ async fn maybe_compact(
             .await;
             (estimated_tokens, None)
         }
+    }
+}
+
+/// Persist tool call records as log entries in the scratchpad.
+async fn persist_scratchpad_logs(
+    config: &LoopConfig<'_>,
+    turn_num: usize,
+    call_records: &[ToolCallRecord],
+) {
+    if let (Some(pad_mutex), Some(mem)) = (config.scratchpad, config.memory) {
+        let mut pad = pad_mutex.lock().await;
+        for tc in call_records {
+            pad.log.push(LogEntry {
+                turn: (turn_num + 1) as u32,
+                tool_name: tc.name.clone(),
+                input_summary: tc.input_summary.clone(),
+                output_summary: tc.output_summary.clone(),
+                is_error: tc.is_error,
+                duration_ms: tc.duration_ms,
+            });
+        }
+        // Cap log at 64 entries to prevent unbounded growth
+        if pad.log.len() > 64 {
+            let drain_count = pad.log.len() - 64;
+            pad.log.drain(..drain_count);
+        }
+        let _ = mem.save(&pad).await;
     }
 }
 
@@ -437,15 +465,173 @@ pub async fn run_agentic_loop(
 
         messages.push(resp.message.clone());
 
+        // ── Check for explicit task_complete signal ──
+        if let Some(tc_idx) = resp
+            .tool_calls
+            .iter()
+            .position(|c| c.name == TASK_COMPLETE_TOOL)
+        {
+            let tc_call = &resp.tool_calls[tc_idx];
+            let result_text = tc_call.input["result"].as_str().map(|s| s.to_string());
+
+            // Collect sibling tool calls (model may call file_write + task_complete together)
+            let sibling_calls: Vec<&ToolCall> = resp
+                .tool_calls
+                .iter()
+                .filter(|c| c.name != TASK_COMPLETE_TOOL)
+                .collect();
+
+            let mut call_records = Vec::new();
+            let mut result_blocks = Vec::new();
+
+            // Execute sibling tools so we don't lose work from the final turn
+            if !sibling_calls.is_empty() {
+                let tool_futures: Vec<_> = sibling_calls
+                    .iter()
+                    .map(|call| async move {
+                        dispatch_log(
+                            config.hooks,
+                            || {
+                                serde_json::json!({
+                                    "level": "info",
+                                    "event": "tool_start",
+                                    "tool": &call.name,
+                                    "id": &call.id,
+                                })
+                            },
+                            &format!("  ↳ {}(…)", call.name),
+                        )
+                        .await;
+                        let start = Instant::now();
+                        let result = match config.tools.execute(call).await {
+                            Ok(r) => r,
+                            Err(err) => apex_core::domain::ToolResult {
+                                tool_use_id: call.id.clone(),
+                                name: call.name.clone(),
+                                output: serde_json::json!({ "error": err.to_string() }),
+                                is_error: true,
+                                ..Default::default()
+                            },
+                        };
+                        (*call, result, start.elapsed())
+                    })
+                    .collect();
+
+                let results = join_all(tool_futures).await;
+
+                for (call, result, elapsed) in results {
+                    let duration_ms = elapsed.as_millis() as u64;
+                    let error_output = if result.is_error {
+                        let raw = result.output.to_string();
+                        Some(apex_core::truncate_str(&raw, 2000).to_owned())
+                    } else {
+                        None
+                    };
+                    call_records.push(ToolCallRecord {
+                        name: call.name.clone(),
+                        input_summary: summarize_json(&call.input, 80),
+                        output_summary: summarize_json(&result.output, 120),
+                        is_error: result.is_error,
+                        duration_ms,
+                        error_output,
+                    });
+                    let raw_content = serde_json::to_string(&result.output)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    let mut final_content = raw_content.clone();
+                    if final_content.len() > config.max_tool_result_bytes {
+                        let truncated =
+                            apex_core::truncate_str(&final_content, config.max_tool_result_bytes);
+                        final_content = format!(
+                            "{truncated}\n\n[truncated: {orig} bytes → {kept} bytes]",
+                            orig = raw_content.len(),
+                            kept = truncated.len()
+                        );
+                    }
+                    result_blocks.push(ContentBlock::ToolResult {
+                        tool_use_id: result.tool_use_id,
+                        content: final_content,
+                        is_error: result.is_error,
+                    });
+                }
+            }
+
+            // Synthetic ToolResult for task_complete so history stays well-formed
+            result_blocks.push(ContentBlock::ToolResult {
+                tool_use_id: tc_call.id.clone(),
+                content: "Task completed.".to_string(),
+                is_error: false,
+            });
+
+            persist_scratchpad_logs(config, turn_num, &call_records).await;
+
+            turns.push(TurnRecord {
+                tool_calls: call_records,
+                usage: resp.usage,
+            });
+
+            messages.push(ChatMessage {
+                role: MessageRole::User,
+                content: result_blocks,
+            });
+
+            // Fire after_turn hooks
+            if let Some(hooks) = config.hooks {
+                let ctx = serde_json::json!({
+                    "turn": turn_num + 1,
+                    "tool_count": turns.last().map_or(0, |t: &TurnRecord| t.tool_calls.len()),
+                    "completed": true,
+                });
+                let _ = hooks.dispatch(HookEvent::AfterTurn, &ctx).await;
+            }
+
+            outcome = Some(LoopOutcome::Completed(result_text));
+            break;
+        }
+
+        // ── No tool calls: nudge and continue (never completion) ──
         if resp.tool_calls.is_empty() {
             let text = resp.text();
-            let final_text = if text.is_empty() { None } else { Some(text) };
+            let text_len = text.len();
+
+            dispatch_log(
+                config.hooks,
+                || {
+                    serde_json::json!({
+                        "level": "warn",
+                        "event": "no_tool_calls",
+                        "turn": turn_num + 1,
+                        "text_len": text_len,
+                        "output_tokens": resp.usage.output_tokens,
+                    })
+                },
+                &format!(
+                    "  ⚠ no tool calls on turn {} ({} chars text)",
+                    turn_num + 1,
+                    text_len
+                ),
+            )
+            .await;
+
             turns.push(TurnRecord {
                 tool_calls: vec![],
                 usage: resp.usage,
             });
-            outcome = Some(LoopOutcome::Completed(final_text));
-            break;
+
+            messages.push(ChatMessage::user_text(
+                "You must use tools to perform actions. Call task_complete when you are done. \
+                 If you need to write file content, use file_write or file_edit — never output it as text.",
+            ));
+
+            // Fire after_turn hooks
+            if let Some(hooks) = config.hooks {
+                let ctx = serde_json::json!({
+                    "turn": turn_num + 1,
+                    "tool_count": 0,
+                    "nudged": true,
+                });
+                let _ = hooks.dispatch(HookEvent::AfterTurn, &ctx).await;
+            }
+            continue;
         }
 
         let mut call_records = Vec::new();
@@ -658,21 +844,7 @@ pub async fn run_agentic_loop(
             });
         }
 
-        // Persist log entries to scratchpad after each turn
-        if let (Some(pad_mutex), Some(mem)) = (config.scratchpad, config.memory) {
-            let mut pad = pad_mutex.lock().await;
-            for tc in &call_records {
-                pad.log.push(LogEntry {
-                    turn: (turn_num + 1) as u32,
-                    tool_name: tc.name.clone(),
-                    input_summary: tc.input_summary.clone(),
-                    output_summary: tc.output_summary.clone(),
-                    is_error: tc.is_error,
-                    duration_ms: tc.duration_ms,
-                });
-            }
-            let _ = mem.save(&pad).await;
-        }
+        persist_scratchpad_logs(config, turn_num, &call_records).await;
 
         turns.push(TurnRecord {
             tool_calls: call_records,
@@ -708,7 +880,9 @@ pub async fn run_agentic_loop(
 mod tests {
     use super::*;
     use crate::test_mocks::*;
-    use apex_core::domain::ToolCall;
+    use apex_core::domain::{
+        StopReason, TokenUsage, ToolCall, ToolCompletionResponse,
+    };
 
     fn default_estimator() -> Arc<Mutex<TokenEstimator>> {
         Arc::new(Mutex::new(TokenEstimator::default()))
@@ -759,9 +933,35 @@ mod tests {
         }
     }
 
+    /// Helper to create a task_complete tool call response.
+    fn task_complete_response(result: &str) -> ToolCompletionResponse {
+        let call = ToolCall {
+            id: "tc-1".into(),
+            name: TASK_COMPLETE_TOOL.into(),
+            input: serde_json::json!({ "result": result }),
+        };
+        ToolCompletionResponse {
+            message: ChatMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    input: call.input.clone(),
+                }],
+            },
+            tool_calls: vec![call],
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                ..Default::default()
+            },
+            stop_reason: StopReason::ToolUse,
+        }
+    }
+
     #[tokio::test]
-    async fn loop_returns_on_end_turn() {
-        let llm = MockLlmProvider::text_only("Hello, world!");
+    async fn loop_completes_on_task_complete() {
+        let llm = MockLlmProvider::new(vec![Ok(task_complete_response("All done"))]);
         let tools = MockToolRegistry::echo("test_tool");
         let estimator = default_estimator();
         let compactor = default_compactor();
@@ -771,18 +971,186 @@ mod tests {
         let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
 
         assert_eq!(turns.len(), 1);
-        assert!(turns[0].tool_calls.is_empty());
-        assert!(matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "Hello, world!"));
+        assert!(
+            matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "All done"),
+            "got: {outcome:?}"
+        );
+
+        // task_complete is intercepted, NOT executed via tool registry
+        let calls = tools.calls.lock().await;
+        assert_eq!(calls.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn task_complete_with_sibling_tools() {
+        let write_call = ToolCall {
+            id: "call-w".into(),
+            name: "test_tool".into(),
+            input: serde_json::json!({}),
+        };
+        let tc_call = ToolCall {
+            id: "call-tc".into(),
+            name: TASK_COMPLETE_TOOL.into(),
+            input: serde_json::json!({ "result": "wrote file" }),
+        };
+        let content = vec![
+            ContentBlock::ToolUse {
+                id: write_call.id.clone(),
+                name: write_call.name.clone(),
+                input: write_call.input.clone(),
+            },
+            ContentBlock::ToolUse {
+                id: tc_call.id.clone(),
+                name: tc_call.name.clone(),
+                input: tc_call.input.clone(),
+            },
+        ];
+        let resp = ToolCompletionResponse {
+            message: ChatMessage {
+                role: MessageRole::Assistant,
+                content,
+            },
+            tool_calls: vec![write_call, tc_call],
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 30,
+                ..Default::default()
+            },
+            stop_reason: StopReason::ToolUse,
+        };
+        let llm = MockLlmProvider::new(vec![Ok(resp)]);
+        let tools = MockToolRegistry::echo("test_tool");
+        let estimator = default_estimator();
+        let compactor = default_compactor();
+        let config = test_loop_config(&llm, &compactor, &tools, &estimator);
+
+        let messages = vec![ChatMessage::user_text("Do something")];
+        let (turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
+
+        assert_eq!(turns.len(), 1);
+        assert!(
+            matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "wrote file"),
+            "got: {outcome:?}"
+        );
+
+        // Sibling tool was executed
+        let calls = tools.calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "test_tool");
+    }
+
+    #[tokio::test]
+    async fn no_tool_calls_nudges_and_continues() {
+        // Turn 1: text only (nudge). Turn 2: task_complete.
+        let llm = MockLlmProvider::new(vec![
+            Ok(ToolCompletionResponse {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "Hello, world!".to_string(),
+                    }],
+                },
+                tool_calls: vec![],
+                usage: TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    ..Default::default()
+                },
+                stop_reason: StopReason::EndTurn,
+            }),
+            Ok(task_complete_response("All done")),
+        ]);
+        let tools = MockToolRegistry::echo("test_tool");
+        let estimator = default_estimator();
+        let compactor = default_compactor();
+        let config = test_loop_config(&llm, &compactor, &tools, &estimator);
+
+        let messages = vec![ChatMessage::user_text("Hi")];
+        let (turns, outcome, msgs) = run_agentic_loop(messages, &config).await;
+
+        assert_eq!(turns.len(), 2);
+        assert!(turns[0].tool_calls.is_empty()); // nudge turn
+        assert!(
+            matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "All done"),
+            "got: {outcome:?}"
+        );
+
+        // Verify nudge message was injected
+        let nudge = msgs
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.text().contains("task_complete"));
+        assert!(nudge, "nudge message should reference task_complete");
+    }
+
+    #[tokio::test]
+    async fn task_complete_missing_result_defaults_to_none() {
+        let call = ToolCall {
+            id: "tc-1".into(),
+            name: TASK_COMPLETE_TOOL.into(),
+            input: serde_json::json!({}),
+        };
+        let resp = ToolCompletionResponse {
+            message: ChatMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    input: call.input.clone(),
+                }],
+            },
+            tool_calls: vec![call],
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                ..Default::default()
+            },
+            stop_reason: StopReason::ToolUse,
+        };
+        let llm = MockLlmProvider::new(vec![Ok(resp)]);
+        let tools = MockToolRegistry::echo("test_tool");
+        let estimator = default_estimator();
+        let compactor = default_compactor();
+        let config = test_loop_config(&llm, &compactor, &tools, &estimator);
+
+        let messages = vec![ChatMessage::user_text("Hi")];
+        let (_turns, outcome, _msgs) = run_agentic_loop(messages, &config).await;
+
+        assert!(
+            matches!(&outcome, LoopOutcome::Completed(None)),
+            "got: {outcome:?}"
+        );
     }
 
     #[tokio::test]
     async fn loop_executes_tool_and_continues() {
+        // Turn 1: tool call. Turn 2: task_complete.
         let tool_call = ToolCall {
             id: "call-1".into(),
             name: "test_tool".into(),
             input: serde_json::json!({}),
         };
-        let llm = MockLlmProvider::tool_then_text(tool_call, "Done!");
+        let tc_resp = task_complete_response("Done!");
+        let content: Vec<ContentBlock> = vec![ContentBlock::ToolUse {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            input: tool_call.input.clone(),
+        }];
+        let llm = MockLlmProvider::new(vec![
+            Ok(ToolCompletionResponse {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content,
+                },
+                tool_calls: vec![tool_call],
+                usage: TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    ..Default::default()
+                },
+                stop_reason: StopReason::ToolUse,
+            }),
+            Ok(tc_resp),
+        ]);
         let tools = MockToolRegistry::echo("test_tool");
         let estimator = default_estimator();
         let compactor = default_compactor();
@@ -794,8 +1162,10 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].tool_calls.len(), 1);
         assert_eq!(turns[0].tool_calls[0].name, "test_tool");
-        assert!(turns[1].tool_calls.is_empty());
-        assert!(matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "Done!"));
+        assert!(
+            matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "Done!"),
+            "got: {outcome:?}"
+        );
 
         // Verify the tool was actually called
         let calls = tools.calls.lock().await;
@@ -827,7 +1197,27 @@ mod tests {
             name: "bad_tool".into(),
             input: serde_json::json!({}),
         };
-        let llm = MockLlmProvider::tool_then_text(tool_call, "Recovered");
+        let content = vec![ContentBlock::ToolUse {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            input: tool_call.input.clone(),
+        }];
+        let llm = MockLlmProvider::new(vec![
+            Ok(ToolCompletionResponse {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content,
+                },
+                tool_calls: vec![tool_call],
+                usage: TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    ..Default::default()
+                },
+                stop_reason: StopReason::ToolUse,
+            }),
+            Ok(task_complete_response("Recovered")),
+        ]);
         let tools = MockToolRegistry::failing("bad_tool", "disk full");
         let estimator = default_estimator();
         let compactor = default_compactor();
@@ -839,8 +1229,11 @@ mod tests {
         // Tool error should be converted to ToolResult with is_error:true
         assert_eq!(turns[0].tool_calls.len(), 1);
         assert!(turns[0].tool_calls[0].is_error);
-        // Loop should continue and get the final text
-        assert!(matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "Recovered"));
+        // Loop should continue and get the completion via task_complete
+        assert!(
+            matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "Recovered"),
+            "got: {outcome:?}"
+        );
     }
 
     #[tokio::test]
@@ -1090,7 +1483,27 @@ mod tests {
             name: "big_tool".into(),
             input: serde_json::json!({}),
         };
-        let llm = MockLlmProvider::tool_then_text(tool_call, "Done");
+        let content = vec![ContentBlock::ToolUse {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            input: tool_call.input.clone(),
+        }];
+        let llm = MockLlmProvider::new(vec![
+            Ok(ToolCompletionResponse {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content,
+                },
+                tool_calls: vec![tool_call],
+                usage: TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    ..Default::default()
+                },
+                stop_reason: StopReason::ToolUse,
+            }),
+            Ok(task_complete_response("Done")),
+        ]);
         let tools = MockToolRegistry::large_output("big_tool", 100_000);
         let estimator = default_estimator();
         let compactor = default_compactor();
@@ -1291,7 +1704,30 @@ mod tests {
                 input: serde_json::json!({}),
             })
             .collect();
-        let llm = MockLlmProvider::multi_tool_then_text(calls, "Done!");
+        let content: Vec<ContentBlock> = calls
+            .iter()
+            .map(|c| ContentBlock::ToolUse {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                input: c.input.clone(),
+            })
+            .collect();
+        let llm = MockLlmProvider::new(vec![
+            Ok(ToolCompletionResponse {
+                message: ChatMessage {
+                    role: MessageRole::Assistant,
+                    content,
+                },
+                tool_calls: calls,
+                usage: TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    ..Default::default()
+                },
+                stop_reason: StopReason::ToolUse,
+            }),
+            Ok(task_complete_response("Done!")),
+        ]);
         let tools = MockToolRegistry::echo("test_tool");
         let estimator = default_estimator();
         let compactor = default_compactor();
@@ -1321,7 +1757,10 @@ mod tests {
             "expected 3 budget-exceeded records"
         );
 
-        assert!(matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "Done!"));
+        assert!(
+            matches!(&outcome, LoopOutcome::Completed(Some(t)) if t == "Done!"),
+            "got: {outcome:?}"
+        );
     }
 
     #[tokio::test]
@@ -1371,7 +1810,27 @@ mod tests {
                 input: serde_json::json!({}),
             })
             .collect();
-        let llm = MockLlmProvider::multi_tool_then_text(calls, "Done!");
+        let content: Vec<ContentBlock> = calls
+            .iter()
+            .map(|c| ContentBlock::ToolUse {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                input: c.input.clone(),
+            })
+            .collect();
+        let llm = MockLlmProvider::new(vec![Ok(ToolCompletionResponse {
+            message: ChatMessage {
+                role: MessageRole::Assistant,
+                content,
+            },
+            tool_calls: calls,
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                ..Default::default()
+            },
+            stop_reason: StopReason::ToolUse,
+        })]);
         let tools = MockToolRegistry::echo("test_tool");
         let estimator = default_estimator();
         let compactor = default_compactor();

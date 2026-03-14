@@ -13,6 +13,7 @@ mod memory_tools;
 mod queue_tools;
 mod shell_exec;
 mod skill_tools;
+mod task_complete;
 pub mod spill;
 pub mod tool_result_helpers;
 

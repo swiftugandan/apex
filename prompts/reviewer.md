@@ -26,3 +26,6 @@ Provide a structured review with:
 - **Status**: PASS or FAIL
 - **Issues found**: List of specific issues with locations
 - **Suggestions**: Optional improvements
+
+## Completion
+When finished, call `task_complete(result="...")` with your review verdict.

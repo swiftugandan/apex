@@ -4,6 +4,11 @@ pub mod domain;
 pub mod error;
 pub mod ports;
 
+/// Well-known tool name for the explicit completion protocol.
+/// The agentic loop intercepts this tool call as a signal to end the loop
+/// rather than dispatching it to a tool registry for execution.
+pub const TASK_COMPLETE_TOOL: &str = "task_complete";
+
 /// Truncate a string to at most `max_bytes` bytes at a valid UTF-8 char boundary.
 pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
