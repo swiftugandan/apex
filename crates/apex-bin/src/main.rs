@@ -1,7 +1,7 @@
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -454,7 +454,7 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
     ));
 
     let calibration = long_term.load_calibration().await.unwrap_or_default();
-    let estimator = Arc::new(Mutex::new(TokenEstimator::new(calibration)));
+    let estimator = Arc::new(RwLock::new(TokenEstimator::new(calibration)));
 
     let invariants = Arc::new(invariants);
 

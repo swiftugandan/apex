@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use apex_core::context::{MessageComposer, TokenEstimator};
 
@@ -7,9 +7,9 @@ use apex_core::context::{MessageComposer, TokenEstimator};
 pub use apex_core::{now_unix_ts, summarize_json};
 
 /// Builds a MessageComposer from the shared token estimator.
-pub async fn composer_from_estimator(estimator: &Arc<Mutex<TokenEstimator>>) -> MessageComposer {
+pub async fn composer_from_estimator(estimator: &Arc<RwLock<TokenEstimator>>) -> MessageComposer {
     let cal = {
-        let est = estimator.lock().await;
+        let est = estimator.read().await;
         est.calibration_data().clone()
     };
     MessageComposer::new(TokenEstimator::new(cal))

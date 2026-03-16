@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use async_trait::async_trait;
 
@@ -56,7 +56,7 @@ impl ToolRegistry for SharedToolRegistry {
 ///    [`CompositeToolRegistry`].
 pub struct CliClaimToolFactory {
     pub static_tools: Arc<CompositeToolRegistry>,
-    pub estimator: Arc<Mutex<TokenEstimator>>,
+    pub estimator: Arc<RwLock<TokenEstimator>>,
 }
 
 #[async_trait]

@@ -3,7 +3,7 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use apex_core::config::CompactionSection;
@@ -47,7 +47,7 @@ pub struct LoopConfig<'a> {
     pub llm: &'a dyn LlmProvider,
     pub compactor: &'a dyn ConversationCompactor,
     pub tools: &'a dyn ToolRegistry,
-    pub estimator: &'a Arc<Mutex<TokenEstimator>>,
+    pub estimator: &'a Arc<RwLock<TokenEstimator>>,
     pub limits: LoopLimits,
     pub scratchpad: Option<&'a Arc<Mutex<apex_core::domain::Scratchpad>>>,
     pub memory: Option<&'a dyn WorkingMemory>,
@@ -83,14 +83,14 @@ fn spill_to_disk(dir: &Path, messages: &[ChatMessage]) -> Result<PathBuf, String
 /// Estimate prompt tokens for the current message history.
 async fn estimate_prompt_tokens(
     messages: &[ChatMessage],
-    estimator: &Arc<Mutex<TokenEstimator>>,
+    estimator: &Arc<RwLock<TokenEstimator>>,
 ) -> u32 {
     let prompt_text: String = messages
         .iter()
         .map(|m| m.text())
         .collect::<Vec<_>>()
         .join("\n");
-    let est = estimator.lock().await;
+    let est = estimator.read().await;
     est.estimate(&prompt_text)
 }
 
@@ -652,7 +652,7 @@ pub async fn run_agentic_loop(
                 .map(|m| m.text())
                 .collect::<Vec<_>>()
                 .join("\n");
-            let mut est = config.estimator.lock().await;
+            let mut est = config.estimator.write().await;
             est.calibrate(&prompt_text, resp.usage.input_tokens);
             est.calibrate_output(&resp.usage);
         }
@@ -869,8 +869,8 @@ mod tests {
     use crate::test_mocks::*;
     use apex_core::domain::{StopReason, TokenUsage, ToolCall, ToolCompletionResponse};
 
-    fn default_estimator() -> Arc<Mutex<TokenEstimator>> {
-        Arc::new(Mutex::new(TokenEstimator::default()))
+    fn default_estimator() -> Arc<RwLock<TokenEstimator>> {
+        Arc::new(RwLock::new(TokenEstimator::default()))
     }
 
     fn test_compaction() -> CompactionSection {
@@ -891,7 +891,7 @@ mod tests {
         llm: &'a dyn LlmProvider,
         compactor: &'a dyn apex_core::ports::ConversationCompactor,
         tools: &'a dyn ToolRegistry,
-        estimator: &'a Arc<Mutex<TokenEstimator>>,
+        estimator: &'a Arc<RwLock<TokenEstimator>>,
     ) -> LoopConfig<'a> {
         LoopConfig {
             persona: "You are helpful.",
@@ -1312,7 +1312,7 @@ mod tests {
         llm: &'a dyn LlmProvider,
         compactor: &'a dyn apex_core::ports::ConversationCompactor,
         tools: &'a dyn ToolRegistry,
-        estimator: &'a Arc<Mutex<TokenEstimator>>,
+        estimator: &'a Arc<RwLock<TokenEstimator>>,
         compaction: CompactionSection,
         scratch_dir: Option<PathBuf>,
     ) -> LoopConfig<'a> {

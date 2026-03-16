@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use apex_core::config::{CompactionSection, ConsolidationSection};
 use apex_core::context::TokenEstimator;
@@ -190,7 +190,7 @@ impl SkillStore for InMemorySkillStore {
 // CompositeToolRegistry containing only queue tools (no static tools).
 
 struct IntegrationClaimToolFactory {
-    estimator: Arc<Mutex<TokenEstimator>>,
+    estimator: Arc<RwLock<TokenEstimator>>,
 }
 
 #[async_trait]
@@ -249,7 +249,7 @@ async fn single_task_roundtrip() {
     let memory: Arc<dyn WorkingMemory> = Arc::new(InMemoryWorkingMemory::new());
     let long_term: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
     let skills: Arc<dyn SkillStore> = Arc::new(InMemorySkillStore);
-    let estimator = Arc::new(Mutex::new(TokenEstimator::default()));
+    let estimator = Arc::new(RwLock::new(TokenEstimator::default()));
     let claim_factory: Arc<dyn ClaimToolFactory> = Arc::new(IntegrationClaimToolFactory {
         estimator: estimator.clone(),
     });

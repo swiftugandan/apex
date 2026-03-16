@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use anyhow::Result;
 
@@ -45,7 +45,7 @@ pub struct WorkerContext {
     pub skills: Arc<dyn SkillStore>,
     pub persona: Arc<String>,
     pub limits: WorkerLimits,
-    pub estimator: Arc<Mutex<TokenEstimator>>,
+    pub estimator: Arc<RwLock<TokenEstimator>>,
     pub compaction: CompactionSection,
     pub consolidation: ConsolidationSection,
     pub hooks: Option<Arc<dyn HookRegistry>>,
@@ -250,8 +250,8 @@ async fn execute_claim(
     if ctx.consolidation.retrieval_at_start && !skip_jit {
         let query = jit_retrieval::derive_query(&claimed.body, &scratchpad.goal);
         if !query.is_empty() {
-            // Clone the estimator to avoid holding the mutex across the async store query.
-            let est = ctx.estimator.lock().await.clone();
+            // Clone the estimator to avoid holding the lock across the async store query.
+            let est = ctx.estimator.read().await.clone();
             let section = jit_retrieval::retrieve_facts_section(
                 ctx.long_term.as_ref(),
                 est,
@@ -322,7 +322,7 @@ async fn execute_claim(
 
     // Persist calibration data after loop completes
     {
-        let est = ctx.estimator.lock().await;
+        let est = ctx.estimator.read().await;
         let cal = est.calibration_data().clone();
         drop(est);
         let _ = ctx.long_term.persist_calibration(&cal).await;
@@ -727,7 +727,7 @@ mod tests {
                     prompt_caching: true,
                 },
             },
-            estimator: Arc::new(Mutex::new(TokenEstimator::default())),
+            estimator: Arc::new(RwLock::new(TokenEstimator::default())),
             compaction: CompactionSection {
                 preserve_turns: 3,
                 max_summary_tokens: 1024,

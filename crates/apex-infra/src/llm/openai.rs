@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 
 use apex_core::domain::{
     ChatMessage, CompletionRequest, CompletionResponse, ContentBlock, MessageRole,
@@ -37,7 +38,10 @@ impl OpenAiProvider {
         let base = base_url.into();
         let key = api_key.into();
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .expect("failed to build HTTP client"),
             endpoint_url: format!("{}/chat/completions", base.trim_end_matches('/')),
             auth_header: format!("Bearer {key}"),
             model: model.into(),
@@ -103,7 +107,7 @@ impl OpenAiProvider {
                 Ok(r) => r,
                 Err(e) => {
                     last_err = LlmError::Http(e.to_string());
-                    let delay = Self::backoff_delay(attempt, None);
+                    let delay = super::retry::backoff_delay(attempt, None);
                     eprintln!(
                         "  ⚠ HTTP error (attempt {}/{}), retrying in {delay:?}: {e}",
                         attempt + 1,
@@ -139,7 +143,7 @@ impl OpenAiProvider {
             if status.as_u16() == 429 || status.is_server_error() {
                 last_err = LlmError::Api(format!("{status}: {body_text}"));
                 if attempt + 1 < Self::MAX_RETRIES {
-                    let delay = Self::backoff_delay(attempt, retry_after);
+                    let delay = super::retry::backoff_delay(attempt, retry_after);
                     eprintln!(
                         "  ⚠ {status} (attempt {}/{}), retrying in {delay:?}",
                         attempt + 1,
@@ -154,16 +158,6 @@ impl OpenAiProvider {
         }
 
         Err(last_err)
-    }
-
-    /// Exponential backoff: 2^attempt seconds, capped at 60s.
-    /// Prefers Retry-After header value when available.
-    fn backoff_delay(attempt: u32, retry_after_secs: Option<u64>) -> std::time::Duration {
-        if let Some(secs) = retry_after_secs {
-            return std::time::Duration::from_secs(secs.min(120));
-        }
-        let secs = (1u64 << attempt).min(60);
-        std::time::Duration::from_secs(secs)
     }
 
     fn build_system_message(blocks: &[SystemBlock]) -> OaiMessage {

@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 
 use apex_core::domain::{
     CacheHint, ChatMessage, CompletionRequest, CompletionResponse, ContentBlock, MessageRole,
@@ -29,7 +30,10 @@ impl AnthropicProvider {
         context_window: usize,
     ) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .expect("failed to build HTTP client"),
             api_key: api_key.into(),
             model: model.into(),
             context_window,
@@ -69,37 +73,79 @@ impl AnthropicProvider {
         Ok(Self::new(api_key, model, context_window))
     }
 
+    /// Maximum number of retries for transient errors (429, 5xx).
+    const MAX_RETRIES: u32 = 3;
+
     async fn send_request(&self, body: Value, use_cache: bool) -> Result<ApiResponse, LlmError> {
-        let mut request = self
-            .client
-            .post(API_URL)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json");
+        let mut last_err = LlmError::Http("no attempts made".into());
 
-        if use_cache {
-            request = request.header("anthropic-beta", "prompt-caching-2024-07-31");
-        }
+        for attempt in 0..Self::MAX_RETRIES {
+            let mut request = self
+                .client
+                .post(API_URL)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", API_VERSION)
+                .header("content-type", "application/json");
 
-        let response = request
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::Http(e.to_string()))?;
+            if use_cache {
+                request = request.header("anthropic-beta", "prompt-caching-2024-07-31");
+            }
 
-        if !response.status().is_success() {
+            let response = match request.json(&body).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = LlmError::Http(e.to_string());
+                    let delay = super::retry::backoff_delay(attempt, None);
+                    eprintln!(
+                        "  ⚠ HTTP error (attempt {}/{}), retrying in {delay:?}: {e}",
+                        attempt + 1,
+                        Self::MAX_RETRIES
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            };
+
             let status = response.status();
-            let body = response
+
+            if status.is_success() {
+                return response
+                    .json::<ApiResponse>()
+                    .await
+                    .map_err(|e| LlmError::Serialization(e.to_string()));
+            }
+
+            // Extract Retry-After header before consuming the response body
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+
+            let body_text = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "failed to read body".to_string());
-            return Err(LlmError::Api(format!("{status}: {body}")));
+
+            // Retry on 429 (rate limit) and 5xx (server errors)
+            if status.as_u16() == 429 || status.is_server_error() {
+                last_err = LlmError::Api(format!("{status}: {body_text}"));
+                if attempt + 1 < Self::MAX_RETRIES {
+                    let delay = super::retry::backoff_delay(attempt, retry_after);
+                    eprintln!(
+                        "  ⚠ {status} (attempt {}/{}), retrying in {delay:?}",
+                        attempt + 1,
+                        Self::MAX_RETRIES
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
+
+            return Err(LlmError::Api(format!("{status}: {body_text}")));
         }
 
-        response
-            .json::<ApiResponse>()
-            .await
-            .map_err(|e| LlmError::Serialization(e.to_string()))
+        Err(last_err)
     }
 
     fn build_messages(messages: &[ChatMessage]) -> Vec<ApiMessage> {

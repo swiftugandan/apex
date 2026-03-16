@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use async_trait::async_trait;
 
@@ -144,7 +144,7 @@ pub struct InProcessSpawner {
     pub llm: Arc<dyn LlmProvider>,
     pub compactor: Arc<dyn ConversationCompactor>,
     pub skill_extractor: Option<Arc<dyn SkillExtractor>>,
-    pub estimator: Arc<Mutex<TokenEstimator>>,
+    pub estimator: Arc<RwLock<TokenEstimator>>,
     pub config: SpawnerConfig,
     pub runtime: Arc<SubAgentRuntimeBuilder>,
     /// Optional hooks from the parent agent.  Only hooks with
@@ -217,6 +217,12 @@ impl SubAgentSpawner for InProcessSpawner {
             .as_ref()
             .and_then(|h| FilteredHookRegistry::from_propagatable(h.as_ref()));
 
+        // Apply role-specific max_output_tokens override for sub-agents
+        let mut sub_limits = self.config.limits;
+        if let Some(max_out) = role.max_output_tokens {
+            sub_limits.max_output_tokens = max_out;
+        }
+
         let sub_spawner: Arc<dyn SubAgentSpawner> = Arc::new(InProcessSpawner {
             project_paths: self.project_paths.clone(),
             parent_long_term: sub_long_term.clone(),
@@ -232,7 +238,7 @@ impl SubAgentSpawner for InProcessSpawner {
                 max_empty_cycles: self.config.max_empty_cycles,
                 compaction: self.config.compaction.clone(),
                 consolidation: self.config.consolidation.clone(),
-                limits: self.config.limits,
+                limits: sub_limits,
                 tool_loading: self.config.tool_loading.clone(),
             },
             runtime: Arc::clone(&self.runtime),
@@ -323,7 +329,7 @@ impl SubAgentSpawner for InProcessSpawner {
                 max_depth: role.max_depth,
                 max_retries: role.max_retries,
                 max_empty_cycles: self.config.max_empty_cycles,
-                limits: self.config.limits,
+                limits: sub_limits,
             },
             estimator: Arc::clone(&self.estimator),
             compaction: self.config.compaction.clone(),

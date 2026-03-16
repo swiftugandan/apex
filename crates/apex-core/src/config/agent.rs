@@ -133,6 +133,11 @@ pub struct RoleProfile {
     #[serde(default = "default_true")]
     pub can_delegate: bool,
 
+    /// Maximum tokens per LLM completion response for this role.
+    /// None = inherit from parent agent config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+
     /// Skill manifests attached to this role (lazy-loaded on demand).
     #[serde(default)]
     pub skills: Vec<SkillManifest>,
@@ -354,6 +359,7 @@ fn default_roles() -> Vec<RoleProfile> {
             max_concurrent: 1,
             memory: MemoryMode::Shared,
             can_delegate: false,
+            max_output_tokens: None,
             skills: vec![],
         },
         RoleProfile {
@@ -370,6 +376,7 @@ fn default_roles() -> Vec<RoleProfile> {
             max_concurrent: 1,
             memory: MemoryMode::Shared,
             can_delegate: false,
+            max_output_tokens: None,
             skills: vec![],
         },
     ]

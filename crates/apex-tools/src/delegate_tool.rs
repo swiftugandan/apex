@@ -118,6 +118,7 @@ impl DelegateToolRegistry {
                 max_concurrent: 1,
                 memory: MemoryMode::Shared,
                 can_delegate,
+                max_output_tokens: None,
                 skills,
             };
 
@@ -305,6 +306,7 @@ mod tests {
             max_concurrent: 1,
             memory: MemoryMode::Shared,
             can_delegate: false,
+            max_output_tokens: None,
             skills: vec![],
         }])
     }
