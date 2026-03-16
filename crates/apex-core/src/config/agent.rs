@@ -40,6 +40,12 @@ pub struct AgentSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
 
+    /// Context window size in tokens. If omitted, falls back to APEX_CONTEXT_WINDOW
+    /// env var or provider defaults. Set this for models whose context window differs
+    /// from provider defaults (e.g. free-tier or small models).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+
     /// Maximum concurrent workers.
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
@@ -375,6 +381,7 @@ impl Default for AgentSection {
             provider: default_provider(),
             model: default_model(),
             base_url: None,
+            context_window: None,
             max_concurrent: default_max_concurrent(),
             max_depth: default_max_depth(),
             max_retries: default_max_retries(),

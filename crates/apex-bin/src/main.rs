@@ -414,12 +414,16 @@ async fn process_queue(paths: &ProjectPaths, adapter: Arc<RfbmqAdapter>) -> Resu
             OpenAiProvider::from_env_with_config(
                 &agent_config.agent.model,
                 agent_config.agent.base_url.as_deref(),
+                agent_config.agent.context_window,
             )
             .context("failed to create OpenAI provider")?,
         ),
         _ => Arc::new(
-            AnthropicProvider::from_env_with_model(&agent_config.agent.model)
-                .context("failed to create Anthropic provider")?,
+            AnthropicProvider::from_env_with_model(
+                &agent_config.agent.model,
+                agent_config.agent.context_window,
+            )
+            .context("failed to create Anthropic provider")?,
         ),
     };
 

@@ -483,6 +483,18 @@ async fn handle_failure(
         }
     }
 
+    // Enforce max retries: if the next attempt would exceed the limit, escalate to reject
+    // regardless of what hooks decided (unless they already chose Reject).
+    let exhausted = !matches!(action, FailureAction::Reject(_))
+        && claimed.headers.retry_count + 1 >= max_retries;
+    if exhausted {
+        action = FailureAction::Reject(format!(
+            "Max retries exhausted ({}/{})",
+            claimed.headers.retry_count + 1,
+            max_retries
+        ));
+    }
+
     // Act on the decision
     match action {
         FailureAction::Reject(ref reason) => {
@@ -524,31 +536,31 @@ async fn handle_failure(
                 .nack_with_delay(claimed, std::time::Duration::from_secs(secs))
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            dispatch_log(
+                hooks,
+                || {
+                    serde_json::json!({
+                        "level": "info",
+                        "event": "retry_scheduled",
+                        "worker_id": worker_id,
+                        "message_id": &claimed.id,
+                        "attempt": claimed.headers.retry_count + 2,
+                        "max_retries": max_retries,
+                    })
+                },
+                &format!(
+                    "[worker {worker_id}]   ↳ Requeued for retry (attempt {} of {})",
+                    claimed.headers.retry_count + 2,
+                    max_retries
+                ),
+            )
+            .await;
         }
         FailureAction::RetryDefault => {
             queue
                 .nack(claimed)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-    }
-
-    if !matches!(action, FailureAction::Reject(_)) {
-        if claimed.headers.retry_count + 1 >= max_retries {
-            dispatch_log(
-                hooks,
-                || {
-                    serde_json::json!({
-                        "level": "warn",
-                        "event": "max_retries_reached",
-                        "worker_id": worker_id,
-                        "message_id": &claimed.id,
-                    })
-                },
-                &format!("[worker {worker_id}]   ↳ Max retries reached, moved to failed/"),
-            )
-            .await;
-        } else {
             dispatch_log(
                 hooks,
                 || {

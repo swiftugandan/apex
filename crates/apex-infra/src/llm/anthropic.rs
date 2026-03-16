@@ -49,13 +49,22 @@ impl AnthropicProvider {
     }
 
     /// Create from an explicit model name, reading only the API key from the environment.
-    pub fn from_env_with_model(model: impl Into<String>) -> Result<Self, LlmError> {
+    ///
+    /// `config_context_window`: optional override from agent.toml `context_window` field.
+    /// Priority: config value > APEX_CONTEXT_WINDOW env var > provider default.
+    pub fn from_env_with_model(
+        model: impl Into<String>,
+        config_context_window: Option<usize>,
+    ) -> Result<Self, LlmError> {
         let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
             LlmError::Configuration("ANTHROPIC_API_KEY environment variable must be set".into())
         })?;
-        let context_window = std::env::var("APEX_CONTEXT_WINDOW")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        let context_window = config_context_window
+            .or_else(|| {
+                std::env::var("APEX_CONTEXT_WINDOW")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
         Ok(Self::new(api_key, model, context_window))
     }

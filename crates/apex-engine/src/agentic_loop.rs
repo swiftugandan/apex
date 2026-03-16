@@ -465,6 +465,7 @@ pub async fn run_agentic_loop(
     let mut turns: Vec<TurnRecord> = Vec::new();
     let mut outcome: Option<LoopOutcome> = None;
     let mut total_tool_calls: usize = 0;
+    let mut consecutive_no_tool_turns: u32 = 0;
     let deadline = config.timeout.map(|d| Instant::now() + d);
     let cache_hint = if config.limits.prompt_caching {
         CacheHint::Static
@@ -750,6 +751,7 @@ pub async fn run_agentic_loop(
 
         // ── No tool calls: nudge and continue (never completion) ──
         if resp.tool_calls.is_empty() {
+            consecutive_no_tool_turns += 1;
             let text = resp.text();
             let text_len = text.len();
 
@@ -762,6 +764,7 @@ pub async fn run_agentic_loop(
                         "turn": turn_num + 1,
                         "text_len": text_len,
                         "output_tokens": resp.usage.output_tokens,
+                        "consecutive_no_tool_turns": consecutive_no_tool_turns,
                     })
                 },
                 &format!(
@@ -776,6 +779,31 @@ pub async fn run_agentic_loop(
                 tool_calls: vec![],
                 usage: resp.usage,
             });
+
+            // After 3 consecutive no-tool turns, the model is stuck — bail out
+            if consecutive_no_tool_turns >= 3 {
+                dispatch_log(
+                    config.hooks,
+                    || {
+                        serde_json::json!({
+                            "level": "error",
+                            "event": "no_tool_calls_exhausted",
+                            "turn": turn_num + 1,
+                            "consecutive_no_tool_turns": consecutive_no_tool_turns,
+                        })
+                    },
+                    &format!(
+                        "  ✗ {} consecutive turns with no tool calls — model appears stuck",
+                        consecutive_no_tool_turns
+                    ),
+                )
+                .await;
+                outcome = Some(LoopOutcome::LlmError(format!(
+                    "Model failed to use tools for {} consecutive turns",
+                    consecutive_no_tool_turns
+                )));
+                break;
+            }
 
             messages.push(ChatMessage::user_text(
                 "You must use tools to perform actions. Call task_complete when you are done. \
@@ -793,6 +821,9 @@ pub async fn run_agentic_loop(
             }
             continue;
         }
+
+        // Reset consecutive no-tool counter on successful tool usage
+        consecutive_no_tool_turns = 0;
 
         let call_refs: Vec<&ToolCall> = resp.tool_calls.iter().collect();
         let exec = execute_tool_calls(&call_refs, config, &mut messages, total_tool_calls).await;

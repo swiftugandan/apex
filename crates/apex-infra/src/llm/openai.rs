@@ -48,7 +48,14 @@ impl OpenAiProvider {
     }
 
     /// Create from config values, reading the API key from the environment.
-    pub fn from_env_with_config(model: &str, base_url: Option<&str>) -> Result<Self, LlmError> {
+    ///
+    /// `config_context_window`: optional override from agent.toml `context_window` field.
+    /// Priority: config value > APEX_CONTEXT_WINDOW env var > provider default.
+    pub fn from_env_with_config(
+        model: &str,
+        base_url: Option<&str>,
+        config_context_window: Option<usize>,
+    ) -> Result<Self, LlmError> {
         let api_key = std::env::var("OPENAI_API_KEY")
             .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
             .map_err(|_| {
@@ -61,47 +68,102 @@ impl OpenAiProvider {
             .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
             .or_else(|| std::env::var("OPENROUTER_BASE_URL").ok())
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-        let context_window = std::env::var("APEX_CONTEXT_WINDOW")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        let context_window = config_context_window
+            .or_else(|| {
+                std::env::var("APEX_CONTEXT_WINDOW")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
         Ok(Self::new(api_key, base_url, model, context_window))
     }
 
+    /// Maximum number of retries for transient errors (429, 5xx).
+    const MAX_RETRIES: u32 = 3;
+
     async fn send_request(&self, body: Value) -> Result<OaiResponse, LlmError> {
-        let mut request = self
-            .client
-            .post(&self.endpoint_url)
-            .header("Authorization", &self.auth_header)
-            .header("content-type", "application/json");
+        let mut last_err = LlmError::Http("no attempts made".into());
 
-        // OpenRouter-specific headers
-        if let Some(ref referer) = self.openrouter_referer {
-            request = request.header("HTTP-Referer", referer);
-        }
-        if let Some(ref title) = self.openrouter_title {
-            request = request.header("X-Title", title);
-        }
+        for attempt in 0..Self::MAX_RETRIES {
+            let mut request = self
+                .client
+                .post(&self.endpoint_url)
+                .header("Authorization", &self.auth_header)
+                .header("content-type", "application/json");
 
-        let response = request
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::Http(e.to_string()))?;
+            // OpenRouter-specific headers
+            if let Some(ref referer) = self.openrouter_referer {
+                request = request.header("HTTP-Referer", referer);
+            }
+            if let Some(ref title) = self.openrouter_title {
+                request = request.header("X-Title", title);
+            }
 
-        if !response.status().is_success() {
+            let response = match request.json(&body).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = LlmError::Http(e.to_string());
+                    let delay = Self::backoff_delay(attempt, None);
+                    eprintln!(
+                        "  ⚠ HTTP error (attempt {}/{}), retrying in {delay:?}: {e}",
+                        attempt + 1,
+                        Self::MAX_RETRIES
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            };
+
             let status = response.status();
-            let body = response
+
+            if status.is_success() {
+                return response
+                    .json::<OaiResponse>()
+                    .await
+                    .map_err(|e| LlmError::Serialization(e.to_string()));
+            }
+
+            // Extract Retry-After header before consuming the response body
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+
+            let body_text = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "failed to read body".to_string());
-            return Err(LlmError::Api(format!("{status}: {body}")));
+
+            // Retry on 429 (rate limit) and 5xx (server errors)
+            if status.as_u16() == 429 || status.is_server_error() {
+                last_err = LlmError::Api(format!("{status}: {body_text}"));
+                if attempt + 1 < Self::MAX_RETRIES {
+                    let delay = Self::backoff_delay(attempt, retry_after);
+                    eprintln!(
+                        "  ⚠ {status} (attempt {}/{}), retrying in {delay:?}",
+                        attempt + 1,
+                        Self::MAX_RETRIES
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
+
+            return Err(LlmError::Api(format!("{status}: {body_text}")));
         }
 
-        response
-            .json::<OaiResponse>()
-            .await
-            .map_err(|e| LlmError::Serialization(e.to_string()))
+        Err(last_err)
+    }
+
+    /// Exponential backoff: 2^attempt seconds, capped at 60s.
+    /// Prefers Retry-After header value when available.
+    fn backoff_delay(attempt: u32, retry_after_secs: Option<u64>) -> std::time::Duration {
+        if let Some(secs) = retry_after_secs {
+            return std::time::Duration::from_secs(secs.min(120));
+        }
+        let secs = (1u64 << attempt).min(60);
+        std::time::Duration::from_secs(secs)
     }
 
     fn build_system_message(blocks: &[SystemBlock]) -> OaiMessage {
